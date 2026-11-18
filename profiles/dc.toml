@@ -2,6 +2,11 @@ name = "dc"
 # 使用已验证的 Qwen 启动参数；屏幕状态和恢复参数尚未验证，暂不声明。
 command = ["qwen", "--approval-mode=yolo"]
 is_agent = true
+# 开会话时由 dct 指定对话 id，重启后按 id 接回同一段对话。
+# `qwen --help` 有 `--session-id`/`--resume`；2026-10-14 实测按 id 接回成功
+# （-p 模式，走训练营网关）。对话记录默认就开着，命令里不用另带 --chat-recording。
+session_id_args = ["--session-id", "{id}"]
+resume_id_args = ["--resume", "{id}"]
 pairable = true
 
 [label]

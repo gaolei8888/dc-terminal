@@ -1,0 +1,719 @@
+# Review package: 72ffbdf..e4d75b1
+
+## Commits
+e4d75b1 fix(mesh): harden seal/wire/relay-token per review, add mutation-killing tests
+
+## Files changed
+ crates/dct-mesh/src/keys.rs        |   9 ++
+ crates/dct-mesh/src/relay_token.rs |  47 ++++++-
+ crates/dct-mesh/src/seal.rs        | 265 ++++++++++++++++++++++++++++++++++---
+ crates/dct-mesh/src/wire.rs        |  41 +++++-
+ 4 files changed, 337 insertions(+), 25 deletions(-)
+
+## Diff
+diff --git a/crates/dct-mesh/src/keys.rs b/crates/dct-mesh/src/keys.rs
+index da344af..668a7cc 100644
+--- a/crates/dct-mesh/src/keys.rs
++++ b/crates/dct-mesh/src/keys.rs
+@@ -48,20 +48,29 @@ impl MachineKeys {
+     }
+ 
+     /// 跟另一台电脑的 X25519 公钥做 Diffie-Hellman，给 `seal` 模块派生对称
+     /// 密钥用。两边各自用「自己的私钥 + 对方的公钥」算，算出同一个共享点。
+     pub fn diffie_hellman(&self, their_kx_pub: &[u8; 32]) -> [u8; 32] {
+         let their = KxPublicKey::from(*their_kx_pub);
+         self.kx.diffie_hellman(&their).to_bytes()
+     }
+ 
+     /// 对 `msg` 签名（内部先做 SHA-256），返回 64 字节 `r||s`。
++    ///
++    /// **ECDSA 签名是可延展的（malleable）：** `(r, s)` 和 `(r, n-s)`
++    /// （"low-S" 和 "high-S"）对同一条消息、同一把私钥都是合法签名，这个
++    /// 函数不保证只产出其中一种。谁都能拿一个合法签名算出另一个同样合法、
++    /// 但字节不同的签名，不需要私钥。所以这里返回的字节，以及所有拿它当
++    /// 字段用的地方（`SignedRoster::sig`、`wire::JoinRequest::sig`、
++    /// `relay_token` 令牌里的 `sig`……）**都不能被当成 id 或去重键**——同一
++    /// 条逻辑上的消息可能对应两种不同的签名字节。真要去重/防重放，认
++    /// 消息自己的字段（比如 `seal::Message::id`），不要认签名或整个信封。
+     pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
+         let sig: EcSig = self.sign.sign(msg);
+         let mut out = [0u8; 64];
+         out.copy_from_slice(&sig.to_bytes());
+         out
+     }
+ }
+ 
+ /// 任何解不出来的公钥或验不过的签名都返回 `false`，不 panic、不区分原因——
+ /// 调用方只关心「这张名单/这条消息是不是真的」。
+diff --git a/crates/dct-mesh/src/relay_token.rs b/crates/dct-mesh/src/relay_token.rs
+index 70d5b94..a2d4b0a 100644
+--- a/crates/dct-mesh/src/relay_token.rs
++++ b/crates/dct-mesh/src/relay_token.rs
+@@ -18,21 +18,22 @@ pub struct Claims {
+     pub exp: u64,
+ }
+ 
+ /// 令牌里实际装的 JSON：`Claims` 的三个字段，外加对它们的签名。
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ struct Envelope {
+     account: String,
+     endpoint: String,
+     exp: u64,
+     /// P-256 ECDSA(SHA-256) 对 `bytes(&claims)` 签的名，64 字节 `r||s`，
+-    /// 标准 base64。
++    /// 标准 base64。ECDSA 签名可延展（见 `keys::MachineKeys::sign` 的文
++    /// 档），所以这个字段、乃至整个令牌字符串，都不能当 id 或去重键用。
+     sig: String,
+ }
+ 
+ /// `dct-relay-token-v1` 规范字节：依次写 `field("dct-relay-token-v1")`、
+ /// `field(account)`、`field(endpoint)`、`field(exp 十进制)`。
+ pub fn bytes(c: &Claims) -> Vec<u8> {
+     let mut out = Vec::new();
+     field(&mut out, TOKEN_VERSION_TAG);
+     field(&mut out, &c.account);
+     field(&mut out, &c.endpoint);
+@@ -171,20 +172,64 @@ mod tests {
+         let token = issue(&claims(), &sk);
+ 
+         let json = URL_SAFE_NO_PAD.decode(&token).unwrap();
+         let mut env: Envelope = serde_json::from_slice(&json).unwrap();
+         env.endpoint = "c-someoneelse".into();
+         let tampered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&env).unwrap());
+ 
+         assert_eq!(verify(&tampered, &[pk], 50), Err(TokenError::BadSignature));
+     }
+ 
++    #[test]
++    fn changing_the_account_inside_the_token_breaks_it() {
++        let (sk, pk) = issuer(1);
++        let token = issue(&claims(), &sk);
++
++        let json = URL_SAFE_NO_PAD.decode(&token).unwrap();
++        let mut env: Envelope = serde_json::from_slice(&json).unwrap();
++        env.account = "someone-elses-account".into();
++        let tampered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&env).unwrap());
++
++        assert_eq!(verify(&tampered, &[pk], 50), Err(TokenError::BadSignature));
++    }
++
++    #[test]
++    fn changing_the_exp_inside_the_token_breaks_it() {
++        let (sk, pk) = issuer(1);
++        let token = issue(&claims(), &sk);
++
++        let json = URL_SAFE_NO_PAD.decode(&token).unwrap();
++        let mut env: Envelope = serde_json::from_slice(&json).unwrap();
++        env.exp = 999_999;
++        let tampered = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&env).unwrap());
++
++        assert_eq!(verify(&tampered, &[pk], 50), Err(TokenError::BadSignature));
++    }
++
++    #[test]
++    fn an_empty_issuer_list_never_verifies() {
++        let (sk, _pk) = issuer(1);
++        let token = issue(&claims(), &sk);
++        assert_eq!(verify(&token, &[], 50), Err(TokenError::BadSignature));
++    }
++
++    #[test]
++    fn bytes_matches_a_known_vector() {
++        let c = Claims {
++            account: "acct".into(),
++            endpoint: "c-known0000000000000f".into(),
++            exp: 1_700_000_000,
++        };
++        let expected: &[u8] = b"18:dct-relay-token-v14:acct21:c-known0000000000000f10:1700000000";
++        assert_eq!(bytes(&c), expected);
++    }
++
+     #[test]
+     fn garbage_is_malformed_not_a_panic() {
+         assert_eq!(verify("", &[], 0), Err(TokenError::Malformed));
+         assert_eq!(
+             verify("not base64url!!", &[], 0),
+             Err(TokenError::Malformed)
+         );
+         assert_eq!(
+             verify(&URL_SAFE_NO_PAD.encode(b"{}"), &[], 0),
+             Err(TokenError::Malformed)
+diff --git a/crates/dct-mesh/src/seal.rs b/crates/dct-mesh/src/seal.rs
+index 2a68900..7eba419 100644
+--- a/crates/dct-mesh/src/seal.rs
++++ b/crates/dct-mesh/src/seal.rs
+@@ -1,31 +1,40 @@
+ //! 一条留言：先用发件方的签名钥匙签一份规范字节（`dct-msg-v1`），把
+ //! `{"m": <消息>, "sig": <签名>}` 序列化成 JSON，再用收件方的 X25519 公钥
+-//! 加密——中转只能看见密文和一个临时公钥，看不到消息内容、收发双方是谁。
++//! 加密——中转看不到 `kind`/`body`/会话名这些内容，但**路由本身不保密**：
++//! 中转要知道这条 `Sealed` 是发给哪个 endpoint 的才能转发，`open` 也要调用
++//! 方在信封上另外附一个 `envelope_from`（见下）——所以中转看得到、也必须看
++//! 得到收发双方是谁，密文只藏内容，不藏地址。
+ //!
+ //! 加密用的是「每条消息一把新临时钥匙」的 ECIES：调用方给一个 `eph_seed`
+-//! （这个 crate 不生成随机数，见 lib.rs），派生出一次性的 X25519 密钥对，跟
+-//! 收件方的公钥做 Diffie-Hellman，再用 HKDF-SHA256 把共享点拉成一把
+-//! ChaCha20-Poly1305 密钥。nonce 固定用全 0——这是安全的，因为每条消息的
+-//! 临时密钥都是新算出来的，同一把密钥只会被用来加密这一条消息、只用这一个
+-//! nonce，ChaCha20-Poly1305 真正要防的「同一把密钥、不同消息复用 nonce」的
+-//! 场景根本不会发生。
++//! （这个 crate 不生成随机数，见 lib.rs）。真正喂给 X25519 的临时私钥不是
++//! `eph_seed` 本身，而是 `SHA-256("dct-seal-eph-v1" ‖ eph_seed ‖ plain)`——
++//! 把加密前的明文也拌进去，这样即使调用方不小心对两条**不同**的消息传了同
++//! 一个种子，算出来的临时私钥也不同（明文不同，摘要就不同）。但这不是纵容
++//! 调用方省事：`eph_seed` 仍然必须每次调用都用新鲜的随机数——两条内容完全
++//! 相同的消息如果还用同一个种子，会算出一模一样的密文，等于告诉中转「这是
++//! 同一条消息又发了一遍」，这是这份哈希绑定防不住的。
++//!
++//! 临时私钥跟收件方的公钥做 Diffie-Hellman，再用 HKDF-SHA256 把共享点拉成
++//! 一把 ChaCha20-Poly1305 密钥。nonce 固定用全 0——这是安全的，因为派生出来
++//! 的对称密钥已经绑死了这一条消息的明文，不会有「同一把密钥、两条不同明文
++//! 共用同一个 nonce」这种 ChaCha20-Poly1305 真正怕的情况。
+ use crate::canon::field;
+ use crate::id;
+ use crate::keys::{self, MachineKeys};
+ use crate::roster::Roster;
+ use base64::{engine::general_purpose::STANDARD, Engine as _};
+ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+ use hkdf::Hkdf;
+ use serde::{Deserialize, Serialize};
+-use sha2::Sha256;
++use sha2::{Digest, Sha256};
+ use x25519_dalek::{PublicKey as KxPublicKey, StaticSecret};
+ 
+ pub const MSG_VERSION_TAG: &str = "dct-msg-v1";
+ 
+ /// 消息种类，JSON 里用全小写（`Msg` -> `"msg"`，`StatusRequest` ->
+ /// `"statusrequest"`）。
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "lowercase")]
+ pub enum Kind {
+     Msg,
+@@ -59,22 +68,23 @@ struct SignedMessage {
+ /// （标准 base64），`ct` 是密文（标准 base64，带 Poly1305 认证标签）。
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct Sealed {
+     pub v: u32,
+     pub eph: String,
+     pub ct: String,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum OpenError {
+-    /// 密文解不开——钥匙不对、被中转改过，或者 `eph`/`ct` 根本不是合法的
+-    /// base64/密文。
++    /// 密文解不开——钥匙不对、被中转改过，`eph`/`ct` 根本不是合法的
++    /// base64/密文，`v` 不是这份代码认识的版本，或者 `eph` 是一个会让
++    /// Diffie-Hellman 算出全零共享密钥的恶意/退化公钥。
+     Decrypt,
+     /// 解密出来的明文不是 `SignedMessage` 期望的 JSON 形状。
+     BadJson,
+     /// `roster` 里没有 `m.from` 这个 endpoint（或者有，但它的 `endpoint` 跟
+     /// 自己的 `sign_pub` 对不上，不能当成真的绑定）。
+     UnknownSender,
+     /// 用发件方在名单里的公钥验签，验不过。
+     BadSignature,
+     /// 中转传来的信封发件人跟签过名的 `m.from` 不一致——中转换了发件人。
+     FromMismatch,
+@@ -114,42 +124,58 @@ pub fn bytes(m: &Message) -> Vec<u8> {
+     field(&mut out, &m.sent_at.to_string());
+     out
+ }
+ 
+ fn kind_str(k: Kind) -> String {
+     let quoted = serde_json::to_string(&k).expect("Kind always serializes");
+     quoted.trim_matches('"').to_string()
+ }
+ 
+ const SEAL_INFO: &[u8] = b"dct-seal-v1";
++const EPH_INFO: &[u8] = b"dct-seal-eph-v1";
+ 
+ fn derive_key(eph_pub: &[u8; 32], to_kx_pub: &[u8; 32], shared: &[u8; 32]) -> [u8; 32] {
+     let mut salt = Vec::with_capacity(64);
+     salt.extend_from_slice(eph_pub);
+     salt.extend_from_slice(to_kx_pub);
+     let hk = Hkdf::<Sha256>::new(Some(&salt), shared);
+     let mut key = [0u8; 32];
+     hk.expand(SEAL_INFO, &mut key)
+         .expect("32 bytes is a valid SHA-256 HKDF output length");
+     key
+ }
+ 
++/// 临时 X25519 私钥不是 `eph_seed` 本身，而是把它跟（加密前的）明文一起做
++/// 一次 SHA-256：`SHA-256("dct-seal-eph-v1" || eph_seed || plain)`。见模块
++/// 顶部的注释——这样同一个种子配不同的消息也不会撞出同一把临时钥匙，但
++/// `eph_seed` 本身仍然必须是调用方每次给的新鲜随机数。
++fn ephemeral_secret(eph_seed: [u8; 32], plain: &[u8]) -> StaticSecret {
++    let mut hasher = Sha256::new();
++    hasher.update(EPH_INFO);
++    hasher.update(eph_seed);
++    hasher.update(plain);
++    let digest = hasher.finalize();
++    let mut seed = [0u8; 32];
++    seed.copy_from_slice(&digest);
++    StaticSecret::from(seed)
++}
++
+ /// 签名并加密一条消息，只有掌握 `to_kx_pub` 对应私钥的那台电脑能打开。
+ pub fn seal(m: &Message, me: &MachineKeys, to_kx_pub: &[u8; 32], eph_seed: [u8; 32]) -> Sealed {
+     let sig = me.sign(&bytes(m));
+     let inner = SignedMessage {
+         m: m.clone(),
+         sig: STANDARD.encode(sig),
+     };
+     let plain = serde_json::to_vec(&inner).expect("SignedMessage always serializes");
+ 
+-    let eph = StaticSecret::from(eph_seed);
++    let eph = ephemeral_secret(eph_seed, &plain);
+     let eph_pub = KxPublicKey::from(&eph);
+     let their_pub = KxPublicKey::from(*to_kx_pub);
+     let shared = eph.diffie_hellman(&their_pub);
+ 
+     let key_bytes = derive_key(eph_pub.as_bytes(), to_kx_pub, shared.as_bytes());
+     let key = Key::from_slice(&key_bytes);
+     let cipher = ChaCha20Poly1305::new(key);
+     // 全 0 nonce 在这里是安全的：`eph_seed` 每条消息都不同，派生出来的对称
+     // 密钥也就每条消息都不同——同一把密钥只会被用来加密恰好一条消息、恰好
+     // 用这一个 nonce。ChaCha20-Poly1305 真正危险的是「同一把密钥」配「不同
+@@ -181,31 +207,47 @@ fn bound_sender_key(roster: &Roster, endpoint: &str) -> Option<[u8; 65]> {
+     let raw = STANDARD.decode(&member.sign_pub).ok()?;
+     let sign_pub: [u8; 65] = raw.try_into().ok()?;
+     if id::endpoint_for(&sign_pub) != endpoint {
+         return None;
+     }
+     Some(sign_pub)
+ }
+ 
+ /// 打开一条密封留言。`envelope_from` 是中转在这条消息外面附的「这是谁发的」
+ /// 元数据（不是加密内容的一部分），必须跟解密后签过名的 `m.from` 一致。
++///
++/// **这个函数不做重放保护。** 它只管「这条留言是不是真的、没被改过、是发
++/// 给我的」，不管「我是不是已经处理过这一条了」——两次 `open` 同一个
++/// `Sealed` 会两次成功返回同一个 `Message`。按 `(m.from, m.id)` 去重、再给
++/// `m.sent_at` 卡一个时间窗口，这是调用方（存留言的那一层）的活。
+ pub fn open(
+     s: &Sealed,
+     me: &MachineKeys,
+     roster: &Roster,
+     envelope_from: &str,
+ ) -> Result<Message, OpenError> {
++    if s.v != 1 {
++        return Err(OpenError::Decrypt);
++    }
++
+     let eph_raw = STANDARD.decode(&s.eph).map_err(|_| OpenError::Decrypt)?;
+     let eph_pub: [u8; 32] = eph_raw.try_into().map_err(|_| OpenError::Decrypt)?;
+     let ct = STANDARD.decode(&s.ct).map_err(|_| OpenError::Decrypt)?;
+ 
+     let shared = me.diffie_hellman(&eph_pub);
++    if shared == [0u8; 32] {
++        // `eph` 是攻击者能自由构造的（它就是密文旁边那个"临时公钥"字段）。
++        // 用一个退化/低阶点（比如全零）当公钥，可以让 Diffie-Hellman 不管
++        // 我的私钥是什么都算出全零共享密钥——不拒绝的话，攻击者就拿到了一
++        // 把跟我的私钥完全脱钩、自己就能算出来的"共享密钥"。
++        return Err(OpenError::Decrypt);
++    }
+     let my_kx_pub = me.kx_pub();
+     let key_bytes = derive_key(&eph_pub, &my_kx_pub, &shared);
+     let key = Key::from_slice(&key_bytes);
+     let cipher = ChaCha20Poly1305::new(key);
+     let nonce = Nonce::from_slice(&[0u8; 12]);
+     let plain = cipher
+         .decrypt(
+             nonce,
+             Payload {
+                 msg: &ct,
+@@ -320,38 +362,168 @@ mod tests {
+         let m = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
+         let sealed = seal(&m, &alice, &bob.kx_pub(), [7u8; 32]);
+ 
+         assert_eq!(
+             open(&sealed, &bob, &roster, &a.endpoint),
+             Err(OpenError::UnknownSender)
+         );
+     }
+ 
+     #[test]
+-    fn a_sender_whose_roster_entry_fails_endpoint_binding_is_refused() {
++    fn a_roster_entry_whose_endpoint_does_not_match_its_own_key_is_refused() {
++        // `roster.member(endpoint)` looks entries up *by* `endpoint`, so a
++        // record whose `endpoint` field doesn't match its own key can only
++        // be found by looking it up under the (wrong) `endpoint` it claims —
++        // which is exactly what happens here. This is the scenario the
++        // binding check inside `bound_sender_key` exists to catch: without
++        // it, whoever controls `mallory`'s key could sign as `x` and have it
++        // accepted, because the roster entry *claims* `x` even though it was
++        // never bound to `x`'s real key.
+         let alice = keys_for(1);
+         let bob = keys_for(2);
+-        let mut a = member_from(&alice, "alice");
+-        // 名单里的记录被人改了：endpoint 不再是从 alice 的 sign_pub 算出来的。
+-        let real_from = a.endpoint.clone();
+-        a.endpoint = "c-0000000000000000000f".into();
+-        let roster = roster_of(vec![a, member_from(&bob, "bob")]);
++        let mallory = keys_for(3);
++        let x = id::endpoint_for(&alice.sign_pub());
+ 
+-        let m = sample_message(&real_from, &id::endpoint_for(&bob.sign_pub()));
+-        let sealed = seal(&m, &alice, &bob.kx_pub(), [7u8; 32]);
++        let forged = Member {
++            name: "alice".into(),
++            endpoint: x.clone(),
++            sign_pub: STANDARD.encode(mallory.sign_pub()),
++            kx_pub: STANDARD.encode(mallory.kx_pub()),
++            added_at: 0,
++        };
++        let roster = roster_of(vec![forged, member_from(&bob, "bob")]);
++
++        // Mallory crafts and signs (with her own real key) a message that
++        // claims to be from `x`.
++        let m = sample_message(&x, &id::endpoint_for(&bob.sign_pub()));
++        let sealed = seal(&m, &mallory, &bob.kx_pub(), [7u8; 32]);
+ 
+         assert_eq!(
+-            open(&sealed, &bob, &roster, &real_from),
++            open(&sealed, &bob, &roster, &x),
+             Err(OpenError::UnknownSender)
+         );
+     }
+ 
++    #[test]
++    fn a_message_forged_by_another_member_claiming_to_be_someone_else_is_refused() {
++        // Alice is a genuine, correctly bound roster member. Mallory (also a
++        // genuine roster member, under her own key) crafts a message whose
++        // `from` field claims to be Alice, and signs it with her own key
++        // instead. The roster lookup succeeds (Alice's real entry), so this
++        // can only be caught by verifying the signature against Alice's key
++        // — which must fail, because it was never made by Alice.
++        let alice = keys_for(1);
++        let bob = keys_for(2);
++        let mallory = keys_for(3);
++        let a = member_from(&alice, "alice");
++        let roster = roster_of(vec![
++            a.clone(),
++            member_from(&bob, "bob"),
++            member_from(&mallory, "mallory"),
++        ]);
++
++        let m = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
++        let sealed = seal(&m, &mallory, &bob.kx_pub(), [7u8; 32]);
++
++        assert_eq!(
++            open(&sealed, &bob, &roster, &a.endpoint),
++            Err(OpenError::BadSignature)
++        );
++    }
++
++    #[test]
++    fn an_unsupported_sealed_version_is_rejected() {
++        let alice = keys_for(1);
++        let bob = keys_for(2);
++        let a = member_from(&alice, "alice");
++        let roster = roster_of(vec![a.clone(), member_from(&bob, "bob")]);
++
++        let m = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
++        let mut sealed = seal(&m, &alice, &bob.kx_pub(), [7u8; 32]);
++        sealed.v = 2;
++
++        assert_eq!(
++            open(&sealed, &bob, &roster, &a.endpoint),
++            Err(OpenError::Decrypt)
++        );
++    }
++
++    #[test]
++    fn an_all_zero_shared_secret_is_rejected() {
++        let alice = keys_for(1);
++        let bob = keys_for(2);
++        let roster = roster_of(vec![member_from(&alice, "alice"), member_from(&bob, "bob")]);
++
++        // `[0u8; 32]` is a well-known low-order X25519 public key: the DH
++        // result is all-zero regardless of the recipient's private key.
++        let forged = Sealed {
++            v: 1,
++            eph: STANDARD.encode([0u8; 32]),
++            ct: STANDARD.encode([0u8; 16]),
++        };
++
++        assert_eq!(
++            open(&forged, &bob, &roster, &id::endpoint_for(&alice.sign_pub())),
++            Err(OpenError::Decrypt)
++        );
++    }
++
++    #[test]
++    fn an_all_zero_shared_secret_is_rejected_even_when_the_ciphertext_would_otherwise_open() {
++        // The test above uses garbage ciphertext, so it can't tell the
++        // explicit all-zero-shared-secret check apart from the AEAD tag
++        // just happening to fail anyway. This test crafts ciphertext that
++        // genuinely *would* decrypt and verify successfully under the key
++        // the all-zero shared secret derives to, so it only passes if the
++        // explicit check is the thing doing the rejecting.
++        let alice = keys_for(1);
++        let bob = keys_for(2);
++        let a = member_from(&alice, "alice");
++        let roster = roster_of(vec![a.clone(), member_from(&bob, "bob")]);
++
++        let m = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
++        let sig = alice.sign(&bytes(&m));
++        let inner = SignedMessage {
++            m: m.clone(),
++            sig: STANDARD.encode(sig),
++        };
++        let plain = serde_json::to_vec(&inner).unwrap();
++
++        // Same key derivation `open` would use for this `eph`/`to_kx_pub`
++        // pair *if* it didn't reject an all-zero shared secret first.
++        let eph_pub = [0u8; 32];
++        let key_bytes = derive_key(&eph_pub, &bob.kx_pub(), &[0u8; 32]);
++        let key = Key::from_slice(&key_bytes);
++        let cipher = ChaCha20Poly1305::new(key);
++        let nonce = Nonce::from_slice(&[0u8; 12]);
++        let ct = cipher
++            .encrypt(
++                nonce,
++                Payload {
++                    msg: &plain,
++                    aad: SEAL_INFO,
++                },
++            )
++            .unwrap();
++
++        let forged = Sealed {
++            v: 1,
++            eph: STANDARD.encode(eph_pub),
++            ct: STANDARD.encode(ct),
++        };
++
++        assert_eq!(
++            open(&forged, &bob, &roster, &a.endpoint),
++            Err(OpenError::Decrypt)
++        );
++    }
++
+     #[test]
+     fn envelope_from_must_match_the_signed_from() {
+         let alice = keys_for(1);
+         let bob = keys_for(2);
+         let mallory = keys_for(3);
+         let a = member_from(&alice, "alice");
+         let roster = roster_of(vec![
+             a.clone(),
+             member_from(&bob, "bob"),
+             member_from(&mallory, "mallory"),
+@@ -413,20 +585,73 @@ mod tests {
+         let a = member_from(&alice, "alice");
+ 
+         let m = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
+         let s1 = seal(&m, &alice, &bob.kx_pub(), [7u8; 32]);
+         let s2 = seal(&m, &alice, &bob.kx_pub(), [8u8; 32]);
+ 
+         assert_ne!(s1.eph, s2.eph);
+         assert_ne!(s1.ct, s2.ct);
+     }
+ 
++    #[test]
++    fn same_eph_seed_but_a_different_message_gives_a_different_ephemeral_key() {
++        // The ephemeral private key is derived from `eph_seed` *and* the
++        // plaintext (see the module doc), specifically so that a caller
++        // accidentally reusing a seed across two different messages still
++        // gets a fresh key each time.
++        let alice = keys_for(1);
++        let bob = keys_for(2);
++        let a = member_from(&alice, "alice");
++
++        let m1 = sample_message(&a.endpoint, &id::endpoint_for(&bob.sign_pub()));
++        let mut m2 = m1.clone();
++        m2.body = "a different message entirely".into();
++
++        let s1 = seal(&m1, &alice, &bob.kx_pub(), [7u8; 32]);
++        let s2 = seal(&m2, &alice, &bob.kx_pub(), [7u8; 32]);
++
++        assert_ne!(s1.eph, s2.eph);
++    }
++
++    #[test]
++    fn seal_matches_a_known_answer_vector() {
++        // Pins the full crypto pipeline (ephemeral key derivation, HKDF,
++        // ChaCha20-Poly1305) for a fixed set of inputs, so a change to any
++        // step's constants/ordering shows up as a diff here instead of only
++        // as "round-trips still work" (which a compatible-on-both-sides bug
++        // would never catch).
++        let alice = MachineKeys::from_seeds([1u8; 32], [2u8; 32]).unwrap();
++        let bob = MachineKeys::from_seeds([3u8; 32], [4u8; 32]).unwrap();
++        let m = Message {
++            id: "kat-1".into(),
++            kind: Kind::Msg,
++            from: id::endpoint_for(&alice.sign_pub()),
++            from_session: "laptop/dc-terminal".into(),
++            to: id::endpoint_for(&bob.sign_pub()),
++            to_session: "desktop/dc-terminal".into(),
++            body: "known answer".into(),
++            sent_at: 1_700_000_000,
++        };
++        let sealed = seal(&m, &alice, &bob.kx_pub(), [9u8; 32]);
++
++        assert_eq!(sealed.eph, "2o+txP0fptgL9khgRgMoteHSoimDytrPGNjUSL8ytSg=");
++        assert_eq!(
++            sealed.ct,
++            "Z5juSC8J3a51ggq2BqI/eKrUgZQ2nPLBksI+IqIf4jNaGgvRu4U/cfvHhax6xdXpYXF3ybTqQOqgx30j\
++             /ofubdwJDLw49t8eqcqnD4JSNleXerU3ndG4mcPoswwekYxd5esEwI0FfKjW0hHag/zrMnPDE4VxzWWs\
++             c1HCsEp5MZsPAdydxfVDoSV0prgGjtfMHGhFpkXJ6GJo0+kJS2Y4kGgIse35WMWE3yLBG9vruld8dKwN\
++             O5dGDKwt9fdHDleCe7Kj4PCw2TMv8VGve4VpQU4Cjuy+effrivxxaAhwsnxHblnrYuWK7JzalbB1dNc0\
++             eaRTaUlisi09OdTPIy93NeyTjXY8//RZxaqAoybC6pNfnB9mSnb8mIQJHp+KMA+5DBqZ2d3bVxEQxgPR\
++             ov+3IOPjSVA/gEsvSHLGEl3VNz0/fA=="
++        );
++    }
++
+     #[test]
+     fn kind_serializes_to_lowercase_json_strings() {
+         assert_eq!(serde_json::to_string(&Kind::Msg).unwrap(), "\"msg\"");
+         assert_eq!(
+             serde_json::to_string(&Kind::Receipt).unwrap(),
+             "\"receipt\""
+         );
+         assert_eq!(
+             serde_json::to_string(&Kind::StatusRequest).unwrap(),
+             "\"statusrequest\""
+diff --git a/crates/dct-mesh/src/wire.rs b/crates/dct-mesh/src/wire.rs
+index 8c6d855..3bfcaf5 100644
+--- a/crates/dct-mesh/src/wire.rs
++++ b/crates/dct-mesh/src/wire.rs
+@@ -1,34 +1,36 @@
+ //! 中转（relay）上跑的消息线上形状：一台电脑发给中转的每一条 JSON 都是一个
+ //! `Payload`，`t` 字段说明它是密封留言、加入请求、整份名单，还是「你的加入
+ //! 申请还在等别人批」。
+ use crate::canon::field;
++use crate::id;
+ use crate::keys::{self, MachineKeys};
+ use crate::roster::{Member, SignedRoster};
+ use crate::seal::Sealed;
+ use base64::{engine::general_purpose::STANDARD, Engine as _};
+ use serde::{Deserialize, Serialize};
+ 
+ pub const JOIN_VERSION_TAG: &str = "dct-join-v1";
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(tag = "t", rename_all = "snake_case")]
+ pub enum Payload {
+     Sealed(Sealed),
+     Join(JoinRequest),
+     Roster(SignedRoster),
+     JoinPending { member: Member, sig: String },
+ }
+ 
+ /// 新电脑请求加入组：`member` 是它自己的名单条目（还没被任何人签认），
+ /// `sig` 是它用自己的钥匙对 `member` 的 `dct-join-v1` 规范字节签的名——证明
+-/// 它真的掌握 `member.sign_pub` 对应的私钥。
++/// 它真的掌握 `member.sign_pub` 对应的私钥。ECDSA 签名可延展（见
++/// `keys::MachineKeys::sign` 的文档），`sig` 不能当 id 或去重键用。
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct JoinRequest {
+     pub member: Member,
+     pub sig: String,
+ }
+ 
+ pub fn encode(p: &Payload) -> Vec<u8> {
+     serde_json::to_vec(p).expect("Payload always serializes")
+ }
+ 
+@@ -49,42 +51,47 @@ fn member_bytes(m: &Member) -> Vec<u8> {
+     field(&mut out, &m.kx_pub);
+     field(&mut out, &m.added_at.to_string());
+     out
+ }
+ 
+ /// 用 `keys` 对 `m` 自签名，返回标准 base64 的 `r||s`。
+ pub fn sign_member(m: &Member, keys: &MachineKeys) -> String {
+     STANDARD.encode(keys.sign(&member_bytes(m)))
+ }
+ 
+-/// 校验 `sig` 是不是 `m` 自己的钥匙（`m.sign_pub`）对 `m` 签的名。任何解不
+-/// 出来的 base64/公钥/签名都当作没验过，不 panic。
++/// 校验 `sig` 是不是 `m` 自己的钥匙（`m.sign_pub`）对 `m` 签的名，并且
++/// `m.endpoint` 真的是从 `m.sign_pub` 算出来的——单有签名不够：签名只证明
++/// 「这份 `Member` 记录是这把 `sign_pub` 的主人认可的」，不证明它认领的
++/// `endpoint` 就是自己的（一个合法成员完全可以自签一条 `endpoint` 写着别
++/// 人地址的记录）。任何解不出来的 base64/公钥/签名都当作没验过，不 panic。
+ pub fn verify_member(m: &Member, sig: &str) -> bool {
+     let Ok(raw_pub) = STANDARD.decode(&m.sign_pub) else {
+         return false;
+     };
+     let Ok(sign_pub): Result<[u8; 65], _> = raw_pub.try_into() else {
+         return false;
+     };
++    if id::endpoint_for(&sign_pub) != m.endpoint {
++        return false;
++    }
+     let Ok(raw_sig) = STANDARD.decode(sig) else {
+         return false;
+     };
+     let Ok(sig_arr): Result<[u8; 64], _> = raw_sig.try_into() else {
+         return false;
+     };
+     keys::verify(&sign_pub, &member_bytes(m), &sig_arr)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::id;
+     use crate::roster::Roster;
+ 
+     fn keys_for(byte: u8) -> MachineKeys {
+         MachineKeys::from_seeds([byte.max(1); 32], [byte.max(1); 32]).unwrap()
+     }
+ 
+     fn member_from(k: &MachineKeys, name: &str) -> Member {
+         Member {
+             name: name.into(),
+             endpoint: id::endpoint_for(&k.sign_pub()),
+@@ -181,20 +188,46 @@ mod tests {
+         tampered.kx_pub = STANDARD.encode(other.kx_pub());
+         assert!(!verify_member(&tampered, &sig));
+ 
+         // 换成另一把真实存在的 sign_pub：解码会成功（曲线上的合法点），但
+         // 既不是签名用的那把私钥对应的公钥，签的字节也变了。
+         let mut tampered = m;
+         tampered.sign_pub = STANDARD.encode(other.sign_pub());
+         assert!(!verify_member(&tampered, &sig));
+     }
+ 
++    #[test]
++    fn verify_member_rejects_a_self_consistent_signature_whose_endpoint_is_someone_elses() {
++        // `m` is genuinely, correctly signed by `k` over exactly these bytes
++        // -- the signature check alone has nothing to object to. The only
++        // thing wrong is that `m.endpoint` doesn't actually belong to `k`.
++        let k = keys_for(1);
++        let mut m = member_from(&k, "alice");
++        m.endpoint = "c-notmykey0000000000".into();
++        let sig = sign_member(&m, &k);
++        assert!(!verify_member(&m, &sig));
++    }
++
++    #[test]
++    fn member_bytes_matches_a_known_vector() {
++        let m = Member {
++            name: "alice".into(),
++            endpoint: "c-known0000000000000f".into(),
++            sign_pub: "signpubb64".into(),
++            kx_pub: "kxpubb64".into(),
++            added_at: 1_700_000_000,
++        };
++        let expected: &[u8] =
++            b"11:dct-join-v15:alice21:c-known0000000000000f10:signpubb648:kxpubb6410:1700000000";
++        assert_eq!(member_bytes(&m), expected);
++    }
++
+     #[test]
+     fn a_signature_from_a_different_key_does_not_verify() {
+         let k = keys_for(1);
+         let other = keys_for(2);
+         let m = member_from(&k, "laptop");
+         let sig = sign_member(&m, &other);
+         assert!(!verify_member(&m, &sig));
+     }
+ 
+     #[test]

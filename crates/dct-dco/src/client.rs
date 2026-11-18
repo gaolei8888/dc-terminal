@@ -1,6 +1,7 @@
 //! 走 unix socket 的 dco 客户端（只在 unix 上编）。
 use crate::{DcoError, Reply, IO_TIMEOUT};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -15,6 +16,17 @@ pub struct DcoClient {
     /// 这台 dco 没有 show_status（太旧）或者回得太慢：这条连接上不再发，免得每一步白等。
     /// 三消的 `show_status` 读写它。
     pub no_show_status: bool,
+    /// 这台 dco 对这些状态回了 `bad_request`（不认识这个状态或参数）：同一个状态不再发，其他状态照发。
+    pub unsupported_states: HashSet<String>,
+    /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
+    pub no_see_text: bool,
+    /// 这台 dco 不认 swipe 的 `settle` 参数（回复里没有 `settle`）：这条连接上不再带，免得每步白发。
+    /// 注意只有「回复里压根没有 settle」才置位；等待出错、报告读不懂都不算。
+    pub no_swipe_settle: bool,
+    /// 这台 dco 没有 tap_at（旧版）：这条连接上不再发，直接说「不会」。
+    pub no_tap_at: bool,
+    /// 带 settle 的调用等回复的时长；None = 调用方按自己的稳定上限算（三消：`SETTLE_TIMEOUT_MS` 加 4 秒）。
+    pub settle_call_timeout: Option<Duration>,
 }
 
 fn err(code: &str, message: impl Into<String>) -> DcoError {
@@ -84,6 +96,11 @@ impl DcoClient {
             next_id: 1,
             timeout,
             no_show_status: false,
+            unsupported_states: HashSet::new(),
+            no_see_text: false,
+            no_swipe_settle: false,
+            no_tap_at: false,
+            settle_call_timeout: None,
         };
         c.send(&json!({ "dco_token": token.trim() }))?;
         let ack = c.read_line()?;
@@ -100,6 +117,17 @@ impl DcoClient {
         let _ = init;
         c.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))?;
         Ok(c)
+    }
+
+    /// 现在一次请求等回复的总时长。
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// 改一次请求等回复的总时长（读超时一起改）；等屏幕稳定的调用临时放长，用完还原。
+    pub fn set_timeout(&mut self, d: Duration) {
+        self.timeout = d;
+        let _ = self.w.set_read_timeout(Some(d));
     }
 
     fn send(&mut self, v: &Value) -> Result<(), DcoError> {
@@ -121,7 +149,20 @@ impl DcoClient {
         let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
-        let reply = self.read_line()?;
+        // 前面超时的调用，回复可能晚到：按 id 认回复，别人的（和没有 id 的通知）跳过。
+        let deadline = std::time::Instant::now() + self.timeout;
+        let reply = loop {
+            let r = self.read_line()?;
+            if r.get("id") == Some(&json!(id)) {
+                break r;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io_err(
+                    &std::io::Error::from(std::io::ErrorKind::TimedOut),
+                    self.timeout,
+                ));
+            }
+        };
         if let Some(e) = reply.get("error") {
             let msg = e["message"].as_str().unwrap_or("dco 报错");
             let code = e["code"].as_i64();

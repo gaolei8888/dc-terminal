@@ -383,17 +383,28 @@ fn mouse_capture_transition(was_attached: bool, is_attached: bool) -> Option<boo
     }
 }
 
-/// 这一帧该不该抓鼠标。三个条件全真才抓。
+/// 这一帧该不该抓鼠标：在会话里、不在复制模式，而且滚轮有人接——
+/// agent 自己订阅了鼠标，或者它是内联的（不在备用屏上），历史在 dct 的
+/// 缓冲里、滚轮该由 dct 来翻。
+///
+/// 只剩「备用屏 + 不要鼠标」（less、vim 这类）不抓：终端会把滚轮转成上下
+/// 方向键送过去，它们正好拿方向键翻页；dct 抓了反而没东西可翻。
+///
+/// 2026-10-15 之前内联的会话也不抓，为的是保住终端原生的拖选复制；代价是
+/// 滚轮在 codex、shell 里被终端转成方向键，翻的是输入历史而不是整页。用户
+/// 选了「跟 Claude 会话一样：滚轮翻整页，复制先按 F4」（F4 一直写在底栏）。
 ///
 /// 抽成纯函数的理由同 `mouse_capture_transition`：副作用（往 stdout 写转义
-/// 序列）没法单测，判断能测——而且判断错了两个方向都难受：漏关，用户在会话里
-/// 连拖选复制都做不了；漏开，agent 收不到它明明订阅了的鼠标事件。
-///
-/// `agent_subscribed` 来自 `App.scroll.agent_owns`，**不新开一条判据**。
-/// 那个字段的语义就是「agent 自己攥着鼠标」，跟这里问的是同一个事实；
-/// 各读各的，迟早会分叉成「dct 抓着鼠标却不肯滚」这种自相矛盾的状态。
-fn wants_mouse_capture(attached: bool, agent_subscribed: bool, copy_mode: bool) -> bool {
-    attached && agent_subscribed && !copy_mode
+/// 序列）没法单测，判断能测。`agent_subscribed` / `alt_screen` 都来自
+/// `App.scroll`，**不新开判据**——跟 `attach::wheel_action` 读同一份事实，
+/// 才不会分叉成「dct 抓着鼠标却不肯滚」这种自相矛盾的状态。
+fn wants_mouse_capture(
+    attached: bool,
+    agent_subscribed: bool,
+    alt_screen: bool,
+    copy_mode: bool,
+) -> bool {
+    attached && !copy_mode && (agent_subscribed || !alt_screen)
 }
 
 /// 这一轮 `Screen` 请求的结果决定下一帧的 `app.scroll`：拿到新画面就用
@@ -552,6 +563,10 @@ pub fn run(
     let browser = std::env::var_os("DCW_PUBLIC_URL").is_some();
     let mut previous_theme = None;
     let follow_agent_theme = std::env::var_os("NO_COLOR").is_none();
+    let mut client = client;
+    // 看着「后台是不是换了一个」：重启之后会话编号指的是另一批会话了，
+    // 见 `back_to_board_after_restart`。
+    client.guard_instance();
     let mut app = App::new(client, default_dir, lang, socket, view_mode);
     // 用户存过的配色。没存过就留在 `App::new` 给的默认档，跟 `load_view_mode`
     // 那边一样：「盘上没有可用的选择」由调用方定默认，settings 只管读写。
@@ -576,6 +591,11 @@ pub fn run(
     // 已经覆盖了这个函数里所有别的 `continue`，不用因为加了一个标签
     // 就把它们全部改成 `continue 'main`。
     'main: loop {
+        // 重连上的是一个新起的后台（dct 重启过了）：手里的会话编号已经不算数，
+        // 先回看板。这之前那一次请求已经被 `Client` 拦下、没有发出去。
+        if app.client.as_mut().is_some_and(|c| c.take_new_daemon()) {
+            back_to_board_after_restart(&mut app);
+        }
         // 收后台验证的结果，必须在 term.draw 之前——通过了要直接把视图
         // 切成新开的会话，不然用户看见的这一帧还是「正在验证…」，多闪一下。
         if let Some(rx) = &app.verify_rx {
@@ -825,6 +845,8 @@ pub fn run(
         live::poll_status(&mut app, std::time::Instant::now());
         // 多电脑现状：后台线程问、这里收，绘制路径上不发请求（见 `computers`）。
         computers::poll(&mut app, std::time::Instant::now());
+        // dct 是不是正在准备重启——每一屏都要，同 `live::poll_status`。
+        poll_drain(&mut app, std::time::Instant::now());
 
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {
@@ -1052,11 +1074,9 @@ pub fn run(
             }
         }
 
-        // 抓不抓鼠标不再只看「在不在会话里」：agent 没订阅鼠标的会话
-        // （codex、shell）里抓着它，唯一的效果是把终端的拖选复制废掉，
-        // 换来一个 PageUp/PageDown/End 已经能做的滚轮。
+        // 抓不抓鼠标不只看「在不在会话里」，判据见 `wants_mouse_capture`。
         //
-        // 检查一次三个条件的合取有没有变，而不是在每个能改变它们的分支
+        // 检查一次几个条件的合取有没有变，而不是在每个能改变它们的分支
         // 各开关一次——那样的分支太多、太容易漏（上面 `mouse_captured`
         // 声明处的注释列了几条）。放在 `term.draw` 之前是因为这一轮循环里
         // 所有会改 `app.view` 的代码（`verify_rx` 收尾、`Screen` 探测发现
@@ -1064,7 +1084,12 @@ pub fn run(
         // 的那一帧；而且这一轮的 `Screen` 响应已经落进 `app.scroll` 了，
         // `agent_owns` 就是这一帧的事实。
         let is_attached = matches!(app.view, View::Attached(_));
-        let want = wants_mouse_capture(is_attached, app.scroll.agent_owns, app.copy_mode);
+        let want = wants_mouse_capture(
+            is_attached,
+            app.scroll.agent_owns,
+            app.scroll.alt_screen,
+            app.copy_mode,
+        );
         if let Some(enable) = mouse_capture_transition(mouse_captured, want) {
             let _ = if enable {
                 execute!(std::io::stdout(), EnableMouseCapture)
@@ -2044,6 +2069,25 @@ pub(crate) fn toggle_view_mode(app: &mut App) {
     }
 }
 
+/// dct 重启过了，界面连上的是新后台：回到看板，说一句人话。
+///
+/// 新后台尽量沿用原来的会话编号，但不保证（旧清单、编号撞了）。界面手里的
+/// 「7 号」要是已经换成了另一个项目里的另一个 agent，接着打的字和回车就会
+/// 落到那里去——所以不管停在哪一屏，都回看板重新拉一遍名单，让用户自己再
+/// 点进去。
+fn back_to_board_after_restart(app: &mut App) {
+    app.view = home_view(app);
+    app.need_sessions = true;
+    app.sent_size = None;
+    app.screen.clear();
+    app.grid_screens.clear();
+    app.grid_page = None;
+    app.explained_failure = None;
+    app.drain = None;
+    app.message =
+        crate::i18n::text(crate::i18n::Key::DaemonRestartedBackToBoard, app.lang).into();
+}
+
 /// 用户选的那个模式对应的视图。**所有「回看板」的地方都必须走这里。**
 ///
 /// 硬编码 `View::Board` 的每一处都是一个「明明在九宫格里，某次操作完却被
@@ -2560,6 +2604,42 @@ fn bar_widths(inner: u16) -> (u16, u16, u16) {
     (escape, project, rest - project)
 }
 
+/// 多久问一次「是不是在准备重启」。
+const DRAIN_POLL_EVERY: Duration = Duration::from_secs(1);
+
+/// 一秒问一次 `DrainStatus { renew: false }`（只看不续——续租约是发起重启的
+/// CLI 的事），有排空在跑就让顶上画一行。连不上的时候不问。
+fn poll_drain(app: &mut App, now: std::time::Instant) {
+    if !app.connected {
+        return;
+    }
+    if app
+        .drain_last_fetch
+        .is_some_and(|t| now.saturating_duration_since(t) < DRAIN_POLL_EVERY)
+    {
+        return;
+    }
+    app.drain_last_fetch = Some(now);
+    app.drain = drain_banner_from(
+        app.client()
+            .and_then(|c| c.call(Request::DrainStatus { renew: false })),
+    );
+}
+
+/// 后台的回答 → 要不要画横幅。有一场排空在进行（`active`）就画，包括
+/// 没有会话可等、正在收尾的那一段；旧后台不认这条请求（回一个错误）、
+/// 连不上，都安静地不画。
+fn drain_banner_from(r: anyhow::Result<Response>) -> Option<crate::drain::Progress> {
+    match r {
+        Ok(Response::DrainProgress {
+            progress,
+            active: true,
+            ..
+        }) => Some(progress),
+        _ => None,
+    }
+}
+
 /// 画一帧界面。内容区（`chunks[0]`）按当前视图分派给各自模块的 `draw`；
 /// 底部栏（`chunks[1]`：逃生键 + 消息/帮助文案）不分视图，统一在这里画。
 fn draw_with_theme(f: &mut Frame, app: &mut App, theme: Option<Theme>) {
@@ -2758,6 +2838,25 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Web => web::draw(f, chunks[0], app),
         View::Live { .. } => live::draw(f, chunks[0], app),
         View::Pair { .. } => pair_view::draw(f, chunks[0], app),
+    }
+
+    // dct 准备重启：在内容区顶上**盖**一行，不挤内容区——同底栏盖在会话
+    // 画面上的道理，改尺寸会让 agent 整屏重绘。
+    if let Some(p) = &app.drain {
+        let top = Rect {
+            height: 1,
+            ..chunks[0]
+        };
+        f.render_widget(ratatui::widgets::Clear, top);
+        f.render_widget(
+            Paragraph::new(if p.waiting.is_empty() {
+                crate::i18n::msg::restart_now_banner(app.lang)
+            } else {
+                crate::i18n::msg::restart_pending_banner(app.lang, p.waiting.len())
+            })
+            .style(bar_danger(app.bar)),
+            top,
+        );
     }
 
     // 边框上不再挂「当前项目：…」这个标题：标题跟框内是两块地方，而用户
@@ -3005,6 +3104,7 @@ mod tests {
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }
     }
 
@@ -3644,6 +3744,7 @@ is_agent = true
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         app.explained_failure = Some((1, "上一次贴在这里时看到的旧解释".into()));
 
@@ -3715,6 +3816,10 @@ is_agent = true
             label: Default::default(),
             note: Default::default(),
             resume_args: Default::default(),
+            session_id_args: Default::default(),
+            resume_id_args: Default::default(),
+            conversation_file: Default::default(),
+            conversation_file_key: Default::default(),
             pairable: false,
             backend_only: false,
         };
@@ -3815,6 +3920,7 @@ is_agent = true
             activity: String::new(),
             is_agent: false,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         app.view = View::Board;
 
@@ -3923,6 +4029,7 @@ is_agent = true
                 activity: "正在读取 src/main.rs".into(),
                 is_agent: true,
                 tag: String::new(),
+                last_active_ms: 0,
             },
             SessionInfo {
                 id: 2,
@@ -3932,6 +4039,7 @@ is_agent = true
                 activity: "要用哪个方案？".into(),
                 is_agent: true,
                 tag: String::new(),
+                last_active_ms: 0,
             },
         ];
 
@@ -4001,6 +4109,24 @@ is_agent = true
             };
             term.draw(|f| draw(f, &mut app)).unwrap();
         }
+    }
+
+    /// C1：dct 重启过了，界面连上的是新后台——停在会话里的界面要回看板、
+    /// 说一句人话、把跟旧会话有关的东西都放掉（尺寸要重新协商）。
+    #[test]
+    fn a_new_daemon_sends_the_ui_back_to_the_board() {
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.sent_size = Some((1, 24, 80));
+        app.need_sessions = false;
+        back_to_board_after_restart(&mut app);
+        assert!(matches!(app.view, View::Board));
+        assert_eq!(app.sent_size, None);
+        assert!(app.need_sessions);
+        assert_eq!(
+            app.message.text,
+            crate::i18n::text(crate::i18n::Key::DaemonRestartedBackToBoard, app.lang)
+        );
+        assert!(!app.message.error);
     }
 
     /// 断连时底部提示必须覆盖普通帮助文案 / 残留的 action 消息——否则用户会盯着
@@ -4097,6 +4223,7 @@ is_agent = true
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         // 第 0 行是组头，第 1 行才是那个会话。停在组头上等于「没选中会话」，
         // s/u/d 也就都不该写在底栏上——那是对的行为，但不是这些测试要问的。
@@ -4122,6 +4249,7 @@ is_agent = true
                 activity: String::new(),
                 is_agent: true,
                 tag: String::new(),
+                last_active_ms: 0,
             },
             SessionInfo {
                 id: 2,
@@ -4131,6 +4259,7 @@ is_agent = true
                 activity: String::new(),
                 is_agent: true,
                 tag: String::new(),
+                last_active_ms: 0,
             },
         ]);
         // 行序：组头 a / 会话 1 / 组头 b / 会话 2
@@ -4265,6 +4394,7 @@ is_agent = true
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         app.list_state.select(Some(1));
         app.view = View::Board;
@@ -4547,6 +4677,7 @@ is_agent = true
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         app.view = View::grid(0);
 
@@ -4670,6 +4801,7 @@ is_agent = true
             activity: "背后的看板".into(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         app.view = View::PickProject(crate::ui::view::ProjectPicker::new(
             vec!["/w/other".to_string()],
@@ -4857,6 +4989,7 @@ is_agent = true
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         app.view = View::Board;
         assert!(
@@ -4897,6 +5030,7 @@ is_agent = true
                 activity: String::new(),
                 is_agent: true,
                 tag: String::new(),
+                last_active_ms: 0,
             }]);
             app.view = View::Board;
             term.draw(|f| draw(f, &mut app)).unwrap();
@@ -4967,6 +5101,7 @@ is_agent = true
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         app.view = View::Board;
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -5213,6 +5348,85 @@ is_agent = true
     /// 「你在播」——这个功能最危险的失败模式不是链接泄露，是老师忘了
     /// 自己在播、切去处理一件私事。所以这一档必须压过消息，甚至压过
     /// 错误消息，见 `ui::mod::draw` 里那段注释。
+    /// dct 准备重启的时候，不管在哪一屏，顶上第一行都要说着「在等几个会话」。
+    #[test]
+    fn a_pending_restart_is_announced_on_the_top_row() {
+        use ratatui::backend::TestBackend;
+        for view in [View::Board, View::Attached(1)] {
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            let (mut app, _dir) = app_with_one_agent_session(view);
+            app.drain = Some(crate::drain::Progress {
+                waiting: vec![1, 2],
+                remaining_s: 60,
+                nudged: false,
+            });
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer();
+            let top: String = (0..buf.area.width)
+                .map(|x| buf[(x, 0)].symbol().to_string())
+                .collect::<String>()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(top.contains("dct准备重启"), "顶上没说要重启：{top}");
+            assert!(top.contains('2'), "没说在等几个：{top}");
+        }
+    }
+
+    /// 没在排空（或旧后台不认这条请求）就什么都不画。
+    #[test]
+    fn no_pending_restart_draws_no_banner() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Board);
+        app.drain = None;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(term.backend().buffer()).contains("准备重启"));
+    }
+
+    #[test]
+    fn drain_banner_state_follows_the_daemon_answer() {
+        let p = |w: Vec<u32>| crate::drain::Progress {
+            waiting: w,
+            remaining_s: 5,
+            nudged: false,
+        };
+        let reply = |w: Vec<u32>, active: bool| {
+            Ok(Response::DrainProgress {
+                progress: p(w),
+                done: false,
+                active,
+            })
+        };
+        assert_eq!(drain_banner_from(reply(vec![3], true)), Some(p(vec![3])));
+        // 没有会话可等了、正在收尾：照样画（说「正在重启」）。
+        assert_eq!(drain_banner_from(reply(vec![], true)), Some(p(vec![])));
+        assert_eq!(drain_banner_from(reply(vec![], false)), None);
+        let old_daemon = Response::Error(crate::proto::ErrorCode::BadRequest("unknown variant".into()));
+        assert_eq!(drain_banner_from(Ok(old_daemon)), None);
+        assert_eq!(drain_banner_from(Err(anyhow::anyhow!("断了"))), None);
+    }
+
+    /// 排空在收尾、没有会话可等的时候，顶上说「正在重启」，不说「还在等 0 个」。
+    #[test]
+    fn the_finishing_window_says_restarting() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let (mut app, _dir) = app_with_one_agent_session(View::Board);
+        app.drain = Some(crate::drain::Progress {
+            waiting: vec![],
+            remaining_s: 0,
+            nudged: false,
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text: String = buffer_text(term.backend().buffer())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(text.contains("dct正在重启"), "{text}");
+        assert!(!text.contains("还在等0"), "{text}");
+    }
+
     #[test]
     fn the_live_banner_beats_every_other_bar_content() {
         use ratatui::backend::TestBackend;
@@ -5465,25 +5679,49 @@ is_agent = true
         assert_eq!(mouse_capture_transition(true, false), Some(false));
     }
 
-    /// 三个条件的真值表，八种组合全列。
+    /// 四个条件的真值表，十六种组合全列（逐行手写，不是拿同一个布尔式
+    /// 再算一遍——那样的测试永远不会红）。
     ///
-    /// 穷举而不是挑几个代表：这个函数错一格的后果是「用户在会话里复制不了」
-    /// 或者「agent 收不到它订阅的鼠标」，两种都不会 panic、不会报错，只会让人
-    /// 觉得工具坏了却说不清哪儿坏。八行断言比一句「应该没问题」便宜得多。
+    /// 错一格的后果是「用户在会话里复制不了」「滚轮翻不了整页」或者「agent
+    /// 收不到它订阅的鼠标」，都不会 panic、不会报错，只会让人觉得工具坏了。
     #[test]
-    fn mouse_is_captured_only_when_all_three_conditions_hold() {
-        // attached, agent_subscribed, copy_mode -> want
-        assert!(wants_mouse_capture(true, true, false));
-        assert!(!wants_mouse_capture(true, true, true), "复制模式一票否决");
+    fn mouse_capture_truth_table() {
+        // attached, agent_subscribed, alt_screen, copy_mode, want
+        let table = [
+            (true, true, true, false, true),
+            (true, true, true, true, false),
+            (true, true, false, false, true),
+            (true, true, false, true, false),
+            (true, false, true, false, false),
+            (true, false, true, true, false),
+            (true, false, false, false, true),
+            (true, false, false, true, false),
+            (false, true, true, false, false),
+            (false, true, true, true, false),
+            (false, true, false, false, false),
+            (false, true, false, true, false),
+            (false, false, true, false, false),
+            (false, false, true, true, false),
+            (false, false, false, false, false),
+            (false, false, false, true, false),
+        ];
+        for (attached, subscribed, alt, copy, want) in table {
+            assert_eq!(
+                wants_mouse_capture(attached, subscribed, alt, copy),
+                want,
+                "attached={attached} subscribed={subscribed} alt={alt} copy={copy}"
+            );
+        }
+        // 真实场景点名，读的人不用自己解布尔式：
+        assert!(wants_mouse_capture(true, true, true, false), "Claude Code");
         assert!(
-            !wants_mouse_capture(true, false, false),
-            "agent 不要鼠标就别抓——抓了用户就白白丢了拖选复制"
+            wants_mouse_capture(true, false, false, false),
+            "codex、shell：内联、不要鼠标——滚轮归 dct 翻整页"
         );
-        assert!(!wants_mouse_capture(true, false, true));
-        assert!(!wants_mouse_capture(false, true, false), "看板上永远不抓");
-        assert!(!wants_mouse_capture(false, true, true));
-        assert!(!wants_mouse_capture(false, false, false));
-        assert!(!wants_mouse_capture(false, false, true));
+        assert!(
+            !wants_mouse_capture(true, false, true, false),
+            "less、vim：备用屏、不要鼠标——终端把滚轮转成方向键给它们"
+        );
     }
 
     /// 断连（或者这一轮压根没拿到 `Response::Screen`）时，`app.scroll`

@@ -1,0 +1,118 @@
+# Review package: a8bee5b..HEAD
+
+## Commits
+b98b487 fix: diff_stat 包含未跟踪新文件，remove_worktree 保留分支
+
+## Files changed
+ src/git.rs | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/git.rs b/src/git.rs
+index 2215b8c..71d1e88 100644
+--- a/src/git.rs
++++ b/src/git.rs
+@@ -73,21 +73,20 @@ pub fn create_worktree(repo: &Path, name: &str) -> Result<Worktree> {
+ pub fn remove_worktree(wt: &Worktree) -> Result<()> {
+     git(
+         &wt.repo,
+         &[
+             "worktree",
+             "remove",
+             "--force",
+             wt.path.to_str().context("worktree 路径不是合法 UTF-8")?,
+         ],
+     )?;
+-    let _ = git(&wt.repo, &["branch", "-D", &wt.branch]);
+     Ok(())
+ }
+ 
+ pub fn checkpoint(wt: &Worktree, label: &str) -> Result<String> {
+     git(&wt.path, &["add", "-A"])?;
+     let dirty = !git(&wt.path, &["status", "--porcelain"])?.is_empty();
+     if dirty {
+         git(
+             &wt.path,
+             &["commit", "-q", "-m", &format!("checkpoint: {label}")],
+@@ -96,20 +95,22 @@ pub fn checkpoint(wt: &Worktree, label: &str) -> Result<String> {
+     git(&wt.path, &["rev-parse", "HEAD"])
+ }
+ 
+ pub fn reset_to(wt: &Worktree, sha: &str) -> Result<()> {
+     git(&wt.path, &["reset", "--hard", "-q", sha])?;
+     git(&wt.path, &["clean", "-fdq"])?;
+     Ok(())
+ }
+ 
+ pub fn diff_stat(wt: &Worktree, base: &str) -> Result<Vec<FileStat>> {
++    // 标记新文件意图（仅登记，不真正暂存），这样未跟踪的新文件也会出现在 diff 里
++    let _ = git(&wt.path, &["add", "-N", "."]);
+     let out = git(&wt.path, &["diff", "--numstat", base])?;
+     let mut stats = Vec::new();
+     for line in out.lines() {
+         let cols: Vec<&str> = line.split('\t').collect();
+         if cols.len() != 3 {
+             continue;
+         }
+         stats.push(FileStat {
+             added: cols[0].parse().unwrap_or(0),
+             removed: cols[1].parse().unwrap_or(0),
+@@ -154,20 +155,27 @@ mod tests {
+ 
+     #[test]
+     fn creates_and_removes_worktree() {
+         let repo = init_repo();
+         let wt = create_worktree(repo.path(), "s1").unwrap();
+         assert!(wt.path.join("a.txt").exists());
+         assert_eq!(wt.branch, "dct/s1");
+         assert!(wt.path.to_string_lossy().contains("dct-worktrees"));
+         remove_worktree(&wt).unwrap();
+         assert!(!wt.path.exists());
++        // 分支必须保留：上面存的是这个会话干的活
++        let branches = std::process::Command::new("git")
++            .args(["branch", "--list", "dct/s1"])
++            .current_dir(repo.path())
++            .output()
++            .unwrap();
++        assert!(String::from_utf8_lossy(&branches.stdout).contains("dct/s1"));
+     }
+ 
+     #[test]
+     fn checkpoint_then_reset_discards_changes() {
+         let repo = init_repo();
+         let wt = create_worktree(repo.path(), "s2").unwrap();
+ 
+         let base = checkpoint(&wt, "before").unwrap();
+ 
+         fs::write(wt.path.join("a.txt"), "changed\n").unwrap();
+@@ -203,11 +211,30 @@ mod tests {
+         let wt = create_worktree(repo.path(), "s4").unwrap();
+         let base = checkpoint(&wt, "c0").unwrap();
+         fs::write(wt.path.join("a.txt"), "hello\nworld\n").unwrap();
+ 
+         let stats = diff_stat(&wt, &base).unwrap();
+         assert_eq!(stats.len(), 1);
+         assert_eq!(stats[0].path, "a.txt");
+         assert_eq!(stats[0].added, 1);
+         assert_eq!(stats[0].removed, 0);
+     }
++
++    #[test]
++    fn diff_stat_includes_untracked_new_files() {
++        let repo = init_repo();
++        let wt = create_worktree(repo.path(), "s5").unwrap();
++        let base = checkpoint(&wt, "c0").unwrap();
++
++        fs::write(wt.path.join("brand-new.txt"), "one\ntwo\n").unwrap();
++
++        let stats = diff_stat(&wt, &base).unwrap();
++        assert_eq!(
++            stats.len(),
++            1,
++            "新建文件必须出现在 diff 里，实际: {stats:?}"
++        );
++        assert_eq!(stats[0].path, "brand-new.txt");
++        assert_eq!(stats[0].added, 2);
++        assert_eq!(stats[0].removed, 0);
++    }
+ }

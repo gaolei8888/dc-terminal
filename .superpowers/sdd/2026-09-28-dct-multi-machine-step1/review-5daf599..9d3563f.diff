@@ -1,0 +1,634 @@
+# Review package: 5daf599..9d3563f
+
+## Commits
+9d3563f fix(mesh): refuse pre-restart replays and never silently change machine identity
+
+## Files changed
+ src/mesh/mod.rs   | 102 ++++++++++++++++++++---
+ src/mesh/store.rs | 241 ++++++++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 313 insertions(+), 30 deletions(-)
+
+## Diff
+diff --git a/src/mesh/mod.rs b/src/mesh/mod.rs
+index b2a98ae..298e152 100644
+--- a/src/mesh/mod.rs
++++ b/src/mesh/mod.rs
+@@ -48,60 +48,84 @@ const SEEN_CAP: usize = 1024;
+ /// Task 7 按会话名解析、投递。
+ pub const UNRESOLVED_SESSION: u32 = 0;
+ 
+ /// 一条等着投进会话的留言。
+ #[derive(Debug, Clone)]
+ pub struct QueuedMsg {
+     pub msg: Message,
+     pub received_at: Instant,
+ }
+ 
+-/// 最近见过的 `(from, id)`，先进先出、有上限。
++/// 最近见过的 `(from, id)`，带着它的 `sent_at`。
++///
++/// 两种方式往外挤：按年龄（`sent_at` 已经落到窗口外面的，反正回放进来也会
++/// 被窗口挡掉，不用再记），和按条数（`SEEN_CAP`，兜底，防一个发件人刷爆
++/// 内存）。
+ #[derive(Default)]
+ struct Seen {
+-    order: VecDeque<(String, String)>,
++    order: VecDeque<(String, String, u64)>,
+     set: HashSet<(String, String)>,
+ }
+ 
+ impl Seen {
+     /// 第一次见返回 `true` 并记下；见过返回 `false`。
+-    fn first_time(&mut self, from: &str, id: &str) -> bool {
++    fn first_time(&mut self, from: &str, id: &str, sent_at: u64, now: u64) -> bool {
++        self.evict_older_than(now.saturating_sub(SENT_AT_WINDOW_SECS));
+         let key = (from.to_string(), id.to_string());
+         if self.set.contains(&key) {
+             return false;
+         }
+         if self.order.len() >= SEEN_CAP {
+-            if let Some(old) = self.order.pop_front() {
+-                self.set.remove(&old);
++            if let Some((f, i, _)) = self.order.pop_front() {
++                self.set.remove(&(f, i));
+             }
+         }
+-        self.order.push_back(key.clone());
++        self.order
++            .push_back((key.0.clone(), key.1.clone(), sent_at));
+         self.set.insert(key);
+         true
+     }
++
++    /// 扔掉 `sent_at` 早于 `cutoff` 的。`order` 按收到的顺序排，不按
++    /// `sent_at` 排，所以要扫一遍而不是只看队头——一条未来时间的留言排在
++    /// 前面，不该挡住后面已经过期的。
++    fn evict_older_than(&mut self, cutoff: u64) {
++        let set = &mut self.set;
++        self.order.retain(|(f, i, t)| {
++            let keep = *t >= cutoff;
++            if !keep {
++                set.remove(&(f.clone(), i.clone()));
++            }
++            keep
++        });
++    }
+ }
+ 
+ type Clock = Box<dyn Fn() -> u64 + Send>;
+ type Rand = Box<dyn Fn() -> [u8; 32] + Send>;
+ 
+ /// 守护进程里这台电脑在组里的状态。放在 `Arc<Mutex<..>>` 里共享。
+ pub struct Mesh {
+     pub keys: MachineKeys,
+     pub me: Member,
+     pub roster: Option<SignedRoster>,
+     /// 等人批准的加入请求：请求、6 位核对码、收到的时间。Task 6 填。
+     pub pending_joins: Vec<(JoinRequest, String, Instant)>,
+     /// 按会话 id 排队的留言。Task 7 投递。
+     pub queues: HashMap<u32, VecDeque<QueuedMsg>>,
+     store: Option<store::Store>,
+     journal: Arc<Journal>,
+     seen: Seen,
++    /// 这个进程从什么时候开始收（unix 秒）。`sent_at` 早于它的留言一律不收：
++    /// 去重表只活在内存里，重启就空了，没有这一条，重启前收过的留言在窗口
++    /// 之内可以原样再回放一遍。第一步没有离线留言，合法的东西不会因此丢。
++    started_at: u64,
+     clock: Clock,
+     rand: Rand,
+ }
+ 
+ impl Mesh {
+     /// `name` 是这台电脑想叫的名字；名单里已经有我，就以名单里那条记录为准
+     /// （`added_at` 之类的字段是签进名单里的，自己另编一份就对不上了）。
+     pub fn new(keys: MachineKeys, name: String, roster: Option<SignedRoster>) -> Mesh {
+         let endpoint = id::endpoint_for(&keys.sign_pub());
+         let me = roster
+@@ -116,20 +140,21 @@ impl Mesh {
+             });
+         Mesh {
+             keys,
+             me,
+             roster,
+             pending_joins: Vec::new(),
+             queues: HashMap::new(),
+             store: None,
+             journal: Arc::new(Journal::new()),
+             seen: Seen::default(),
++            started_at: unix_now(),
+             clock: Box::new(unix_now),
+             rand: Box::new(os_rand),
+         }
+     }
+ 
+     /// 从磁盘读出（第一次就生成）钥匙、名字、名单。
+     pub fn load(store: store::Store) -> anyhow::Result<Mesh> {
+         let keys = store.load_or_create_keys(&os_rand)?;
+         let name = store.name()?;
+         let roster = store.roster()?;
+@@ -140,25 +165,34 @@ impl Mesh {
+     pub fn with_store(mut self, s: store::Store) -> Mesh {
+         self.store = Some(s);
+         self
+     }
+ 
+     pub fn with_journal(mut self, j: Arc<Journal>) -> Mesh {
+         self.journal = j;
+         self
+     }
+ 
++    /// 换时钟。进程起点跟着换成这个时钟的「现在」——见 `started_at`。
+     pub fn with_clock(mut self, c: impl Fn() -> u64 + Send + 'static) -> Mesh {
++        self.started_at = c();
+         self.clock = Box::new(c);
+         self
+     }
+ 
++    /// 测试用：直接指定进程起点。
++    #[cfg(test)]
++    fn with_started_at(mut self, t: u64) -> Mesh {
++        self.started_at = t;
++        self
++    }
++
+     pub fn with_rand(mut self, r: impl Fn() -> [u8; 32] + Send + 'static) -> Mesh {
+         self.rand = Box::new(r);
+         self
+     }
+ 
+     pub fn endpoint(&self) -> &str {
+         &self.me.endpoint
+     }
+ 
+     /// 电脑信封的唯一入口。返回值是要回给发件方的 payload；`None` = 不回。
+@@ -210,21 +244,24 @@ impl Mesh {
+             return self.drop(env, "sealed_without_group");
+         };
+         let m = match seal::open(s, &self.keys, &current.roster, env.from.as_str()) {
+             Ok(m) => m,
+             Err(e) => return self.drop(env, &format!("sealed_{e:?}")),
+         };
+         let now = (self.clock)();
+         if now.abs_diff(m.sent_at) > SENT_AT_WINDOW_SECS {
+             return self.drop(env, "stale");
+         }
+-        if !self.seen.first_time(&m.from, &m.id) {
++        if m.sent_at < self.started_at {
++            return self.drop(env, "before_start");
++        }
++        if !self.seen.first_time(&m.from, &m.id, m.sent_at, now) {
+             return self.drop(env, "replay");
+         }
+         match m.kind {
+             Kind::Msg => {
+                 let key = session_key(&m.to_session);
+                 self.queues.entry(key).or_default().push_back(QueuedMsg {
+                     msg: m.clone(),
+                     received_at: Instant::now(),
+                 });
+                 self.reply(&m, Kind::Receipt, "queued".to_string())
+@@ -329,22 +366,27 @@ mod tests {
+ 
+     /// A 建组、把 B 签进去（version 2）。返回两台都拿着 v2 名单的 `Mesh`。
+     fn pair_ab() -> (Mesh, Mesh, SignedRoster) {
+         let (ka, kb) = (keys(1), keys(2));
+         let (ma, mb) = (member(&ka, "A"), member(&kb, "B"));
+         let g = roster::genesis(ma.clone(), "mine".into(), &ka);
+         let mut r2 = g.roster.clone();
+         r2.version = 2;
+         r2.members.push(mb);
+         let v2 = roster::sign(r2, &ma, &ka);
+-        let a = Mesh::new(ka, "A".into(), Some(v2.clone())).with_clock(|| NOW);
+-        let b = Mesh::new(kb, "B".into(), Some(v2.clone())).with_clock(|| NOW);
++        // 进程起点放在窗口之前，窗口那几条测试才测得到窗口本身。
++        let a = Mesh::new(ka, "A".into(), Some(v2.clone()))
++            .with_clock(|| NOW)
++            .with_started_at(NOW - 2 * SENT_AT_WINDOW_SECS);
++        let b = Mesh::new(kb, "B".into(), Some(v2.clone()))
++            .with_clock(|| NOW)
++            .with_started_at(NOW - 2 * SENT_AT_WINDOW_SECS);
+         (a, b, v2)
+     }
+ 
+     fn env(from: &str, to: &str, payload: Vec<u8>) -> Envelope {
+         Envelope {
+             from: EndpointId::new(from).unwrap(),
+             to: EndpointId::new(to).unwrap(),
+             seq: 1,
+             payload,
+             recipients: vec![],
+@@ -456,27 +498,61 @@ mod tests {
+         assert!(
+             b.on_envelope(&sealed_env(&a, &b, &edge)).is_some(),
+             "窗口边上还该收"
+         );
+     }
+ 
+     #[test]
+     fn the_seen_set_is_bounded() {
+         let mut s = Seen::default();
+         for i in 0..SEEN_CAP + 10 {
+-            assert!(s.first_time("c-a", &i.to_string()));
++            assert!(s.first_time("c-a", &i.to_string(), NOW, NOW));
+         }
+         assert_eq!(s.order.len(), SEEN_CAP);
+         assert_eq!(s.set.len(), SEEN_CAP);
+-        assert!(!s.first_time("c-a", &(SEEN_CAP + 9).to_string()));
+-        assert!(s.first_time("c-a", "0"), "最老的已经被挤出去了");
+-        assert!(s.first_time("c-b", "5"), "去重键里有 from");
++        assert!(!s.first_time("c-a", &(SEEN_CAP + 9).to_string(), NOW, NOW));
++        assert!(s.first_time("c-a", "0", NOW, NOW), "最老的已经被挤出去了");
++        assert!(s.first_time("c-b", "5", NOW, NOW), "去重键里有 from");
++    }
++
++    /// 按年龄挤：`sent_at` 落到窗口外的条目被清掉，窗口内的留着。
++    #[test]
++    fn the_seen_set_forgets_entries_older_than_the_window() {
++        let mut s = Seen::default();
++        assert!(s.first_time("c-a", "old", NOW, NOW));
++        // 一条未来时间的排在中间，不该挡住后面过期条目的清理。
++        assert!(s.first_time("c-a", "future", NOW + 500, NOW));
++        assert!(s.first_time("c-a", "young", NOW + 100, NOW + 100));
++        let later = NOW + SENT_AT_WINDOW_SECS + 1;
++        assert!(s.first_time("c-a", "x", later, later));
++        let ids: Vec<&str> = s.order.iter().map(|(_, i, _)| i.as_str()).collect();
++        assert_eq!(ids, ["future", "young", "x"]);
++        assert_eq!(s.set.len(), 3);
++    }
++
++    /// 重启之后，去重表是空的——窗口之内的旧留言靠「早于进程起点」挡住。
++    #[test]
++    fn a_message_accepted_before_a_restart_is_refused_after_it() {
++        let (a, mut b, v2) = pair_ab();
++        let e = sealed_env(&a, &b, &msg(&a, &b, Kind::Msg, "m1", NOW));
++        assert!(b.on_envelope(&e).is_some());
++
++        // 「重启」：同一把钥匙、同一份名单，一个新的 Mesh，起点在 NOW 之后。
++        let restarted_keys = keys(2);
++        let mut b2 = Mesh::new(restarted_keys, "B".into(), Some(v2)).with_clock(|| NOW + 30);
++        assert_eq!(b2.endpoint(), b.endpoint());
++        assert_eq!(b2.on_envelope(&e), None, "重启前收过的不该再收一次");
++        assert!(b2.queues.is_empty());
++
++        // 重启之后新发的照收。
++        let fresh = sealed_env(&a, &b2, &msg(&a, &b2, Kind::Msg, "m2", NOW + 30));
++        assert!(b2.on_envelope(&fresh).is_some());
+     }
+ 
+     #[test]
+     fn a_roster_with_a_bad_signature_is_dropped_and_the_old_one_kept() {
+         let (a, mut b, v2) = pair_ab();
+         let mut r3 = v2.roster.clone();
+         r3.version = 3;
+         r3.members.retain(|m| m.name != "B");
+         let mut forged = roster::sign(r3, &a.me, &a.keys);
+         // 签名换成另一把钥匙签的：形状完全合法，只是验不过。
+diff --git a/src/mesh/store.rs b/src/mesh/store.rs
+index 0436b22..b80e49f 100644
+--- a/src/mesh/store.rs
++++ b/src/mesh/store.rs
+@@ -13,20 +13,26 @@ use std::path::{Path, PathBuf};
+ 
+ use anyhow::{anyhow, bail, Context, Result};
+ use base64::{engine::general_purpose::STANDARD, Engine as _};
+ use dct_mesh::roster::MAX_NAME_LEN;
+ use dct_mesh::{MachineKeys, SignedRoster};
+ 
+ const SIGN_KEY: &str = "sign.key";
+ const KX_KEY: &str = "kx.key";
+ const NAME: &str = "name";
+ const ROSTER: &str = "roster.json";
++const KEYS_LOCK: &str = ".keys.lock";
++
++/// 等别的进程生成钥匙最多等多久。生成本身是几毫秒的事。
++const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
++/// 锁文件多旧就当成是崩掉的进程留下的。
++const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+ 
+ pub struct Store {
+     dir: PathBuf,
+ }
+ 
+ impl Store {
+     pub fn at(dir: PathBuf) -> Store {
+         Store { dir }
+     }
+ 
+@@ -40,57 +46,88 @@ impl Store {
+     }
+ 
+     /// 读出这台电脑的两把钥匙；还没有就用 `rand` 生成、落盘。
+     ///
+     /// 两个文件的写入顺序是有讲究的：**先落 `kx.key`，再落 `sign.key`**，于是
+     /// 「`sign.key` 在」就意味着两把都完整写过。只有 `kx.key` 没有 `sign.key`
+     /// 是上次写到一半断了——那时这台电脑的身份还从没被用过（端点 id 由
+     /// `sign.key` 算出），整套重新生成是安全的。反过来「有 `sign.key` 没有
+     /// `kx.key`」不可能由我们自己写出来，是有人动过这个目录，**不猜、报错**：
+     /// 悄悄补一把新的 `kx.key` 等于让组里其它电脑加密给我的东西全都解不开。
++    ///
++    /// **名单还在、钥匙却不全，一律报错，不重新生成。** 那种情况下生成一把新
++    /// 钥匙，这台电脑的端点就悄悄换了：名单上写着的还是旧端点，组里谁发来
++    /// 的东西都解不开、验不过，而用户看到的只是「多电脑不灵了」。要重来就让
++    /// 用户自己删掉整个目录，那是一个看得见的决定。
++    ///
++    /// 生成的那一段在 `.keys.lock` 里做：`dct login` 和守护进程可能同一刻
++    /// 都发现「还没有钥匙」，没有这把锁，两边各写一半，落盘的就是一把
++    /// 进程 A 的 `kx.key` 配进程 B 的 `sign.key`。
+     pub fn load_or_create_keys(&self, rand: &dyn Fn() -> [u8; 32]) -> Result<MachineKeys> {
+-        let sign_path = self.dir.join(SIGN_KEY);
+-        let kx_path = self.dir.join(KX_KEY);
+-        if sign_path.exists() {
+-            if !kx_path.exists() {
+-                bail!(
+-                    "{} 在，{} 却不见了——不会替你重新生成（那会换掉这台电脑的加密钥匙）",
+-                    sign_path.display(),
+-                    kx_path.display()
+-                );
+-            }
+-            let sign = read_seed(&sign_path)?;
+-            let kx = read_seed(&kx_path)?;
+-            return MachineKeys::from_seeds(sign, kx)
+-                .map_err(|e| anyhow!("{} 不是一把能用的钥匙：{e}", sign_path.display()));
++        if let Some(k) = self.existing_keys()? {
++            return Ok(k);
+         }
+-
+         self.ensure_dir()?;
++        let _lock = KeysLock::acquire(&self.dir.join(KEYS_LOCK), LOCK_WAIT, LOCK_STALE)?;
++        // 等锁的时候别人可能已经生成好了。
++        if let Some(k) = self.existing_keys()? {
++            return Ok(k);
++        }
++
+         // P-256 的种子要落在 [1, n) 里，随机 32 字节落在外面的概率约 2^-32；
+         // 连着好几次都落在外面，说明 `rand` 坏了，不是运气差。
+         let mut attempt = 0;
+         let (sign, kx, keys) = loop {
+             let sign = rand();
+             let kx = rand();
+             if let Ok(k) = MachineKeys::from_seeds(sign, kx) {
+                 break (sign, kx, k);
+             }
+             attempt += 1;
+             if attempt >= 8 {
+                 bail!("随机数给不出一把合法的签名钥匙，随机源可能坏了");
+             }
+         };
+-        write_atomic(&kx_path, STANDARD.encode(kx).as_bytes())?;
+-        write_atomic(&sign_path, STANDARD.encode(sign).as_bytes())?;
++        write_atomic(&self.dir.join(KX_KEY), STANDARD.encode(kx).as_bytes())?;
++        write_atomic(&self.dir.join(SIGN_KEY), STANDARD.encode(sign).as_bytes())?;
+         Ok(keys)
+     }
+ 
++    /// 磁盘上已经有完整的一对就读出来；还没有（可以生成）就是 `None`；
++    /// 不能生成（见 `load_or_create_keys`）就报错。
++    fn existing_keys(&self) -> Result<Option<MachineKeys>> {
++        let sign_path = self.dir.join(SIGN_KEY);
++        let kx_path = self.dir.join(KX_KEY);
++        let (has_sign, has_kx) = (sign_path.exists(), kx_path.exists());
++        if has_sign && has_kx {
++            let sign = read_seed(&sign_path)?;
++            let kx = read_seed(&kx_path)?;
++            return MachineKeys::from_seeds(sign, kx)
++                .map(Some)
++                .map_err(|e| anyhow!("{} 不是一把能用的钥匙：{e}", sign_path.display()));
++        }
++        if self.dir.join(ROSTER).exists() {
++            bail!(
++                "这台电脑的多电脑钥匙丢了，但组名单还在；要重置请删除 {} 后重新 dct login",
++                self.dir.display()
++            );
++        }
++        if has_sign {
++            bail!(
++                "{} 在，{} 却不见了——不会替你重新生成（那会换掉这台电脑的加密钥匙）",
++                sign_path.display(),
++                kx_path.display()
++            );
++        }
++        Ok(None)
++    }
++
+     /// 这台电脑在组里叫什么。没设过就是主机名（整理成名单接受的样子）。
+     pub fn name(&self) -> Result<String> {
+         match std::fs::read_to_string(self.dir.join(NAME)) {
+             Ok(s) => Ok(s.trim().to_string()),
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(tidy_name(&hostname())),
+             Err(e) => Err(e).context("读不了电脑名"),
+         }
+     }
+ 
+     /// 改名。规则跟名单的一样（`roster::accept` 会拒掉不合规的名字），在这里
+@@ -133,20 +170,75 @@ impl Store {
+ }
+ 
+ /// 跟着 socket 走，测试把 socket 放临时目录就自动隔离（同 `secrets_path_for_socket`）。
+ pub fn dir_for_socket(socket: &Path) -> PathBuf {
+     match socket.parent() {
+         Some(d) => d.join("mesh"),
+         None => PathBuf::from("mesh"),
+     }
+ }
+ 
++/// 跨进程的「我在生成钥匙」：独占创建一个文件，用完删掉。
++///
++/// 进程崩在中间会留下锁文件，所以超过 `stale` 的锁当成没人拿着、删掉重来；
++/// 生成钥匙只要几毫秒，一把一分钟前的锁不可能还有人在用。
++struct KeysLock {
++    path: PathBuf,
++}
++
++impl KeysLock {
++    fn acquire(
++        path: &Path,
++        wait: std::time::Duration,
++        stale: std::time::Duration,
++    ) -> Result<KeysLock> {
++        let deadline = std::time::Instant::now() + wait;
++        loop {
++            match std::fs::OpenOptions::new()
++                .write(true)
++                .create_new(true)
++                .open(path)
++            {
++                Ok(_) => {
++                    return Ok(KeysLock {
++                        path: path.to_path_buf(),
++                    })
++                }
++                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
++                    let age = std::fs::metadata(path)
++                        .and_then(|m| m.modified())
++                        .ok()
++                        .and_then(|t| t.elapsed().ok());
++                    if age.is_some_and(|a| a > stale) {
++                        let _ = std::fs::remove_file(path);
++                        continue;
++                    }
++                    if std::time::Instant::now() >= deadline {
++                        bail!(
++                            "另一个 dct 正在生成多电脑钥匙，等不到它结束（{}）",
++                            path.display()
++                        );
++                    }
++                    std::thread::sleep(std::time::Duration::from_millis(20));
++                }
++                Err(e) => return Err(e).with_context(|| format!("建不了 {}", path.display())),
++            }
++        }
++    }
++}
++
++impl Drop for KeysLock {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_file(&self.path);
++    }
++}
++
+ fn read_seed(path: &Path) -> Result<[u8; 32]> {
+     let text =
+         std::fs::read_to_string(path).with_context(|| format!("读不了 {}", path.display()))?;
+     let raw = STANDARD
+         .decode(text.trim())
+         .with_context(|| format!("{} 不是 base64", path.display()))?;
+     raw.try_into()
+         .map_err(|_| anyhow!("{} 不是 32 字节", path.display()))
+ }
+ 
+@@ -308,20 +400,135 @@ mod tests {
+             let mode = std::fs::metadata(s.dir().join(f))
+                 .unwrap()
+                 .permissions()
+                 .mode();
+             assert_eq!(mode & 0o777, 0o600, "{f}");
+         }
+         let dir_mode = std::fs::metadata(s.dir()).unwrap().permissions().mode();
+         assert_eq!(dir_mode & 0o777, 0o700);
+     }
+ 
++    #[test]
++    fn missing_keys_with_a_roster_present_is_an_error_not_a_new_identity() {
++        let (_t, s) = store();
++        let k = s.load_or_create_keys(&counter_rand()).unwrap();
++        s.save_roster(&genesis(member_of(&k, "laptop"), "mine".into(), &k))
++            .unwrap();
++
++        for gone in [&[SIGN_KEY, KX_KEY][..], &[SIGN_KEY][..], &[KX_KEY][..]] {
++            let (_t2, s2) = store();
++            std::fs::create_dir_all(s2.dir()).unwrap();
++            for f in [SIGN_KEY, KX_KEY, ROSTER] {
++                std::fs::copy(s.dir().join(f), s2.dir().join(f)).unwrap();
++            }
++            for f in gone {
++                std::fs::remove_file(s2.dir().join(f)).unwrap();
++            }
++            let err = s2
++                .load_or_create_keys(&|| panic!("不该生成新钥匙"))
++                .err()
++                .unwrap_or_else(|| panic!("少了 {gone:?} 该报错"));
++            assert!(
++                err.to_string().contains("钥匙丢了，但组名单还在"),
++                "{gone:?}: {err}"
++            );
++            for f in [SIGN_KEY, KX_KEY] {
++                if gone.contains(&f) {
++                    assert!(!s2.dir().join(f).exists(), "{f} 不该被补上");
++                }
++            }
++        }
++    }
++
++    /// 写入顺序：`kx.key` 先落盘。让 `kx.key` 那一步失败，`sign.key` 就绝不
++    /// 能出现——顺序反过来的话，这里会留下一把孤零零的 `sign.key`，下次启动
++    /// 就是「有 sign 没 kx」那个报错。
++    #[test]
++    fn kx_key_is_written_before_sign_key() {
++        let (_t, s) = store();
++        std::fs::create_dir_all(s.dir()).unwrap();
++        std::fs::create_dir(s.dir().join("kx.key.tmp")).unwrap();
++        assert!(s.load_or_create_keys(&counter_rand()).is_err());
++        assert!(!s.dir().join(SIGN_KEY).exists());
++    }
++
++    /// 别的进程拿着锁的时候，这边等它，然后读它生成的那一对，不自己再生成。
++    #[test]
++    fn a_held_keys_lock_makes_the_other_creator_wait_and_reuse_the_keys() {
++        let (t, s) = store();
++        std::fs::create_dir_all(s.dir()).unwrap();
++        let lock = KeysLock::acquire(
++            &s.dir().join(KEYS_LOCK),
++            std::time::Duration::from_secs(1),
++            LOCK_STALE,
++        )
++        .unwrap();
++        let dir = t.path().join("mesh");
++        let waiter = std::thread::spawn(move || {
++            Store::at(dir)
++                .load_or_create_keys(&|| [5u8; 32])
++                .map(|k| k.sign_pub())
++        });
++        std::thread::sleep(std::time::Duration::from_millis(200));
++        assert!(!waiter.is_finished(), "锁还在，不该往下走");
++        assert!(!s.dir().join(SIGN_KEY).exists());
++        // 「另一个进程」在锁里把钥匙写好，然后放锁。
++        let mine = MachineKeys::from_seeds([7; 32], [8; 32]).unwrap();
++        write_atomic(&s.dir().join(KX_KEY), STANDARD.encode([8u8; 32]).as_bytes()).unwrap();
++        write_atomic(
++            &s.dir().join(SIGN_KEY),
++            STANDARD.encode([7u8; 32]).as_bytes(),
++        )
++        .unwrap();
++        drop(lock);
++        assert_eq!(waiter.join().unwrap().unwrap(), mine.sign_pub());
++        assert!(!s.dir().join(KEYS_LOCK).exists(), "用完要删锁");
++    }
++
++    #[test]
++    fn a_stale_keys_lock_left_by_a_crash_is_broken() {
++        let (_t, s) = store();
++        std::fs::create_dir_all(s.dir()).unwrap();
++        let f = std::fs::File::create(s.dir().join(KEYS_LOCK)).unwrap();
++        f.set_modified(std::time::SystemTime::now() - LOCK_STALE * 2)
++            .unwrap();
++        drop(f);
++        assert!(s.load_or_create_keys(&counter_rand()).is_ok());
++    }
++
++    /// 两个进程同时第一次建钥匙：拿到的必须是同一对，磁盘上也是那一对。
++    #[test]
++    fn concurrent_creators_end_up_with_one_matching_pair() {
++        for _ in 0..20 {
++            let t = tempfile::tempdir().unwrap();
++            let dir = t.path().join("mesh");
++            let spawn = |seed: u8| {
++                let d = dir.clone();
++                std::thread::spawn(move || {
++                    let n = Cell::new(seed);
++                    Store::at(d)
++                        .load_or_create_keys(&move || {
++                            n.set(n.get().wrapping_add(1));
++                            [n.get(); 32]
++                        })
++                        .map(|k| (k.sign_pub(), k.kx_pub()))
++                        .unwrap()
++                })
++            };
++            let (a, b) = (spawn(10), spawn(100));
++            let (a, b) = (a.join().unwrap(), b.join().unwrap());
++            assert_eq!(a, b);
++            let disk = Store::at(dir).load_or_create_keys(&|| [1; 32]).unwrap();
++            assert_eq!((disk.sign_pub(), disk.kx_pub()), a);
++        }
++    }
++
+     #[test]
+     fn no_roster_yet_is_none() {
+         let (_t, s) = store();
+         assert!(s.roster().unwrap().is_none());
+     }
+ 
+     #[test]
+     fn a_saved_roster_reads_back() {
+         let (_t, s) = store();
+         let k = s.load_or_create_keys(&counter_rand()).unwrap();

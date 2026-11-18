@@ -1,0 +1,207 @@
+# Review package: cc23a20..9877dca
+
+## Commits
+9877dca fix(game): a slow settle reply never makes the swipe look unsent, and a malformed settle report is not read as a bounce-back
+639d576 docs(game): show a text on the octopus while the model is being asked
+
+## Files changed
+ crates/dct-game/src/dco.rs                         | 27 ++++++++++++---
+ crates/dct-game/src/dco_tests.rs                   | 39 ++++++++++++++++++++++
+ .../plans/2026-10-04-dct-dco-settle-and-moods.md   |  1 +
+ 3 files changed, 62 insertions(+), 5 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/dco.rs b/crates/dct-game/src/dco.rs
+index 4ba4ddd..24a4154 100644
+--- a/crates/dct-game/src/dco.rs
++++ b/crates/dct-game/src/dco.rs
+@@ -13,21 +13,25 @@ use std::time::Duration;
+ pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
+ 
+ pub struct DcoClient {
+     r: BufReader<UnixStream>,
+     w: UnixStream,
+     next_id: u64,
+     /// 这台 dco 没有 show_status（太旧）或者回得太慢：这条连接上不再发，免得每一步白等。
+     no_show_status: bool,
+     /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
+     no_see_text: bool,
++    /// 这台 dco 不认 swipe 的 `settle` 参数（回复里没有 `settle`）：这条连接上不再带，免得每步白发。
++    /// 注意只有「回复里压根没有 settle」才置位；等待出错、报告读不懂都不算。
+     no_swipe_settle: bool,
++    /// 带 settle 的 swipe 等回复的时长：要比 dco 自己最多等的 `SETTLE_TIMEOUT_MS` 还长，否则会把还在等的划动当成失败。
++    pub(crate) settle_call_timeout: Duration,
+     /// 一次请求等回复的总时长；跳过别的回复也算在里面。
+     timeout: Duration,
+ }
+ 
+ fn err(code: &str, message: impl Into<String>) -> DcoError {
+     DcoError { code: code.into(), message: message.into() }
+ }
+ 
+ /// 读写出错：超时单独说，别的都当作 dco 断开了。
+ fn io_err(e: &std::io::Error) -> DcoError {
+@@ -53,21 +57,21 @@ impl DcoClient {
+             .ok_or_else(|| err("dco_down", "dco 没在运行，先打开 dco 再试"))?;
+         let socket = endpoint["socket"].as_str().ok_or_else(|| err("dco_down", "dco 没在运行，先打开 dco 再试"))?;
+         let token = std::fs::read_to_string(dir.join("token")).map_err(|_| err("dco_down", "读不到 dco 的钥匙文件，dco 还没启动过？"))?;
+         let stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
+             std::io::ErrorKind::PermissionDenied => err("dco_blocked", "这里不让连 dco"),
+             _ => err("dco_down", "dco 没在运行，先打开 dco 再试"),
+         })?;
+         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
+         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
+         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
+-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, no_swipe_settle: false, timeout };
++        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, no_swipe_settle: false, settle_call_timeout: timeout.max(Duration::from_millis(SETTLE_TIMEOUT_MS as u64 + 4000)), timeout };
+         c.send(&json!({ "dco_token": token.trim() }))?;
+         let ack = c.read_line()?;
+         if ack.get("ok") != Some(&Value::Bool(true)) {
+             return Err(err("dco_refused", "dco 拒绝了连接"));
+         }
+         let init = c.request("initialize", json!({
+             "protocolVersion": "2025-06-18", "capabilities": {},
+             "clientInfo": { "name": "dct", "version": env!("CARGO_PKG_VERSION") }
+         }))?;
+         let _ = init;
+@@ -155,43 +159,56 @@ impl Dco for DcoClient {
+     }
+ 
+     fn swipe_settle(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> SwipeOutcome {
+         if self.no_swipe_settle {
+             return match self.swipe(p, from, to) {
+                 Err(e) => SwipeOutcome::NotSwiped(e),
+                 Ok(()) => SwipeOutcome::SwipedNoSettle(err("unsupported", "这个 dco 不会等屏幕稳定")),
+             };
+         }
+         let [x, y, w, h] = p.region;
+-        let body = match self.call("swipe", json!({
++        let normal = self.timeout;
++        self.timeout = self.settle_call_timeout;
++        let _ = self.w.set_read_timeout(Some(self.timeout));
++        let res = self.call("swipe", json!({
+             "window": p.window,
+             "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
+             "settle": { "quiet_ms": SETTLE_QUIET_MS, "timeout_ms": SETTLE_TIMEOUT_MS, "region": { "x": x, "y": y, "w": w, "h": h } },
+-        })) {
++        }));
++        self.timeout = normal;
++        let _ = self.w.set_read_timeout(Some(normal));
++        let body = match res {
+             Ok(b) => b,
++            // 请求已经写出去了，划动很可能已经发生：不能说「没划」，否则调用方会再划一次。
++            // 其他传输错误（断线等）分不清是写出前还是写出后，保持 NotSwiped。
++            Err(e) if e.code == "dco_timeout" => return SwipeOutcome::SwipedNoSettle(e),
+             Err(e) => return SwipeOutcome::NotSwiped(e),
+         };
+         // 到这里划动已经发生；下面任何一种“没拿到报告”都不许再划。
+         let s = &body["settle"];
+         if !s.is_object() {
+             // 旧 dco 不认 settle 参数，只划了。以后别再带。
+             self.no_swipe_settle = true;
+             return SwipeOutcome::SwipedNoSettle(err("unsupported", "这个 dco 不会等屏幕稳定"));
+         }
+         if s["error"].is_object() {
+             let e = &s["error"];
+             return SwipeOutcome::SwipedNoSettle(err(e["code"].as_str().unwrap_or("dco_error"), e["message"].as_str().unwrap_or("等屏幕稳定时出错")));
+         }
++        // 缺 changed / settled 的报告不能当「弹回原样」用。
++        let (Some(changed), Some(settled)) = (s["changed"].as_bool(), s["settled"].as_bool()) else {
++            return SwipeOutcome::SwipedNoSettle(err("bad_settle", "dco 回的稳定报告读不懂"));
++        };
+         SwipeOutcome::Settled(SwipeSettle {
+-            changed: s["changed"].as_bool().unwrap_or(false),
++            changed,
+             change: s["change"].as_f64().unwrap_or(0.0),
+-            settled: s["settled"].as_bool().unwrap_or(false),
++            settled,
+             timed_out: s["timed_out"].as_bool().unwrap_or(false),
+             settled_ms: s["settled_ms"].as_u64(),
+         })
+     }
+ 
+     fn see_text(&mut self, p: &Profile) -> Result<Seen, DcoError> {
+         if self.no_see_text {
+             return Err(err("unsupported", "这个 dco 不会认画面上的字"));
+         }
+         let body = match self.call("see", json!({ "window": p.window, "source": "ocr" })) {
+diff --git a/crates/dct-game/src/dco_tests.rs b/crates/dct-game/src/dco_tests.rs
+index 5d691ce..99718e8 100644
+--- a/crates/dct-game/src/dco_tests.rs
++++ b/crates/dct-game/src/dco_tests.rs
+@@ -527,10 +527,49 @@ fn swipe_settle_timeout_is_returned_for_the_caller_to_judge() {
+     let r = json!({"swiped":true,"settle":{"changed":true,"change":0.2,"settled":false,"timed_out":true}});
+     let (h, _) = settle_fake(dir.path(), vec![(r, false)]);
+     let mut c = DcoClient::connect(dir.path()).unwrap();
+     assert_eq!(
+         c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)),
+         SwipeOutcome::Settled(SwipeSettle { changed: true, change: 0.2, settled: false, timed_out: true, settled_ms: None })
+     );
+     drop(c);
+     h.join().unwrap();
+ }
++
++#[test]
++fn swipe_settle_client_timeout_is_swiped_no_settle_and_late_reply_is_skipped() {
++    let dir = tempfile::tempdir().unwrap();
++    let n = std::sync::atomic::AtomicUsize::new(0);
++    let h = fake(dir.path(), TOKEN, move |tool, args| {
++        assert_eq!(tool, "swipe");
++        assert!(args.get("settle").is_some());
++        if n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
++            std::thread::sleep(std::time::Duration::from_millis(500));
++            (json!({"swiped":true,"settle":{"changed":true,"settled":true}}), false)
++        } else {
++            (json!({"swiped":true,"settle":{"changed":false,"change":0.0,"settled":true,"timed_out":false,"settled_ms":5}}), false)
++        }
++    });
++    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
++    c.settle_call_timeout = std::time::Duration::from_millis(250);
++    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "dco_timeout"));
++    c.settle_call_timeout = std::time::Duration::from_secs(5);
++    match c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)) {
++        SwipeOutcome::Settled(s) => assert!(!s.changed && s.settled_ms == Some(5)),
++        o => panic!("{o:?}"),
++    }
++    drop(c);
++    h.join().unwrap();
++}
++
++#[test]
++fn swipe_settle_malformed_report_is_not_a_bounce_back() {
++    let dir = tempfile::tempdir().unwrap();
++    let (h, args) = settle_fake(dir.path(), vec![(json!({"swiped":true,"settle":{}}), false), (json!({"swiped":true,"settle":{"changed":true}}), false)]);
++    let mut c = DcoClient::connect(dir.path()).unwrap();
++    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "bad_settle"));
++    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "bad_settle"));
++    drop(c);
++    h.join().unwrap();
++    let a = args.lock().unwrap();
++    assert!(a[1].get("settle").is_some());
++}
+diff --git a/docs/superpowers/plans/2026-10-04-dct-dco-settle-and-moods.md b/docs/superpowers/plans/2026-10-04-dct-dco-settle-and-moods.md
+index dbf448b..3157885 100644
+--- a/docs/superpowers/plans/2026-10-04-dct-dco-settle-and-moods.md
++++ b/docs/superpowers/plans/2026-10-04-dct-dco-settle-and-moods.md
+@@ -148,20 +148,21 @@
+ 
+ **Files:**
+ - Modify: `crates/dct-game/src/play.rs`、`crates/dct-game/src/navigate.rs`、`src/game/identify.rs`、`src/game/profile.rs`（可选键 `theme`）、`crates/dct-game/src/play.rs` 的 `Profile`（加 `theme: Option<String>`，所有构造处补 `None`）、`src/game/skill.md`
+ - Test: `crates/dct-game/src/play_tests.rs`、`navigate.rs` 的测试、`src/game/identify.rs`、`src/game/profile.rs`
+ 
+ **Interfaces:**
+ - Consumes: Task 3 的 `show_status_with`；Task 4 的 `mood::{for_step, for_stop, for_genre}`、`GoalFinder::{step_index, goal_start}`。
+ - 行为：
+   1. **开局一次**（非 dry-run）：`show_status_with("look", None, p.theme.as_deref())`（有 `theme` 才发；没有就什么都不发，和现在一样）。
+   2. **每步划完、写完记录之后**：用这一步的 `chosen.features`、`stalled_now`、剩余步数（`finder.step_index()` 指的那个数字的 `progress_after`）、目标数字当前值（`gi` 指的那个数字的 `progress_after`）和 `finder.goal_start()` 算 `for_step`。结果是 `Some(m)` 且 `m.state` 和**上一次发给章鱼的状态不同** → `show_status_with(m.state, m.text, None)`；结果是 `None` 且上一次发的不是 `"look"` → 发 `look`。**同一个状态连着不重发。**
++  2b. **问大模型的那段时间**（play() 里已有的 `show_status("think")` … `show_status("look")` 之间）：把 `think` 改成 `show_status_with("think", Some("问大模型中"), None)`（说明条「问大模型中」5 个字，≤16），问完仍回 `look`。这样用户一眼看出章鱼是在等模型，不是卡住。模型没回应（`down`）时发一次 `show_status_with("stall", Some("大模型没回应"), None)`。测试：问模型的那一步，`events` 里 think 带 `text == "问大模型中"`；规则选步的步不发 think。
+   3. **结束时**（`play` 的 `break` 之后、返回 `Summary` 之前；`auto_next` 结束时同理）：`for_stop(&stop)` 有就发（不受「同状态不重发」限制）。`Won`、`LivesOut`、`Money`、`Ad`、`UnknownScreen`、`LevelEnded` 是 `navigate.rs` 的停止原因，在 `auto_next` 的出口发。
+   4. `dct game identify`：`for_genre` 有就发（经 `show_status_with`）。
+   5. 配置文件可选键 `theme = "candy"`（字符串，≤ 20 个字符；超了拒绝并说人话）；`profile::load` 读进 `Profile.theme`。**`candy-crush` 内置配置和用户本地的 `level-17xx.toml` 不改**（本地文件由用户自己加这一行；说明卡里写一句怎么加）。
+   6. 说明卡加一小节「章鱼」：它会随着玩的过程表现情绪；想让它有糖果主题，在配置文件里加 `theme = "candy"`；旧版 dco 看不到新的表情，不影响玩。
+ 
+ - [ ] **Step 1: 写失败的测试**（`Fake` 的 `events` 记录 `show_status_with` 的 state/text/theme；旧测试继续断言「规则选步不发 think/look」不变：只在**问模型**时 think/look 成对出现，其余事件只在状态变化时出现）
+ - 有 `theme` 的 profile：开局第一个事件是 `look`，theme 带上；没有 theme：事件序列里没有任何新增事件（和旧测试一致）。
+ - 一步大招（`bomb>0`）：划完发 `celebrate`；下一步普通步发 `look`；再下一步普通步**不再发**（`look` 不重发）。
+ - 剩余步数 ≤5（用 `texts` 队列造步数列 −1/步，目标列恒定，先让识别器认出）：发 `tense`；之后连着多步不重发。
+ - 目标数字降到开局的 20% 以内：发 `hopeful`（没有 tense 时）。

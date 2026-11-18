@@ -1,0 +1,300 @@
+# Review package: 42bc5d2..HEAD
+
+## Commits
+629fd3d feat(game): six steps without the on-screen numbers dropping is a stall: recorded, said in plain words, and the model is asked
+
+## Files changed
+ crates/dct-game/src/play.rs       | 29 +++++++++++++++++++-
+ crates/dct-game/src/play_tests.rs | 57 +++++++++++++++++++++++++++++++++++++++
+ src/game/text.rs                  | 11 ++++++++
+ 3 files changed, 96 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index 8dfa3a3..36296ee 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -50,20 +50,28 @@ pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
+         .filter_map(|e| {
+             let t = e.text.trim();
+             if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+                 return None;
+             }
+             t.parse::<u64>().ok()
+         })
+         .collect()
+ }
+ 
++/// 连着这么多步目标数字都没下降，就算停滞。
++pub const STALL_STEPS: usize = 6;
++
++/// 个数相同、且至少有一个数变小才算「下降」。个数不同（OCR 漏读了一个）一律不算，也不算「没下降」。
++pub(crate) fn decreased(before: &[u64], after: &[u64]) -> bool {
++    before.len() == after.len() && before.iter().zip(after).any(|(b, a)| a < b)
++}
++
+ fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {
+     dco.see_text(p).ok().map(|s| numbers(&s))
+ }
+ 
+ pub trait Dco {
+     fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
+     /// 坐标是窗口比例（0～1）。
+     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError>;
+     /// 读画面上的字。只有“自动开始下一局”要用；默认不支持，所以只玩一关的假 dco 不用实现。
+     fn see_text(&mut self, _p: &Profile) -> Result<Seen, DcoError> {
+@@ -261,20 +269,21 @@ fn centre(p: &Profile, (r, c): (usize, usize)) -> (f64, f64) {
+ 
+ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
+     let mut steps = 0;
+     let mut baseline: Option<usize> = None;
+     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
+     let mut asked = 0usize;
+     let mut streak = 0;
+     let mut locked: Vec<(usize, usize)> = Vec::new();
+     let mut current: Option<GridRead> = None;
+     let mut no_move_confirms = 0;
++    let mut no_progress = 0usize;
+     let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
+     let stop = loop {
+         if steps >= o.max_steps {
+             break Stop::StepsDone;
+         }
+         let t_read = clock.now_ms();
+         let g = match current.take() {
+             Some(g) => g,
+             None => match dco.read_grid(p) {
+                 Ok(g) => g,
+@@ -344,21 +353,21 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         };
+         let mut pick = pick;
+         let mut ask_rec: Option<Value> = None;
+         let mut decider = "rules";
+         if let Some(adv) = o.advisor {
+             // 发给模型的候选：没失败过的，最多 ASK_SHOWN 个；下标指回 cands
+             let offered: Vec<usize> = {
+                 (0..cands.len()).filter(|&i| !blocked(&cands[i])).take(ASK_SHOWN).collect()
+             };
+             let had_failed_here = failed.iter().any(|(_, cells)| *cells == board_key);
+-            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here) {
++            if !o.dry_run && adv.available() && asked < o.ask_budget && offered.len() >= 2 && (o.ask_always || had_failed_here || no_progress >= STALL_STEPS) {
+                 asked += 1;
+                 let fixed = fixed_ids(&g, &p.fixed_rgb, p.match_de);
+                 let failed_now: Vec<String> = failed.iter().filter(|(_, cells)| *cells == board_key).map(|(m, _)| describe_move(m)).collect();
+                 let input = AskInput {
+                     board: board_text(&g, &fixed),
+                     goal: o.goal.to_string(),
+                     candidates: offered.iter().map(|&i| describe(&cands[i])).collect(),
+                     failed: failed_now.clone(),
+                 };
+                 dco.show_status("think");
+@@ -385,20 +394,23 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+             "rows": g.rows, "cols": g.cols, "cells": g.cells, "odd": g.odd, "classes": g.classes,
+             "candidates": cands.iter().map(|c| json!({
+                 "a": [c.mv.a.0, c.mv.a.1], "b": [c.mv.b.0, c.mv.b.1], "score": c.score,
+                 "features": {
+                     "cleared": c.features.cleared, "cascade": c.features.cascade, "striped": c.features.striped,
+                     "wrapped": c.features.wrapped, "bomb": c.features.bomb, "triggered": c.features.triggered,
+                     "special_swap": c.features.special_swap, "lowest_row": c.features.lowest_row } })).collect::<Vec<_>>(),
+             "chosen": pick, "decider": decider, "dry_run": o.dry_run, "swiped": false,
+             "predicted_cleared": chosen.features.cleared + chosen.features.cascade,
+         });
++        if no_progress >= STALL_STEPS {
++            rec["stalled"] = json!(true);
++        }
+         if let Some(a) = ask_rec {
+             rec["ask"] = a;
+         }
+         if o.dry_run {
+             rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": 0, "settle": 0 });
+             rec["outcome"] = json!("dry_run");
+             sink(rec);
+             break Stop::DryRun;
+         }
+         // 端点和起始时刻原样记进记录，章鱼叠加层的事件日志靠它跟 dct 真做的对账（窗口 0–1 比例）。
+@@ -421,50 +433,65 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         let t_settle = clock.now_ms();
+         let result = settle(dco, clock, p, &g);
+         rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });
+         match result {
+             // 游戏动了一下又弹回原样（被笼子、锁住的糖），棋盘和划之前一样：算没反应：同一盘棋上不再重复选这一步。
+             Settle::Settled(next) if same(&next, &g) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(next.observation_id);
+                 let progress_after = read_numbers(dco, p);
++                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
++                    if b.len() == a.len() {
++                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
++                    }
++                }
+                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                 progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+                 locked.push(chosen.mv.a);
+                 locked.push(chosen.mv.b);
+                 if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(next);
+             }
+             Settle::Settled(next) => {
+                 rec["outcome"] = json!("moved");
+                 rec["observed_changed"] = json!(changed_cells(&g, &next));
+                 rec["after_observation_id"] = json!(next.observation_id);
+                 let progress_after = read_numbers(dco, p);
++                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
++                    if b.len() == a.len() {
++                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
++                    }
++                }
+                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                 progress_prev = progress_after;
+                 sink(rec);
+                 streak = 0;
+                 failed.clear();
+                 locked.clear();
+                 current = Some(next);
+             }
+             Settle::NoChange(same_board) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(same_board.observation_id);
+                 let progress_after = read_numbers(dco, p);
++                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
++                    if b.len() == a.len() {
++                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
++                    }
++                }
+                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                 progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+                 locked.push(chosen.mv.a);
+                 locked.push(chosen.mv.b);
+                 if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+diff --git a/crates/dct-game/src/play_tests.rs b/crates/dct-game/src/play_tests.rs
+index f9fc94d..48fde10 100644
+--- a/crates/dct-game/src/play_tests.rs
++++ b/crates/dct-game/src/play_tests.rs
+@@ -1072,10 +1072,67 @@ fn progress_is_null_when_the_dco_cannot_read_text() {
+ 
+ #[test]
+ fn the_after_of_one_step_is_the_before_of_the_next() {
+     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED)), Ok(grid(A)), Ok(grid(A))]);
+     d.texts = vec![vec!["50"], vec!["49"], vec!["48"]].into();
+     let (_, log) = run(&mut d, 2, false);
+     assert!(log.len() >= 2);
+     assert_eq!(log[1]["progress"]["before"], json!([49]));
+     assert_eq!(log[1]["progress"]["after"], json!([48]));
+ }
++
++#[test]
++fn decreased_needs_same_length_and_a_smaller_number() {
++    assert!(decreased(&[50, 30], &[49, 30]));
++    assert!(!decreased(&[50, 30], &[50, 30]));
++    assert!(!decreased(&[50, 30], &[51, 30]));
++    assert!(!decreased(&[50, 30], &[49]));
++}
++
++fn progress_texts(n: usize, flat: bool) -> VecDeque<Vec<&'static str>> {
++    let mut v: Vec<Vec<&'static str>> = vec![vec!["50"]];
++    for i in 0..n {
++        v.push(if flat { vec!["50"] } else { vec![Box::leak(format!("{}", 49 - i).into_boxed_str())] });
++    }
++    v.into()
++}
++
++fn stall_reads() -> Vec<Result<GridRead, DcoError>> {
++    let mut reads = vec![Ok(grid(A))];
++    for _ in 0..40 {
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(A)));
++        reads.push(Ok(grid(A)));
++    }
++    reads
++}
++
++#[test]
++fn six_steps_without_the_number_dropping_is_a_stall_and_asks_the_model() {
++    let say = Say::new(Some(0));
++    let mut d = Fake::new(stall_reads());
++    d.texts = progress_texts(8, true);
++    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
++    assert_eq!(log[5].get("stalled"), None, "before step 7 it is not a stall");
++    assert!(say.calls.get() >= 1);
++    assert!(log.iter().any(|l| l["stalled"] == true));
++}
++
++#[test]
++fn a_dropping_number_never_stalls() {
++    let say = Say::new(Some(0));
++    let mut d = Fake::new(stall_reads());
++    d.texts = progress_texts(8, false);
++    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
++    assert_eq!(say.calls.get(), 0);
++    assert!(log.iter().all(|l| l.get("stalled").is_none()));
++}
++
++#[test]
++fn unreadable_numbers_neither_add_to_nor_clear_the_stall_count() {
++    let say = Say::new(Some(0));
++    let mut d = Fake::new(settled_script());
++    let (s, log) = run_ask(&mut d, Some(&say), false, 30, 1);
++    assert_eq!(s.stop, Stop::StepsDone);
++    assert!(log[0].get("stalled").is_none());
++}
+diff --git a/src/game/text.rs b/src/game/text.rs
+index e1663ff..e3f0d70 100644
+--- a/src/game/text.rs
++++ b/src/game/text.rs
+@@ -38,20 +38,23 @@ pub fn step_line(step: usize, rec: &Value) -> String {
+         outcome => {
+             let t = &rec["timing_ms"];
+             if t.is_object() {
+                 s += &format!("（读 {} ms，选 {} ms，划 {} ms）", n(&t["read"]), n(&t["choose"]), n(&t["swipe"]));
+             }
+             if outcome == "no_change" {
+                 s += "；这一步划了没反应";
+             }
+         }
+     }
++    if rec["stalled"].as_bool() == Some(true) {
++        s += "；这几步看起来没有进展";
++    }
+     if rec["decider"] == "model" {
+         s += "（大模型选的）";
+     }
+     s
+ }
+ 
+ /// 写进记录文件的停下原因（给程序看的，不是给人看的）。
+ pub fn stop_code(stop: &Stop) -> &'static str {
+     match stop {
+         Stop::NoGrid(_) => "no_grid",
+@@ -314,11 +317,19 @@ mod tests {
+             assert!(stop_line(&s, 3, Path::new("/x")).0.contains("这个画面上我没有点任何东西"));
+         }
+     }
+ 
+     #[test]
+     fn stop_sentences_for_money_and_ads_promise_nothing_was_pressed() {
+         for s in [Stop::Money, Stop::Ad] {
+             assert!(stop_line(&s, 3, Path::new("/x")).0.contains("没有点任何东西"));
+         }
+     }
++
++    #[test]
++    fn step_line_says_so_when_stalled() {
++        let rec = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved","stalled":true});
++        assert!(step_line(1, &rec).contains("这几步看起来没有进展"));
++        let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
++        assert!(!step_line(1, &rec2).contains("没有进展"));
++    }
+ }

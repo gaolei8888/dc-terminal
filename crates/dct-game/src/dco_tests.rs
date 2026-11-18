@@ -1,11 +1,11 @@
 use crate::dco::DcoClient;
-use crate::play::{Dco, Profile};
+use crate::play::{Dco, DcoError, Profile, Region, SwipeOutcome, SwipeSettle, TapSettleReq};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 
 fn profile() -> Profile {
-    Profile { window: json!({"app": "iPhone Mirroring"}), region: [0.2, 0.3, 0.5, 0.4], rows: 2, cols: 2, extra: json!({"class_de": 20.0}) }
+    Profile { window: json!({"app": "iPhone Mirroring"}), region: [0.2, 0.3, 0.5, 0.4], rows: 2, cols: 2, extra: json!({"class_de": 20.0}), fixed_rgb: vec![], match_de: 24.0, weights: crate::choose::Weights::default(), level_pattern: None, theme: None }
 }
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -237,6 +237,12 @@ fn fake_status(dir: &std::path::Path, status_reply: Option<(i64, &'static str)>)
                 calls.push((name.clone(), req["params"]["arguments"].clone()));
                 let body = match name.as_str() {
                     "show_status" => {
+                        if let Some((0, message)) = status_reply {
+                            // code 0 = 工具层错误：isError 回复，error.code 是 "bad_request"（旧 dco 不认识这个状态或参数）。
+                            let body = json!({"error": {"code": "bad_request", "message": message}});
+                            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": body.to_string()}], "isError": true}})).unwrap();
+                            continue;
+                        }
                         if let Some((code, message)) = status_reply {
                             writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})).unwrap();
                             continue;
@@ -335,4 +341,508 @@ fn a_show_status_timeout_is_not_paid_twice() {
     assert!(t.elapsed() < std::time::Duration::from_millis(100));
     drop(c);
     assert_eq!(h.join().unwrap(), 1);
+}
+
+#[test]
+fn a_see_text_timeout_is_not_paid_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("dco.sock");
+    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let h = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        let mut tool_calls = 0;
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return tool_calls;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            if req["method"] == "tools/call" {
+                tool_calls += 1; // 不回话：让客户端超时
+                continue;
+            }
+            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": {}})).unwrap();
+        }
+    });
+    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+    assert_eq!(c.see_text(&profile()).err().unwrap().code, "dco_timeout");
+    let t = std::time::Instant::now();
+    assert_eq!(c.see_text(&profile()).err().unwrap().code, "unsupported");
+    assert!(t.elapsed() < std::time::Duration::from_millis(100));
+    drop(c);
+    assert_eq!(h.join().unwrap(), 1);
+}
+
+#[test]
+fn a_late_reply_to_a_timed_out_call_is_not_taken_for_the_next_calls_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let _h = fake(dir.path(), TOKEN, |tool, _| match tool {
+        "slow" => {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            (json!({}), false)
+        }
+        "read_grid" => (json!({"rows":2,"cols":2,"cells":[[0,0],[1,1]],"odd":[[false,false],[false,false]],
+                "classes":[{"id":0,"rgb":[1,2,3],"count":2},{"id":1,"rgb":[4,5,6],"count":2}],"elapsed_ms":1}), false),
+        other => panic!("没想到会调 {other}"),
+    });
+    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+    assert_eq!(c.call("slow", json!({})).unwrap_err().code, "dco_timeout");
+    // 慢回复在这次调用等的时候才到，必须被跳过
+    let g = c.read_grid(&profile()).unwrap();
+    assert_eq!((g.rows, g.cols, g.classes.len()), (2, 2, 2));
+}
+
+fn settle_fake(dir: &std::path::Path, replies: Vec<(Value, bool)>) -> (std::thread::JoinHandle<Vec<String>>, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+    let args = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let a2 = args.clone();
+    let replies = std::sync::Mutex::new(replies.into_iter());
+    let h = fake(dir, TOKEN, move |tool, a| {
+        assert_eq!(tool, "swipe");
+        a2.lock().unwrap().push(a.clone());
+        replies.lock().unwrap().next().unwrap()
+    });
+    (h, args)
+}
+
+fn ed(code: &str, message: &str) -> DcoError {
+    DcoError { code: code.into(), message: message.into(), run_id: None }
+}
+
+#[test]
+fn swipe_settle_reports_what_dco_saw_and_sends_the_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let ok = json!({"swiped":true,"settle":{"changed":true,"change":0.4,"settled":true,"timed_out":false,"settled_ms":420,"region":{"x":0.2,"y":0.3,"w":0.5,"h":0.4}}});
+    let (h, args) = settle_fake(dir.path(), vec![(ok, false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let r = c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5));
+    assert_eq!(r, SwipeOutcome::Settled(SwipeSettle { changed: true, change: 0.4, settled: true, timed_out: false, settled_ms: Some(420) }));
+    drop(c);
+    h.join().unwrap();
+    let a = args.lock().unwrap();
+    assert_eq!(a[0]["settle"]["quiet_ms"], 300);
+    assert_eq!(a[0]["settle"]["timeout_ms"], 8000);
+    assert_eq!(a[0]["settle"]["region"], json!({"x":0.2,"y":0.3,"w":0.5,"h":0.4}));
+}
+
+#[test]
+fn swipe_settle_bounce_back_is_a_settled_no_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = json!({"swiped":true,"settle":{"changed":false,"change":0.0,"settled":true,"timed_out":false,"settled_ms":310}});
+    let (h, _) = settle_fake(dir.path(), vec![(r, false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    match c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)) {
+        SwipeOutcome::Settled(s) => assert!(!s.changed && s.settled),
+        o => panic!("{o:?}"),
+    }
+    drop(c);
+    h.join().unwrap();
+}
+
+#[test]
+fn swipe_settle_old_dco_swiped_without_settle_and_is_not_asked_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, args) = settle_fake(dir.path(), vec![(json!({"swiped":true}), false), (json!({"swiped":true}), false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "unsupported"));
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "unsupported"));
+    drop(c);
+    h.join().unwrap();
+    let a = args.lock().unwrap();
+    assert_eq!(a.len(), 2);
+    assert!(a[0].get("settle").is_some());
+    assert!(a[1].get("settle").is_none());
+}
+
+#[test]
+fn swipe_settle_wait_error_keeps_asking_next_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = json!({"swiped":true,"settle":{"error":{"code":"stale","message":"窗口关了"}}});
+    let (h, args) = settle_fake(dir.path(), vec![(bad, false), (json!({"swiped":true}), false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(ed("stale", "窗口关了")));
+    c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5));
+    drop(c);
+    h.join().unwrap();
+    let a = args.lock().unwrap();
+    assert!(a[0].get("settle").is_some() && a[1].get("settle").is_some());
+}
+
+#[test]
+fn swipe_settle_swipe_failure_is_not_swiped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, _) = settle_fake(dir.path(), vec![(json!({"error":{"code":"halted","message":"急停"}}), true)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::NotSwiped(ed("halted", "急停")));
+    drop(c);
+    h.join().unwrap();
+}
+
+#[test]
+fn swipe_settle_timeout_is_returned_for_the_caller_to_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = json!({"swiped":true,"settle":{"changed":true,"change":0.2,"settled":false,"timed_out":true}});
+    let (h, _) = settle_fake(dir.path(), vec![(r, false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(
+        c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)),
+        SwipeOutcome::Settled(SwipeSettle { changed: true, change: 0.2, settled: false, timed_out: true, settled_ms: None })
+    );
+    drop(c);
+    h.join().unwrap();
+}
+
+#[test]
+fn swipe_settle_client_timeout_is_swiped_no_settle_and_late_reply_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = std::sync::atomic::AtomicUsize::new(0);
+    let h = fake(dir.path(), TOKEN, move |tool, args| {
+        assert_eq!(tool, "swipe");
+        assert!(args.get("settle").is_some());
+        if n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            (json!({"swiped":true,"settle":{"changed":true,"settled":true}}), false)
+        } else {
+            (json!({"swiped":true,"settle":{"changed":false,"change":0.0,"settled":true,"timed_out":false,"settled_ms":5}}), false)
+        }
+    });
+    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+    c.settle_call_timeout = Some(std::time::Duration::from_millis(250));
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "dco_timeout"));
+    c.settle_call_timeout = Some(std::time::Duration::from_secs(5));
+    match c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)) {
+        SwipeOutcome::Settled(s) => assert!(!s.changed && s.settled_ms == Some(5)),
+        o => panic!("{o:?}"),
+    }
+    drop(c);
+    h.join().unwrap();
+}
+
+#[test]
+fn swipe_settle_malformed_report_is_not_a_bounce_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, args) = settle_fake(dir.path(), vec![(json!({"swiped":true,"settle":{}}), false), (json!({"swiped":true,"settle":{"changed":true}}), false)]);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "bad_settle"));
+    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "bad_settle"));
+    drop(c);
+    h.join().unwrap();
+    let a = args.lock().unwrap();
+    assert!(a[1].get("settle").is_some());
+}
+
+#[test]
+fn show_status_with_carries_text_and_theme_and_omits_missing_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake_status(dir.path(), None);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    c.show_status_with("celebrate", Some("好"), Some("night"));
+    c.show_status_with("look", None, None);
+    drop(c);
+    let calls = h.join().unwrap();
+    assert_eq!(status_calls(&calls), [&json!({"state": "celebrate", "text": "好", "theme": "night"}), &json!({"state": "look"})]);
+}
+
+#[test]
+fn status_text_is_cut_to_16_characters_not_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake_status(dir.path(), None);
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let long = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸";
+    assert_eq!(long.chars().count(), 20);
+    c.show_status_with("wait", Some(long), None);
+    drop(c);
+    let calls = h.join().unwrap();
+    assert_eq!(status_calls(&calls), [&json!({"state": "wait", "text": "一二三四五六七八九十甲乙丙丁戊己"})]);
+}
+
+#[test]
+fn a_rejected_state_is_remembered_per_state_and_does_not_silence_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = fake_status(dir.path(), Some((0, "unknown state")));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    c.show_status_with("stall", None, None);
+    c.show_status_with("stall", None, None);
+    c.show_status("think");
+    drop(c);
+    let calls = h.join().unwrap();
+    let states: Vec<_> = status_calls(&calls).iter().map(|a| a["state"].as_str().unwrap().to_string()).collect();
+    assert_eq!(states, ["stall", "think"], "stall once, then think still goes out");
+}
+
+#[test]
+fn a_status_timeout_still_stops_show_status_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("dco.sock");
+    std::fs::write(dir.path().join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.path().join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let h = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        let mut tool_calls = 0;
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return tool_calls;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            if req["method"] == "tools/call" {
+                tool_calls += 1;
+                continue;
+            }
+            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": {}})).unwrap();
+        }
+    });
+    let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+    c.show_status_with("celebrate", None, None);
+    c.show_status_with("look", None, None);
+    c.show_status("think");
+    drop(c);
+    assert_eq!(h.join().unwrap(), 1);
+}
+
+/// 假 dco，回整个 MCP 结果（含图片项）。`handler(tool, args)` 返回 `result`；记下每次 (工具名, 参数)。
+fn raw_fake(dir: &std::path::Path, handler: impl Fn(&str, &Value) -> Value + Send + 'static) -> std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> {
+    let sock = dir.join("dco.sock");
+    std::fs::write(dir.join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let c2 = calls.clone();
+    std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            let Some(id) = req.get("id") else { continue };
+            let result = if req["method"] == "tools/call" {
+                let (n, a) = (req["params"]["name"].as_str().unwrap().to_string(), req["params"]["arguments"].clone());
+                let r = handler(&n, &a);
+                c2.lock().unwrap().push((n, a));
+                r
+            } else {
+                json!({})
+            };
+            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": result})).unwrap();
+        }
+    });
+    calls
+}
+
+fn text_result(body: Value, is_error: bool) -> Value {
+    json!({"content": [{"type": "text", "text": body.to_string()}], "isError": is_error})
+}
+
+#[test]
+fn capture_decodes_the_image_item_and_asks_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = raw_fake(dir.path(), |_, _| {
+        json!({"content": [{"type": "text", "text": json!({"elements": []}).to_string()}, {"type": "image", "data": "iVBORw0K", "mimeType": "image/png"}], "isError": false})
+    });
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.capture(&profile()).unwrap(), vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].0, "see");
+    assert_eq!(calls[0].1["include_image"], true);
+    assert_eq!(calls[0].1["window"]["app"], "iPhone Mirroring");
+}
+
+#[test]
+fn capture_without_an_image_item_is_no_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let _c = raw_fake(dir.path(), |_, _| text_result(json!({"elements": []}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.capture(&profile()).unwrap_err().code, "no_image");
+}
+
+#[test]
+fn capture_keeps_the_private_screen_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let _c = raw_fake(dir.path(), |_, _| text_result(json!({"error": {"code": "private_screen", "message": "私人"}}), true));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.capture(&profile()).unwrap_err().code, "private_screen");
+}
+
+#[test]
+fn see_text_reads_positions_from_frac_or_from_bounds_and_window_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let _c = raw_fake(dir.path(), |_, _| {
+        text_result(json!({"snapshot_id": "s1", "window": {"size": {"w": 400.0, "h": 800.0}}, "elements": [
+            {"id": "e1", "text": "A", "frac": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.05}},
+            {"id": "e2", "text": "B", "bounds": {"x": 100.0, "y": 400.0, "w": 200.0, "h": 80.0}},
+            {"id": "e3", "text": "C"}]}), false)
+    });
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let s = c.see_text(&profile()).unwrap();
+    assert_eq!(s.elements[0].frac, Some([1000, 2000, 3000, 500]));
+    assert_eq!(s.elements[1].frac, Some([2500, 5000, 5000, 1000]));
+    assert_eq!(s.elements[2].frac, None);
+}
+
+fn tap_at_fake(dir: &std::path::Path, tap_reply: Value) -> std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> {
+    raw_fake(dir, move |tool, _| match tool {
+        "list_windows" => text_result(json!({"windows": [{"window_id": 11, "app": "Mail"}, {"window_id": 7281, "app": "iPhone Mirroring"}]}), false),
+        _ => tap_reply.clone(),
+    })
+}
+
+#[test]
+fn tap_at_sends_the_window_id_the_position_and_the_avoid_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"at": {"x_bp": 1800, "y_bp": 6000}, "kind": "no_text", "text": ""}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let avoid = [Region { x_bp: 7800, y_bp: 0, w_bp: 2200, h_bp: 2000 }];
+    let t = c.tap_at(&profile(), 1800, 6000, &avoid, None).unwrap();
+    assert_eq!((t.kind.as_str(), t.text.as_str()), ("no_text", ""));
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].0, "list_windows");
+    assert_eq!(calls[1].0, "tap_at");
+    let a = &calls[1].1;
+    assert_eq!(a["window"], json!({"window_id": 7281}));
+    assert_eq!((a["x_bp"].as_u64(), a["y_bp"].as_u64()), (Some(1800), Some(6000)));
+    assert_eq!(a["avoid"], json!([{"x_bp": 7800, "y_bp": 0, "w_bp": 2200, "h_bp": 2000}]));
+}
+
+#[test]
+fn tap_at_truncates_the_avoid_list_to_16() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "text", "text": "x"}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let avoid = vec![Region { x_bp: 1, y_bp: 2, w_bp: 3, h_bp: 4 }; 20];
+    c.tap_at(&profile(), 5, 6, &avoid, None).unwrap();
+    assert_eq!(calls.lock().unwrap()[1].1["avoid"].as_array().unwrap().len(), 16);
+}
+
+#[test]
+fn tap_at_unknown_tool_is_remembered_and_never_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"error": {"code": "bad_request", "message": "unknown tool: tap_at"}}), true));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "unsupported");
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "unsupported");
+    let n = calls.lock().unwrap().iter().filter(|(t, _)| t == "tap_at").count();
+    assert_eq!(n, 1, "第二次不该再发");
+}
+
+#[test]
+fn tap_at_not_allowed_is_passed_through_and_not_remembered_as_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"error": {"code": "not_allowed", "message": "落点在不点区域"}}), true));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "not_allowed");
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "not_allowed");
+    assert_eq!(calls.lock().unwrap().iter().filter(|(t, _)| t == "tap_at").count(), 2);
+}
+
+#[test]
+fn tap_at_without_a_matching_window_is_window_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = raw_fake(dir.path(), |_, _| text_result(json!({"windows": [{"window_id": 11, "app": "Mail"}]}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap_err().code, "window_not_found");
+    assert!(calls.lock().unwrap().iter().all(|(t, _)| t != "tap_at"));
+}
+
+#[test]
+fn tap_at_sends_the_settle_request_and_parses_the_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "no_text", "text": ""}, "settle": {"changed": true, "change": 0.07, "settled": true, "timed_out": false, "settled_ms": 900}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let req = TapSettleReq { quiet_ms: 500, timeout_ms: 6000, region: [0.0, 0.0, 1.0, 0.8] };
+    let t = c.tap_at(&profile(), 1, 2, &[], Some(&req)).unwrap();
+    let s = t.settle.unwrap();
+    assert_eq!((s.changed, s.settled, s.timed_out, s.settled_ms), (true, true, false, Some(900)));
+    assert!((s.change - 0.07).abs() < 1e-9);
+    assert_eq!(calls.lock().unwrap()[1].1["settle"], json!({"quiet_ms": 500, "timeout_ms": 6000, "region": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.8}}));
+}
+
+#[test]
+fn tap_at_without_a_settle_request_sends_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "text", "text": "x"}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    c.tap_at(&profile(), 1, 2, &[], None).unwrap();
+    assert!(calls.lock().unwrap()[1].1.get("settle").is_none());
+}
+
+#[test]
+fn an_old_dco_that_ignores_settle_gives_no_report_and_is_not_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "no_text", "text": ""}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    let req = TapSettleReq { quiet_ms: 500, timeout_ms: 6000, region: [0.0, 0.0, 1.0, 0.8] };
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], Some(&req)).unwrap().settle, None);
+    assert!(c.tap_at(&profile(), 1, 2, &[], Some(&req)).is_ok());
+    assert_eq!(calls.lock().unwrap().iter().filter(|(t, _)| t == "tap_at").count(), 2);
+}
+
+#[test]
+fn a_malformed_settle_report_is_no_report() {
+    let dir = tempfile::tempdir().unwrap();
+    tap_at_fake(dir.path(), text_result(json!({"tapped": {"kind": "no_text", "text": ""}, "settle": {"settled": true}}), false));
+    let mut c = DcoClient::connect(dir.path()).unwrap();
+    assert_eq!(c.tap_at(&profile(), 1, 2, &[], None).unwrap().settle, None);
+}
+
+/// 一次连接的假 dco（工具回复不带图）：记下握手和每个方法名。
+fn fake(dir: &std::path::Path, token: &str, handler: impl Fn(&str, &Value) -> (Value, bool) + Send + 'static) -> std::thread::JoinHandle<Vec<String>> {
+    let sock = dir.join("dco.sock");
+    std::fs::write(dir.join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+    std::fs::write(dir.join("token"), token).unwrap();
+    let l = UnixListener::bind(&sock).unwrap();
+    let token = token.to_string();
+    std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut seen = vec![];
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        let hello: Value = serde_json::from_str(line.trim()).unwrap();
+        seen.push(hello.to_string());
+        if hello["dco_token"] != token {
+            writeln!(w, r#"{{"ok":false}}"#).unwrap();
+            return seen;
+        }
+        writeln!(w, r#"{{"ok":true}}"#).unwrap();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap() == 0 {
+                return seen;
+            }
+            let req: Value = serde_json::from_str(line.trim()).unwrap();
+            seen.push(req["method"].as_str().unwrap().to_string());
+            let Some(id) = req.get("id") else { continue };
+            let result = match req["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion": "2025-06-18"}),
+                "tools/call" => {
+                    let (body, is_error) = handler(req["params"]["name"].as_str().unwrap(), &req["params"]["arguments"]);
+                    json!({"content": [{"type": "text", "text": body.to_string()}], "isError": is_error})
+                }
+                _ => json!({}),
+            };
+            writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": id, "result": result})).unwrap();
+        }
+    })
 }

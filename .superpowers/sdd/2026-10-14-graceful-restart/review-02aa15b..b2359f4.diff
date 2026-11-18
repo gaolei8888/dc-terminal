@@ -1,0 +1,106 @@
+# Review package: 02aa15b..HEAD
+
+## Commits
+b2359f4 feat(profile): qwen and dc resume a conversation by id (verified by hand)
+
+## Files changed
+ profiles/dc.toml   | 5 +++++
+ profiles/qwen.toml | 5 +++++
+ src/profile.rs     | 6 +++---
+ 3 files changed, 13 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/profiles/dc.toml b/profiles/dc.toml
+index 5014c7b..0860900 100644
+--- a/profiles/dc.toml
++++ b/profiles/dc.toml
+@@ -1,14 +1,19 @@
+ name = "dc"
+ # 使用已验证的 Qwen 启动参数；屏幕状态和恢复参数尚未验证，暂不声明。
+ command = ["qwen", "--approval-mode=yolo"]
+ is_agent = true
++# 开会话时由 dct 指定对话 id，重启后按 id 接回同一段对话。
++# `qwen --help` 有 `--session-id`/`--resume`；2026-10-14 实测按 id 接回成功
++# （-p 模式，走训练营网关）。对话记录默认就开着，命令里不用另带 --chat-recording。
++session_id_args = ["--session-id", "{id}"]
++resume_id_args = ["--resume", "{id}"]
+ pairable = true
+ 
+ [label]
+ zh = "DC"
+ en = "DC"
+ 
+ [note]
+ zh = "训练营自带，默认使用 Qwen Code"
+ en = "Qwen Code through the camp gateway"
+ 
+diff --git a/profiles/qwen.toml b/profiles/qwen.toml
+index 5c9e077..000a798 100644
+--- a/profiles/qwen.toml
++++ b/profiles/qwen.toml
+@@ -3,20 +3,25 @@ name = "qwen"
+ # 等人点头，而 dct 的整个前提是「它从来不问这样可以吗」——那份底气来自每轮
+ # 之前的隐藏快照，不是来自逐条确认。README 那句「command 里记得带上这个
+ # agent 自己的权限绕过参数」说的就是这里，而这个 profile 一直漏着它。
+ #
+ # 写 `--approval-mode=yolo` 而不是 `--yolo`：两个都还能用，但 Qwen Code
+ # 自己的文档说前者是取代后者的新写法（"Use `--approval-mode=yolo` instead
+ # of `--yolo` for the new unified approach"），而且两个同时给会直接报错。
+ # 实测于 qwen-code 0.22.2。
+ command = ["qwen", "--approval-mode=yolo"]
+ is_agent = true
++# 开会话时由 dct 指定对话 id，重启后按 id 接回同一段对话。
++# `qwen --help` 有 `--session-id`/`--resume`；2026-10-14 实测按 id 接回成功
++# （-p 模式，走训练营网关）。对话记录默认就开着，命令里不用另带 --chat-recording。
++session_id_args = ["--session-id", "{id}"]
++resume_id_args = ["--resume", "{id}"]
+ # 两个 pattern 仍然不填：TUI 没实测过，编一个假的会让正在干活的会话在看板上
+ # 显示成空闲。状态显示「—」是承认不知道。
+ # 跟 dc.toml 用同一把钥匙、同一个网关（见下面 [secret.hint] 那句），先点
+ # Qwen Code 的学生不该撞上粘贴框——见 profile.rs::Profile::pairable。
+ pairable = true
+ 
+ [label]
+ zh = "Qwen Code"
+ en = "Qwen Code"
+ 
+diff --git a/src/profile.rs b/src/profile.rs
+index f46afe5..d973ae4 100644
+--- a/src/profile.rs
++++ b/src/profile.rs
+@@ -1569,32 +1569,32 @@ mod tests {
+         let args = vec![
+             "--session-id".to_string(),
+             "{id}".to_string(),
+             "x{id}y".to_string(),
+         ];
+         assert_eq!(fill_id(&args, "abc"), vec!["--session-id", "abc", "xabcy"]);
+     }
+ 
+     #[test]
+     fn claude_based_profiles_resume_by_id() {
+-        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
++        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api", "qwen", "dc"] {
+             let p = Profile::builtin(name).unwrap();
+             assert_eq!(p.session_id_args, vec!["--session-id", "{id}"], "{name}");
+             assert_eq!(p.resume_id_args, vec!["--resume", "{id}"], "{name}");
+             assert!(p.resumes_by_id(), "{name}");
+         }
+     }
+ 
+     #[test]
+     fn unverified_profiles_do_not_resume_by_id() {
+-        // qwen、dc 要等 Task 3 实测；codex、opencode 开会话时没法指定 id。
+-        for name in ["codex", "opencode", "qwen", "dc", "shell"] {
++        // codex、opencode 开会话时没法指定 id；qwen、dc 已实测，在上面的正向测试里。
++        for name in ["codex", "opencode", "shell"] {
+             let p = Profile::builtin(name).unwrap();
+             assert!(
+                 p.session_id_args.is_empty() && p.resume_id_args.is_empty(),
+                 "{name}"
+             );
+             assert!(!p.resumes_by_id(), "{name}");
+         }
+     }
+ 
+     #[test]

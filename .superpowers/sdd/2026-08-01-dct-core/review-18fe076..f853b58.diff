@@ -1,0 +1,293 @@
+# Review package: 18fe076..HEAD
+
+## Commits
+f853b58 feat: 守护进程、Unix socket 协议与客户端
+
+## Files changed
+ src/client.rs             | 32 ++++++++++++++++++++
+ src/daemon.rs             | 77 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib.rs                |  8 +++++
+ src/main.rs               |  8 ++---
+ src/proto.rs              | 33 ++++++++++++++++++++
+ src/ui.rs                 |  1 +
+ tests/daemon_roundtrip.rs | 75 +++++++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 228 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/src/client.rs b/src/client.rs
+new file mode 100644
+index 0000000..bbc9e14
+--- /dev/null
++++ b/src/client.rs
+@@ -0,0 +1,32 @@
++use anyhow::{Context, Result};
++use std::io::{BufRead, BufReader, Write};
++use std::os::unix::net::UnixStream;
++use std::path::Path;
++
++use crate::proto::{Request, Response};
++
++pub struct Client {
++    reader: BufReader<UnixStream>,
++    writer: UnixStream,
++}
++
++impl Client {
++    pub fn connect(socket: &Path) -> Result<Client> {
++        let stream = UnixStream::connect(socket)
++            .with_context(|| format!("连不上守护进程: {}", socket.display()))?;
++        Ok(Client {
++            reader: BufReader::new(stream.try_clone()?),
++            writer: stream,
++        })
++    }
++
++    pub fn call(&mut self, req: Request) -> Result<Response> {
++        writeln!(self.writer, "{}", serde_json::to_string(&req)?)?;
++        self.writer.flush()?;
++        let mut line = String::new();
++        self.reader
++            .read_line(&mut line)
++            .context("守护进程没有回应")?;
++        Ok(serde_json::from_str(&line)?)
++    }
++}
+diff --git a/src/daemon.rs b/src/daemon.rs
+new file mode 100644
+index 0000000..a5f93c8
+--- /dev/null
++++ b/src/daemon.rs
+@@ -0,0 +1,77 @@
++use anyhow::Result;
++use std::io::{BufRead, BufReader, Write};
++use std::os::unix::net::{UnixListener, UnixStream};
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use crate::profile::Profile;
++use crate::proto::{Request, Response};
++use crate::session::SessionManager;
++
++pub fn run(socket: &Path) -> Result<()> {
++    if let Some(parent) = socket.parent() {
++        std::fs::create_dir_all(parent)?;
++    }
++    let _ = std::fs::remove_file(socket);
++    let listener = UnixListener::bind(socket)?;
++
++    let mgr = Arc::new(Mutex::new(SessionManager::new()));
++
++    let tick_mgr = mgr.clone();
++    std::thread::spawn(move || loop {
++        std::thread::sleep(Duration::from_millis(200));
++        tick_mgr.lock().unwrap().tick();
++    });
++
++    for conn in listener.incoming() {
++        let conn = conn?;
++        let m = mgr.clone();
++        std::thread::spawn(move || {
++            if let Err(e) = serve(conn, m) {
++                eprintln!("连接处理失败: {e}");
++            }
++        });
++    }
++    Ok(())
++}
++
++fn serve(stream: UnixStream, mgr: Arc<Mutex<SessionManager>>) -> Result<()> {
++    let mut out = stream.try_clone()?;
++    let reader = BufReader::new(stream);
++    for line in reader.lines() {
++        let line = line?;
++        if line.trim().is_empty() {
++            continue;
++        }
++        let resp = match serde_json::from_str::<Request>(&line) {
++            Ok(req) => handle(req, &mgr),
++            Err(e) => Response::Error(format!("请求解析失败: {e}")),
++        };
++        writeln!(out, "{}", serde_json::to_string(&resp)?)?;
++        out.flush()?;
++    }
++    Ok(())
++}
++
++fn handle(req: Request, mgr: &Arc<Mutex<SessionManager>>) -> Response {
++    let mut m = mgr.lock().unwrap();
++    let r: anyhow::Result<Response> = match req {
++        Request::List => Ok(Response::Sessions(m.list())),
++        Request::Profiles => Ok(Response::Profiles(
++            Profile::builtin_names()
++                .iter()
++                .map(|s| s.to_string())
++                .collect(),
++        )),
++        Request::Create { dir, profile } => m
++            .create(&PathBuf::from(dir), &profile)
++            .map(|id| Response::Created { id }),
++        Request::Input { id, text } => m.send_input(id, &text).map(|_| Response::Ok),
++        Request::Screen { id } => m.screen(id).map(Response::Screen),
++        Request::Stop { id } => m.stop(id).map(|_| Response::Ok),
++        Request::Undo { id } => m.undo(id).map(|_| Response::Ok),
++        Request::Diff { id } => m.diff(id).map(Response::Diff),
++    };
++    r.unwrap_or_else(|e| Response::Error(e.to_string()))
++}
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..5f801d2
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,8 @@
++pub mod client;
++pub mod daemon;
++pub mod git;
++pub mod profile;
++pub mod proto;
++pub mod pty;
++pub mod session;
++pub mod ui;
+diff --git a/src/main.rs b/src/main.rs
+index ee22db0..66e4b75 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,8 +1,4 @@
+-mod git;
+-mod profile;
+-mod pty;
+-mod session;
+-
+-fn main() {
++fn main() -> anyhow::Result<()> {
+     println!("dct");
++    Ok(())
+ }
+diff --git a/src/proto.rs b/src/proto.rs
+new file mode 100644
+index 0000000..8b58cff
+--- /dev/null
++++ b/src/proto.rs
+@@ -0,0 +1,33 @@
++use serde::{Deserialize, Serialize};
++use std::path::PathBuf;
++
++use crate::git::FileStat;
++use crate::session::SessionInfo;
++
++#[derive(Debug, Serialize, Deserialize)]
++pub enum Request {
++    List,
++    Create { dir: String, profile: String },
++    Input { id: u32, text: String },
++    Screen { id: u32 },
++    Stop { id: u32 },
++    Undo { id: u32 },
++    Diff { id: u32 },
++    Profiles,
++}
++
++#[derive(Debug, Serialize, Deserialize)]
++pub enum Response {
++    Sessions(Vec<SessionInfo>),
++    Created { id: u32 },
++    Screen(String),
++    Diff(Vec<FileStat>),
++    Profiles(Vec<String>),
++    Ok,
++    Error(String),
++}
++
++pub fn socket_path() -> PathBuf {
++    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
++    PathBuf::from(home).join(".dct").join("daemon.sock")
++}
+diff --git a/src/ui.rs b/src/ui.rs
+new file mode 100644
+index 0000000..fd6c123
+--- /dev/null
++++ b/src/ui.rs
+@@ -0,0 +1 @@
++// Task 6 实现
+diff --git a/tests/daemon_roundtrip.rs b/tests/daemon_roundtrip.rs
+new file mode 100644
+index 0000000..4ba89a5
+--- /dev/null
++++ b/tests/daemon_roundtrip.rs
+@@ -0,0 +1,75 @@
++use std::path::PathBuf;
++use std::thread::sleep;
++use std::time::Duration;
++
++use dct::client::Client;
++use dct::proto::{Request, Response};
++
++#[test]
++fn daemon_serves_create_list_and_stop() {
++    let dir = tempfile::tempdir().unwrap();
++    let sock: PathBuf = dir.path().join("d.sock");
++
++    let s = sock.clone();
++    std::thread::spawn(move || {
++        dct::daemon::run(&s).unwrap();
++    });
++
++    // 等 socket 出现
++    for _ in 0..50 {
++        if sock.exists() {
++            break;
++        }
++        sleep(Duration::from_millis(50));
++    }
++
++    let workdir = tempfile::tempdir().unwrap();
++    let mut c = Client::connect(&sock).unwrap();
++
++    let resp = c
++        .call(Request::Create {
++            dir: workdir.path().display().to_string(),
++            profile: "shell".into(),
++        })
++        .unwrap();
++    let id = match resp {
++        Response::Created { id } => id,
++        other => panic!("预期 Created，实际 {other:?}"),
++    };
++
++    match c.call(Request::List).unwrap() {
++        Response::Sessions(v) => {
++            assert_eq!(v.len(), 1);
++            assert_eq!(v[0].id, id);
++            assert_eq!(v[0].profile, "shell");
++        }
++        other => panic!("预期 Sessions，实际 {other:?}"),
++    }
++
++    assert!(matches!(
++        c.call(Request::Stop { id }).unwrap(),
++        Response::Ok
++    ));
++}
++
++#[test]
++fn unknown_session_returns_error_not_panic() {
++    let dir = tempfile::tempdir().unwrap();
++    let sock: PathBuf = dir.path().join("e.sock");
++    let s = sock.clone();
++    std::thread::spawn(move || {
++        dct::daemon::run(&s).unwrap();
++    });
++    for _ in 0..50 {
++        if sock.exists() {
++            break;
++        }
++        sleep(Duration::from_millis(50));
++    }
++
++    let mut c = Client::connect(&sock).unwrap();
++    match c.call(Request::Stop { id: 999 }).unwrap() {
++        Response::Error(msg) => assert!(msg.contains("没有这个会话")),
++        other => panic!("预期 Error，实际 {other:?}"),
++    }
++}

@@ -32,11 +32,14 @@ use std::path::{Path, PathBuf};
 
 /// 一条记下来的、当时还活着的会话。
 ///
-/// **不记 agent 自己的对话 id**——那条路（`claude --resume <id>`）在设计
-/// 阶段就被明确划出了范围：能记的只有「哪个目录、哪个 profile、起了个
-/// 什么名字、什么时候还活着」，接不接得回**同一个**对话，交给
-/// `--continue` 自己按目录去猜。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// **2026-10-14 起也记 agent 自己的对话 id**（profile 声明了
+/// `session_id_args` / `resume_id_args` 才有）。以前只记「哪个目录、哪个
+/// profile、起了个什么名字、什么时候还活着」，接回哪段对话交给
+/// `--continue` 按目录去猜——同一个目录下开着好几个会话时，只有一个能
+/// 接回原来的对话，其余的只能从头开。有了 id 就各接各的，见
+/// `docs/superpowers/specs/2026-10-14-graceful-restart-design.md` 第 1 节。
+/// 没有 id 的旧记录照旧走 `--continue` 分组（[`continue_flags`]）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedSession {
     pub dir: PathBuf,
     pub profile: String,
@@ -49,6 +52,28 @@ pub struct RecordedSession {
     /// 跨进程重启之后
     /// 的绝对值没有意义——见 `group_for_resume` 的文档。
     pub last_active: u64,
+    /// agent 自己的对话 id（profile 声明了 `session_id_args` 才有）。
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// 平稳重启时这个会话是被打断的（没干完就被叫停或硬停）。
+    #[serde(default)]
+    pub interrupted: bool,
+    /// 接不回对话的会话，重启前写的交接文件。
+    #[serde(default)]
+    pub handoff: Option<PathBuf>,
+    /// 会话编号（看板上的「3 号」）。重启后尽量还用这个号——开着的界面、
+    /// 用户脑子里的「3 号」都还指着它。旧文件没有，或者号已经被占了，就
+    /// 发一个新号。
+    #[serde(default)]
+    pub id: Option<u32>,
+    /// 这个会话就是敲 `dct restart` 的那个。重启后它收到的是「重启已经
+    /// 完成了，不用再重启」，不是「继续」——它没做完的事正是那条命令。
+    #[serde(default)]
+    pub restart_initiator: bool,
+    /// 准备重启期间别的电脑发来、还没送进去的留言（已经加好来源标记的
+    /// 整句）。重启后等会话空下来照常送。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_messages: Vec<String>,
 }
 
 /// 磁盘格式。跟 `secrets.rs` 一样包一层表，留出将来加别的段的余地。
@@ -168,6 +193,72 @@ pub fn group_for_resume(sessions: &[RecordedSession]) -> Vec<bool> {
     out
 }
 
+/// 这一条重启后会不会按对话 id 接回：记录里有 id，**而且**它的 profile
+/// 此刻还声明着按 id 接回的参数（`Profile::resumes_by_id`）。profile 后来
+/// 去掉了那两组参数的话，id 就没处用，这一条照旧走 `--continue` 分组。
+pub fn will_resume_by_id(r: &RecordedSession, profiles: &[crate::profile::Profile]) -> bool {
+    r.conversation_id.is_some()
+        && profiles
+            .iter()
+            .find(|p| p.name == r.profile)
+            .is_some_and(|p| p.resumes_by_id())
+}
+
+/// 按 id 接回的记录各接各的，不进 `--continue` 的分组；其余的照旧分组。
+/// 返回值跟输入逐位对应，语义同 [`group_for_resume`]：`true` = 这一条该带
+/// `resume_args`。按 id 接回的那些一律是 `false`——用不着猜。判定「按不按
+/// id 接回」见 [`will_resume_by_id`]。
+///
+/// **同一个 (目录, profile) 里已经有按 id 接回的记录时，没有 id 的那几条
+/// 一律不带 `--continue`，从空白开始。** `--continue` 接的是这个目录下最近
+/// 写过的那段对话；兄弟会话有自己的 id、又常常是最近用过的那个，这时
+/// `--continue` 接到的就是兄弟的对话——两个格子写同一份对话，自己那段
+/// 反而丢了。没有 id 又用过的会话在准备重启时会被请去写交接（见
+/// `SessionManager::drain_resumable`），所以从空白开始也能接着干。
+///
+/// **例外：它比组里每一个兄弟都更晚被用过**（`last_active` 严格最大）。
+/// 那 `--continue` 接到的最近那段对话就是它自己的，照样带上。这一条是给
+/// 没经过排空的重启用的（崩溃、被杀、直接重启）：没人请它写过交接，从
+/// 空白开始就真丢了。`drain_resumable` 不跟着放宽：
+/// 排空时请它写一份交接，最坏只是重启后多收一句「先读交接」。
+pub fn continue_flags(
+    sessions: &[RecordedSession],
+    profiles: &[crate::profile::Profile],
+) -> Vec<bool> {
+    let by_id: Vec<bool> = sessions
+        .iter()
+        .map(|r| will_resume_by_id(r, profiles))
+        .collect();
+    let sibling_has_id = |i: usize| {
+        (0..sessions.len()).any(|j| {
+            by_id[j] && sessions[j].dir == sessions[i].dir && sessions[j].profile == sessions[i].profile
+        })
+    };
+    let newest_in_group = |i: usize| {
+        (0..sessions.len()).all(|j| {
+            j == i
+                || sessions[j].dir != sessions[i].dir
+                || sessions[j].profile != sessions[i].profile
+                || sessions[j].last_active < sessions[i].last_active
+        })
+    };
+    let idx: Vec<usize> = (0..sessions.len())
+        .filter(|&i| !by_id[i] && !sibling_has_id(i))
+        .collect();
+    let sub: Vec<RecordedSession> = idx.iter().map(|&i| sessions[i].clone()).collect();
+    let flags = group_for_resume(&sub);
+    let mut out = vec![false; sessions.len()];
+    for (k, &i) in idx.iter().enumerate() {
+        out[i] = flags[k];
+    }
+    for i in 0..sessions.len() {
+        if !by_id[i] && sibling_has_id(i) && newest_in_group(i) {
+            out[i] = true;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,9 +267,128 @@ mod tests {
         RecordedSession {
             dir: PathBuf::from(dir),
             profile: profile.to_string(),
-            tag: String::new(),
             last_active,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn old_file_without_new_fields_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("last-sessions.toml");
+        std::fs::write(
+            &p,
+            "[[sessions]]\ndir = \"/tmp\"\nprofile = \"claude\"\ntag = \"\"\nlast_active = 5\n",
+        )
+        .unwrap();
+        let v = load(&p);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].conversation_id, None);
+        assert!(!v[0].interrupted);
+        assert_eq!(v[0].handoff, None);
+    }
+
+    #[test]
+    fn new_fields_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("last-sessions.toml");
+        let r = RecordedSession {
+            dir: "/tmp".into(),
+            profile: "claude".into(),
+            tag: "t".into(),
+            last_active: 1,
+            conversation_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            interrupted: true,
+            handoff: Some("/tmp/h.md".into()),
+            id: Some(7),
+            restart_initiator: true,
+            held_messages: vec!["[来自 pc] 你好".into()],
+        };
+        save(&p, std::slice::from_ref(&r)).unwrap();
+        assert_eq!(load(&p), vec![r]);
+    }
+
+    /// 有对话 id 的那条各接各的，不占 `--continue` 的位子；没 id 的照旧按
+    /// `last_active` 挑一条继续——**只在同组没有按 id 接回的兄弟时**。
+    #[test]
+    fn continue_flags_skips_records_with_ids() {
+        let mut with_id = rec("/w/x", "claude", 9);
+        with_id.conversation_id = Some("abc".into());
+        let sessions = vec![
+            rec("/w/x", "claude", 5),
+            with_id,
+            rec("/w/x", "claude", 1),
+            rec("/w/y", "claude", 3),
+            rec("/w/y", "claude", 4),
+        ];
+        let profiles = vec![crate::profile::Profile::builtin("claude").unwrap()];
+        assert_eq!(
+            continue_flags(&sessions, &profiles),
+            vec![false, false, false, false, true]
+        );
+    }
+
+    /// I2：没 id 的会话（上次是 `--continue` 接回来的）跟有 id 的兄弟在同一个
+    /// 目录里时，`--continue` 会接到兄弟最近写的那段对话上。这种一律从空白开始。
+    #[test]
+    fn no_continue_when_a_sibling_resumes_by_id() {
+        let mut b = rec("/w/x", "claude", 9);
+        b.conversation_id = Some("b".into());
+        let a = rec("/w/x", "claude", 5);
+        let profiles = vec![crate::profile::Profile::builtin("claude").unwrap()];
+        assert_eq!(continue_flags(&[a.clone(), b], &profiles), vec![false, false]);
+        // 没有兄弟时照旧接回
+        assert_eq!(continue_flags(&[a], &profiles), vec![true]);
+    }
+
+    /// N8：没 id 的那条比组里每个兄弟（有 id 的、没 id 的）都更晚被用过，
+    /// `--continue` 接到的最近那段对话就是它自己的，照样带上。打平不算。
+    #[test]
+    fn the_newest_id_less_record_keeps_continue_even_beside_an_id_sibling() {
+        let mut b = rec("/w/x", "claude", 5);
+        b.conversation_id = Some("b".into());
+        let profiles = vec![crate::profile::Profile::builtin("claude").unwrap()];
+        let newest = rec("/w/x", "claude", 9);
+        let older = rec("/w/x", "claude", 3);
+        let elsewhere = rec("/w/y", "claude", 100);
+        assert_eq!(
+            continue_flags(
+                &[older.clone(), b.clone(), newest, elsewhere.clone()],
+                &profiles
+            ),
+            vec![false, false, true, true]
+        );
+        // 有 id 的兄弟更新：都不带
+        let mut b2 = b.clone();
+        b2.last_active = 10;
+        assert_eq!(
+            continue_flags(&[older.clone(), b2, rec("/w/x", "claude", 9)], &profiles),
+            vec![false, false, false]
+        );
+        // 跟兄弟打平：不算更新
+        assert_eq!(
+            continue_flags(&[rec("/w/x", "claude", 5), b], &profiles),
+            vec![false, false]
+        );
+    }
+
+    /// 记录里有 id，但 profile 已经不声明按 id 接回的参数了：id 没处用，
+    /// 这一条要回到 `--continue` 分组里去抢位，不能被晾在外面。
+    #[test]
+    fn an_id_whose_profile_no_longer_resumes_by_id_joins_continue_grouping() {
+        let mut with_id = rec("/w/x", "claude", 9);
+        with_id.conversation_id = Some("abc".into());
+        let sessions = vec![rec("/w/x", "claude", 5), with_id.clone()];
+
+        let mut no_ids = crate::profile::Profile::builtin("claude").unwrap();
+        no_ids.session_id_args.clear();
+        no_ids.resume_id_args.clear();
+        let profiles = vec![no_ids];
+
+        assert!(!will_resume_by_id(&with_id, &profiles));
+        assert_eq!(continue_flags(&sessions, &profiles), vec![false, true]);
+        // profile 都不认识了也一样：不算按 id 接回。
+        assert!(!will_resume_by_id(&with_id, &[]));
     }
 
     #[test]

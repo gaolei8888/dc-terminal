@@ -1,17 +1,25 @@
 //! `--auto-next`：一局结束以后自己接着来——失败了点“再来一次”，弹窗里只点白名单里的字，
 //! 认出生命用完、价格、广告、不认识的画面就停。打赢也停：下一关的版面不一样，现在的棋盘位置读不对。
 //! 跟 dco 说话和计时都是传进来的（同 `play`），所以测试里换成假的。
+use crate::ask::Advisor;
 use crate::board::looks_like_board;
-use crate::play::{play, Clock, Dco, DcoError, Options, Profile, Seen, Stop, Summary};
+use crate::mood;
+use crate::play::{play_inner, Clock, Dco, DcoError, Options, Profile, Seen, Stop, Summary};
 use crate::screen::{classify, is_level_start, Element, Screen};
 use serde_json::{json, Value};
 
-pub struct NavOptions {
+pub struct NavOptions<'a> {
     /// 整个命令一共最多走几步棋（不是每一局）。
     pub max_steps: usize,
     /// 整个命令最多点几次“开始 / 再来一次”；点一次「开始」或「再来一次」算一次；点了「再来一次」之后紧跟着的那个 Play 是同一次重来，不另算。
     pub tries: usize,
     pub dry_run: bool,
+    pub advisor: Option<&'a dyn Advisor>,
+    pub ask_always: bool,
+    pub ask_budget: usize,
+    pub goal: &'a str,
+    /// 目标数字是屏幕上第几个数字（从 0 数）；`None` = 不知道，不判断停滞。
+    pub goal_index: Option<usize>,
 }
 
 const AFTER_TAP_FIRST_MS: u64 = 400;
@@ -37,6 +45,14 @@ fn nav_record(clock: &dyn Clock, seen: &Seen, screen: &str, tapped: Option<&str>
     })
 }
 
+/// 画面上有没有 profile 里写的「关卡号」字样（`level_pattern`，数据不是代码）。没写就永远是否。
+fn shows_level_label(p: &Profile, elements: &[Element]) -> bool {
+    let Some(re) = p.level_pattern.as_deref().and_then(|s| regex::Regex::new(s).ok()) else {
+        return false;
+    };
+    elements.iter().any(|e| re.is_match(&e.text))
+}
+
 /// 点一个元素，再等画面变。变了返回 `Ok(true)`，8 秒不变返回 `Ok(false)`；dco 拒绝或出错就把错误交出去。
 fn tap_and_wait(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, seen: &Seen, el: &Element) -> Result<bool, DcoError> {
     dco.tap(&seen.snapshot_id, &el.id)?;
@@ -55,7 +71,16 @@ fn tap_and_wait(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, seen: &Se
     }
 }
 
-pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavOptions, sink: &mut dyn FnMut(Value)) -> Summary {
+/// dco 的错误变成停下的原因：私人画面单独一种（不是出错）。
+fn dco_stop(e: DcoError) -> Stop {
+    if e.code == "private_screen" {
+        Stop::PrivateScreen
+    } else {
+        Stop::Dco(e)
+    }
+}
+
+pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavOptions<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
     let (mut steps, mut tries, mut taps, mut no_effect) = (0usize, 0usize, 0usize, 0usize);
     // after_board：刚玩完一局，还没有进过新棋盘。这时看到的 Play 可能是通关后的下一关，不点。
     // expect_board：开局框的 Play 点成了，接下来应该是重来那一局的棋盘（它的 OCR 读成 Unknown，不能因为 after_board 拒绝）。
@@ -64,9 +89,20 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
     let stop = loop {
         let seen = match dco.see_text(p) {
             Ok(s) => s,
-            Err(e) => break Stop::Dco(e),
+            Err(e) => break dco_stop(e),
         };
-        let screen = classify(&seen.elements);
+        // 画面上写着这个游戏的「关卡号」（profile 数据）、而且读得出合格的棋盘：它就是棋盘。
+        // 不先过 OCR 分类：棋盘 HUD 上的图标会被读成 ￥ 之类的符号，被当成“带价格的画面”。
+        // 标签在但棋盘读不出来（结算页、弹窗只留着标签的情形）就照旧交给 classify。
+        let mut pre_grid = if shows_level_label(p, &seen.elements) {
+            match dco.read_grid(p) {
+                Ok(g) if looks_like_board(&g) => Some(g),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let screen = if pre_grid.is_some() { Screen::Unknown } else { classify(&seen.elements) };
         // 要点哪个元素、它是什么类型；不点的情况直接在这里停。
         let (kind, el) = match screen {
             Screen::LivesOut => {
@@ -112,18 +148,24 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
             }
             Screen::Unknown => {
                 // 刚玩完一局遇到不认识的画面：弹窗也可能读得出“棋盘”，不去读，直接停。
-                if after_board && !expect_board {
+                // （关卡号标签 + 合格棋盘的画面除外：HUD 标签在弹窗和结算页上会消失，有它就是棋盘。）
+                if after_board && !expect_board && pre_grid.is_none() {
                     sink(nav_record(clock, &seen, "unknown", None, "stopped"));
                     break Stop::UnknownScreen(texts(&seen));
                 }
                 // 不是任何已知的按钮画面：看看是不是棋盘。
-                match dco.read_grid(p) {
+                let grid = match pre_grid.take() {
+                    Some(g) => Ok(g),
+                    None => dco.read_grid(p),
+                };
+                match grid {
                     Ok(g) if looks_like_board(&g) => {
                         let remaining = o.max_steps.saturating_sub(steps);
                         // 这个画面的字是以后“像棋盘”判断的证据。
                         sink(nav_record(clock, &seen, "board", None, "entered"));
                         expect_board = false;
-                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run }, sink);
+                        // after_board 不用在这里清：play 返回后要么 break，要么马上重新置 true，中间没人读它。
+                        let s = play_inner(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal, goal_index: o.goal_index }, sink);
                         steps += s.steps;
                         match s.stop {
                             // 画面变了（结算页、弹窗）：回到上面重新看是什么。
@@ -137,7 +179,7 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
                                 if steps >= o.max_steps {
                                     let end = match dco.see_text(p) {
                                         Ok(e) => e,
-                                        Err(e) => break Stop::Dco(e),
+                                        Err(e) => break dco_stop(e),
                                     };
                                     let (name, stop) = match classify(&end.elements) {
                                         Screen::Retry(_) => ("retry", Stop::StepsDone),
@@ -206,10 +248,13 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
             }
             Err(e) => {
                 sink(nav_record(clock, &seen, kind, Some(&el.text), "stopped"));
-                break Stop::Dco(e);
+                break dco_stop(e);
             }
         }
     };
+    if let Some(m) = mood::for_stop(&stop) {
+        dco.show_status_with(m.state, m.text, None);
+    }
     Summary { steps, stop }
 }
 
@@ -255,11 +300,12 @@ mod tests {
         stuck: bool,
         /// 逐次点按钮的脚本：`true` = 这一次点了没反应。用完以后看 `stuck`。
         stuck_script: Vec<bool>,
+        moods: Vec<(String, Option<String>)>,
     }
 
     impl World {
         fn new(frames: Vec<Frame>) -> World {
-            World { frames, at: 0, taps: vec![], swipes: 0, tap_error: None, see_error: None, stuck: false, stuck_script: vec![] }
+            World { frames, at: 0, taps: vec![], swipes: 0, tap_error: None, see_error: None, stuck: false, stuck_script: vec![], moods: vec![] }
         }
         fn advance(&mut self) {
             if self.at + 1 < self.frames.len() {
@@ -288,6 +334,9 @@ mod tests {
             self.advance();
             Ok(())
         }
+        fn show_status_with(&mut self, state: &str, text: Option<&str>, _: Option<&str>) {
+            self.moods.push((state.into(), text.map(Into::into)));
+        }
         fn see_text(&mut self, _: &Profile) -> Result<Seen, DcoError> {
             if let Some(e) = self.see_error.clone() {
                 return Err(e);
@@ -299,7 +348,7 @@ mod tests {
             Ok(Seen {
                 snapshot_id: format!("s{}", self.at),
                 observation_id: Some(format!("obs-{}", self.at)),
-                elements: texts.iter().enumerate().map(|(i, t)| Element { id: format!("e{}", i + 1), text: t.to_string() }).collect(),
+                elements: texts.iter().enumerate().map(|(i, t)| Element { id: format!("e{}", i + 1), text: t.to_string() , frac: None }).collect(),
             })
         }
         fn tap(&mut self, snapshot_id: &str, element_id: &str) -> Result<(), DcoError> {
@@ -332,7 +381,7 @@ mod tests {
     }
 
     fn profile() -> Profile {
-        Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows: 3, cols: 4, extra: json!({}) }
+        Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: crate::choose::Weights::default(), level_pattern: None, theme: None }
     }
 
     fn run(w: &mut World, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
@@ -341,7 +390,7 @@ mod tests {
 
     fn run_with(w: &mut World, max_steps: usize, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
         let mut log = vec![];
-        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry }, &mut |v| log.push(v));
+        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
         (s, log)
     }
 
@@ -427,6 +476,28 @@ mod tests {
     }
 
     #[test]
+    fn auto_next_stops_show_the_matching_mood() {
+        for (frame, want) in [
+            (text(&["Level Complete!"]), ("won", None)),
+            (text(&["No more lives", "Ask friends"]), ("sad", None)),
+            (text(&["Buy 💎 5"]), ("wait", Some("要你处理"))),
+        ] {
+            let mut w = World::new(vec![frame]);
+            let _ = run(&mut w, 5, false);
+            assert_eq!(w.moods, [(want.0.to_string(), want.1.map(String::from))]);
+        }
+    }
+
+    #[test]
+    fn a_level_ending_midway_does_not_announce_a_stop() {
+        // 一局结束（回到弹窗）只是中途：play 不发「看不懂」，最后一句由 auto_next 发。
+        let mut w = World::new(vec![board(A), text(&["Out of moves", "Try again"]), text(&["Level 1712", "Select boosters:", "Play", "B Play"]), board(DEAD)]);
+        let (s, _) = run(&mut w, 5, false);
+        assert_eq!(s.stop, Stop::NoMoves);
+        assert!(w.moods.is_empty(), "{:?}", w.moods);
+    }
+
+    #[test]
     fn a_priced_failure_popup_with_no_thanks_is_declined_and_play_goes_on() {
         let mut w = World::new(vec![
             board(A),
@@ -489,7 +560,7 @@ mod tests {
     fn the_step_budget_is_shared_across_levels() {
         let mut w = World::new(vec![board(A), board(A)]);
         let mut log = vec![];
-        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false }, &mut |v| log.push(v));
+        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
         assert_eq!(s.steps, 1);
         assert_eq!(s.stop, Stop::StepsDone);
     }
@@ -662,5 +733,60 @@ mod tests {
         assert_eq!(s.stop, Stop::LevelEnded);
         assert_eq!(w.taps, ["Try again", "Play"]);
         assert_eq!(w.swipes, 1);
+    }
+
+    // ---- 画面上的关卡号标签 + 合格棋盘 = 棋盘（不过 OCR 分类） ----
+
+    const HUD: &[&str] = &["10", "1714/♥4", "39", "￥124"];
+
+    fn labelled() -> Profile {
+        Profile { level_pattern: Some(r"(\d{3,5})\s*/".into()), ..profile() }
+    }
+
+    fn run_profile(w: &mut World, p: &Profile) -> Summary {
+        auto_next(w, &mut Clk(0), p, &NavOptions { max_steps: 50, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {})
+    }
+
+    #[test]
+    fn a_hud_with_the_level_label_and_a_valid_board_is_played_even_if_an_icon_reads_as_a_price() {
+        let mut w = World::new(vec![Frame::TextGrid(HUD.to_vec(), grid(A)), board(DEAD)]);
+        let s = run_profile(&mut w, &labelled());
+        assert_eq!(s.stop, Stop::NoMoves);
+        assert_eq!(w.swipes, 1);
+        assert!(w.taps.is_empty());
+    }
+
+    #[test]
+    fn without_a_level_pattern_the_same_hud_is_still_a_price_screen() {
+        let mut w = World::new(vec![Frame::TextGrid(HUD.to_vec(), grid(A))]);
+        let s = run_profile(&mut w, &profile());
+        assert_eq!(s.stop, Stop::Money);
+        assert_eq!(w.swipes, 0);
+    }
+
+    #[test]
+    fn the_label_alone_is_not_enough_when_the_grid_does_not_look_like_a_board() {
+        let lopsided: &[&[u16]] = &[&[1, 1, 1, 1], &[1, 1, 1, 1], &[1, 1, 2, 2]];
+        let mut w = World::new(vec![Frame::TextGrid(HUD.to_vec(), grid(lopsided))]);
+        let s = run_profile(&mut w, &labelled());
+        assert_eq!(s.stop, Stop::Money);
+        assert_eq!(w.swipes, 0);
+        assert!(w.taps.is_empty());
+    }
+
+    #[test]
+    fn a_result_screen_with_a_price_and_no_label_still_stops_as_money() {
+        let mut w = World::new(vec![Frame::TextGrid(vec!["Out of moves", "Buy ￥6"], grid(A))]);
+        let s = run_profile(&mut w, &labelled());
+        assert_eq!(s.stop, Stop::Money);
+        assert_eq!((w.swipes, w.taps.len()), (0, 0));
+    }
+
+    #[test]
+    fn after_a_level_a_labelled_valid_board_is_the_next_board_not_an_unknown_screen() {
+        let mut w = World::new(vec![board(A), Frame::TextGrid(vec!["1715/", "7"], grid(A)), board(DEAD)]);
+        let s = run_profile(&mut w, &labelled());
+        assert_eq!(s.stop, Stop::NoMoves);
+        assert_eq!(w.swipes, 2);
     }
 }

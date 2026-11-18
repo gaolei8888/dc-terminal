@@ -1,6 +1,6 @@
-//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N]`。
+//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N] [--ask-model] [--ask-every-step] [--goal 目标] [--goal-number N]`。
 
-const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5]";
+const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"] [--goal-number 2]";
 
 pub struct Args {
     pub game: String,
@@ -10,13 +10,21 @@ pub struct Args {
     pub auto_next: bool,
     /// 整个命令最多点几次“开始 / 再来一次”（每次都会用掉一条生命）。
     pub tries: usize,
+    /// 启用大模型：划了没反应时问它选哪一步（没配大模型就只用规则）。
+    pub ask_model: bool,
+    /// 每一步都问大模型（隐含 `ask_model`）。
+    pub ask_every_step: bool,
+    /// 告诉大模型这一关要干什么。
+    pub goal: Option<String>,
+    /// 目标数字是屏幕上第几个数字（从 1 数）；不写就不判断停滞。
+    pub goal_number: Option<usize>,
 }
 
 pub fn parse(args: &[String]) -> Result<Args, String> {
     if args.first().map(String::as_str) != Some("play") {
         return Err(USAGE.into());
     }
-    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5 };
+    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5, ask_model: false, ask_every_step: false, goal: None, goal_number: None };
     let mut it = args[1..].iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -25,6 +33,17 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--tries" => {
                 let v = it.next().ok_or("--tries 后面要写次数")?;
                 a.tries = v.parse().ok().filter(|n| (1..=20).contains(n)).ok_or("--tries 要在 1 到 20 之间")?;
+            }
+            "--ask-model" => a.ask_model = true,
+            "--ask-every-step" => {
+                a.ask_every_step = true;
+                a.ask_model = true;
+            }
+            "--goal" => a.goal = Some(it.next().ok_or("--goal 后面要写目标，比如 --goal \"清掉冰块\"")?.clone()),
+            "--goal-number" => {
+                const BAD: &str = "--goal-number 要写一个 1 到 20 的数字，比如 --goal-number 2 表示屏幕上第 2 个数字是目标";
+                let v = it.next().ok_or(BAD)?;
+                a.goal_number = Some(v.parse().ok().filter(|n| (1..=20).contains(n)).ok_or(BAD)?);
             }
             "--game" => a.game = it.next().ok_or("--game 后面要写游戏名")?.clone(),
             "--steps" => {
@@ -38,7 +57,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 #[cfg(unix)]
-struct SystemClock;
+pub(super) struct SystemClock;
 
 #[cfg(unix)]
 impl dct_game::play::Clock for SystemClock {
@@ -51,6 +70,15 @@ impl dct_game::play::Clock for SystemClock {
 }
 
 pub fn run(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("ask-bench") {
+        return super::bench::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("scene") {
+        return super::scene::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("identify") {
+        return super::identify::run(&args[1..]);
+    }
     let a = match parse(args) {
         Ok(a) => a,
         Err(m) => {
@@ -94,6 +122,24 @@ fn run_parsed(a: &Args) -> i32 {
         }
     };
     let clock = SystemClock;
+    let advisor: Option<super::advisor::LlmAdvisor> = if a.ask_model || a.ask_every_step {
+        match crate::cli::load_llm_backend() {
+            Ok(l) => Some(super::advisor::LlmAdvisor::new(l.backend, l.model)),
+            Err(crate::cli::LoadLlmError::NotEnabled(_)) => {
+                println!("没开大模型，这次只用规则玩。");
+                None
+            }
+            Err(crate::cli::LoadLlmError::Problem { .. }) => {
+                println!("大模型连不上，这次只用规则玩。可以先运行 dct llm check 看原因。");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let ask_always = a.ask_every_step && advisor.is_some();
+    let goal = a.goal.clone().unwrap_or_else(|| "尽量多消".into());
+    let adv_ref: Option<&dyn dct_game::ask::Advisor> = advisor.as_ref().map(|x| x as &dyn dct_game::ask::Advisor);
     let log = match LogFile::open(&home, clock.now_ms() / 1000) {
         Ok(l) => l,
         Err(m) => {
@@ -125,9 +171,9 @@ fn run_parsed(a: &Args) -> i32 {
         }
     };
     let summary = if a.auto_next {
-        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run }, &mut sink)
+        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal, goal_index: a.goal_number.map(|n| n - 1) }, &mut sink)
     } else {
-        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run }, &mut sink)
+        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal, goal_index: a.goal_number.map(|n| n - 1) }, &mut sink)
     };
     let (line, code) = text::stop_line(&summary.stop, summary.steps, log.path());
     let _ = log.append(&json!({ "schema": 1, "run_id": run_id, "time_ms": SystemClock.now_ms(), "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));
@@ -136,12 +182,39 @@ fn run_parsed(a: &Args) -> i32 {
     } else {
         eprintln!("{line}");
     }
+    if let Some(line) = advisor.as_ref().and_then(|a| a.summary()) {
+        println!("{line}");
+    }
     code
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ask_model_and_goal() {
+        let a = parse(&["play".into(), "--ask-model".into(), "--goal".into(), "清掉冰块".into()]).unwrap();
+        assert!(a.ask_model);
+        assert_eq!(a.goal.as_deref(), Some("清掉冰块"));
+        let d = parse(&["play".into()]).unwrap();
+        assert!(!d.ask_model && !d.ask_every_step);
+        // --ask-model 只在划了没反应时问；每一步都问要 --ask-every-step
+        assert!(!a.ask_every_step);
+        let e = parse(&["play".into(), "--ask-every-step".into()]).unwrap();
+        assert!(e.ask_every_step && e.ask_model);
+        assert_eq!(d.goal, None);
+        assert!(parse(&["play".into(), "--goal".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_goal_number() {
+        assert_eq!(p(&["play", "--goal-number", "2"]).unwrap().goal_number, Some(2));
+        assert_eq!(p(&["play"]).unwrap().goal_number, None);
+        for bad in [&["play", "--goal-number", "0"][..], &["play", "--goal-number", "21"], &["play", "--goal-number", "x"], &["play", "--goal-number"]] {
+            assert!(p(bad).err().unwrap().contains("--goal-number 要写一个 1 到 20 的数字"));
+        }
+    }
 
     fn p(v: &[&str]) -> Result<Args, String> {
         parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())

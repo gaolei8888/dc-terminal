@@ -1,6 +1,7 @@
 //! 棋盘配置：窗口、棋盘在窗口里的位置、行列数、读棋盘的参数。第一轮手写：内置一份 Candy Crush，
 //! `~/.dct/games/<游戏>.toml` 存在就用它。棋盘位置每关不同，换关要改——自动校准是下一轮的事。
 use dct_game::play::Profile;
+use dct_game::Weights;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -16,6 +17,22 @@ inset = 0.6
 class_de = 24
 top_div = 5
 odd_share = 0.15
+
+# 关卡号在画面上的写法（一个捕获组）。有它、又读得出合格棋盘的画面就是棋盘，不看 HUD 上的符号。
+# 过渡期的本地数据：长期要搬进 dcv。
+level_pattern = '(\d{3,5})\s*/'
+
+# 打分权重。这是过渡期的本地数据：长期要搬进 dcv，dct 的代码里不留任何游戏的数值。
+# special_swap 写 0：两颗特殊糖互换却消不掉东西的步不走（特殊糖的标记会闪，会反复选到这种空步）。
+[weights]
+cleared = 1
+cascade = 0.5
+striped = 6
+wrapped = 8
+bomb = 15
+triggered = 5
+special_swap = 0
+low_row = 1
 "#;
 
 #[derive(Deserialize)]
@@ -29,6 +46,51 @@ struct File {
     class_de: Option<f64>,
     top_div: Option<u32>,
     odd_share: Option<f64>,
+    /// 关卡号在画面上的写法：恰好一个捕获组的正则。过渡期的本地数据，长期搬进 dcv。
+    level_pattern: Option<String>,
+    /// 章鱼的主题名（可选，最长 20 个字符）。
+    theme: Option<String>,
+    /// `dct game scene` 不点的区域（窗口 0 到 1，最多 16 块）。不写 = 没有。游戏专属的数据只来自这里。
+    no_tap: Option<Vec<NoTapEntry>>,
+    /// 可选的重复表 `[[class]]`：把读出来的颜色类别标成「不是糖」（洞、蜂蜜块、糖果机）。
+    #[serde(default)]
+    class: Vec<ClassEntry>,
+    /// 可选的打分权重表；没写的项保持通用的中性默认。
+    weights: Option<WeightsEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoTapEntry {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// `no_tap` 最多这么多块（和 dco 的 `tap_at` 一次能带的数一样）。
+pub const NO_TAP_MAX: usize = 16;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WeightsEntry {
+    cleared: Option<f64>,
+    cascade: Option<f64>,
+    striped: Option<f64>,
+    wrapped: Option<f64>,
+    bomb: Option<f64>,
+    triggered: Option<f64>,
+    special_swap: Option<f64>,
+    low_row: Option<f64>,
+}
+
+/// 一类颜色。只有 `kind = "fixed"` 的会进 Profile；`candy` 只是写给人看的备注，被接受后忽略。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClassEntry {
+    name: String,
+    rgb: [i64; 3],
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +114,8 @@ pub struct Loaded {
     pub sha256: String,
     /// 说给用户听的来源：「内置的」或文件路径。
     pub source: String,
+    /// 不点的区域（整数万分比），给 `dct game scene` 用。
+    pub no_tap: Vec<dct_game::play::Region>,
 }
 
 pub fn games_dir(home: &Path) -> PathBuf {
@@ -89,6 +153,27 @@ pub fn load(home: &Path, game: &str) -> Result<Loaded, String> {
     if let Some(v) = f.odd_share {
         extra.insert("odd_share".into(), json!(v));
     }
+    // 颜色距离的阈值沿用读盘用的 class_de：「同一类」在两边是同一个意思
+    let match_de = f.class_de.unwrap_or(24.0);
+    let fixed_rgb: Vec<[u8; 3]> =
+        f.class.iter().filter(|c| c.kind == "fixed").map(|c| [c.rgb[0] as u8, c.rgb[1] as u8, c.rgb[2] as u8]).collect();
+    let mut weights = Weights::default();
+    if let Some(w) = &f.weights {
+        for (slot, v) in [
+            (&mut weights.cleared, w.cleared),
+            (&mut weights.cascade, w.cascade),
+            (&mut weights.striped, w.striped),
+            (&mut weights.wrapped, w.wrapped),
+            (&mut weights.bomb, w.bomb),
+            (&mut weights.triggered, w.triggered),
+            (&mut weights.special_swap, w.special_swap),
+            (&mut weights.low_row, w.low_row),
+        ] {
+            if let Some(v) = v {
+                *slot = v;
+            }
+        }
+    }
     let sha256 = Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
     Ok(Loaded {
         profile: Profile {
@@ -97,10 +182,20 @@ pub fn load(home: &Path, game: &str) -> Result<Loaded, String> {
             rows: f.rows,
             cols: f.cols,
             extra: Value::Object(extra),
+            fixed_rgb,
+            match_de,
+            weights,
+            level_pattern: f.level_pattern,
+            theme: f.theme,
         },
         sha256,
         source,
+        no_tap: f.no_tap.as_deref().unwrap_or(&[]).iter().map(|r| dct_game::play::Region { x_bp: bp(r.x), y_bp: bp(r.y), w_bp: bp(r.w), h_bp: bp(r.h) }).collect(),
     })
+}
+
+fn bp(v: f64) -> u16 {
+    dct_game::scene::to_bp(v)
 }
 
 fn check(f: &File) -> Result<(), String> {
@@ -111,6 +206,56 @@ fn check(f: &File) -> Result<(), String> {
     }
     if !(1..=32).contains(&f.rows) || !(1..=32).contains(&f.cols) {
         return Err("rows、cols 都要在 1 到 32 之间".into());
+    }
+    for c in &f.class {
+        if c.kind != "fixed" && c.kind != "candy" {
+            return Err(format!("[[class]]「{}」的 kind 只能写 \"fixed\"（不是糖）或 \"candy\"（糖），现在写的是「{}」", c.name, c.kind));
+        }
+        if c.rgb.iter().any(|v| !(0..=255).contains(v)) {
+            return Err(format!("[[class]]「{}」的 rgb 三个数都要在 0 到 255 之间", c.name));
+        }
+    }
+    if let Some(list) = &f.no_tap {
+        if list.len() > NO_TAP_MAX {
+            return Err(format!("no_tap 最多 {NO_TAP_MAX} 块，现在写了 {} 块", list.len()));
+        }
+        for (i, r) in list.iter().enumerate() {
+            let ok = [r.x, r.y, r.w, r.h].iter().all(|v| (0.0..=1.0).contains(v)) && r.w > 0.0 && r.h > 0.0 && r.x + r.w <= 1.0 + 1e-9 && r.y + r.h <= 1.0 + 1e-9;
+            if !ok {
+                return Err(format!("no_tap 第 {} 块要整个落在窗口里：x、y、w、h 都取 0 到 1，w 和 h 大于 0，x+w、y+h 不超过 1", i + 1));
+            }
+        }
+    }
+    if f.theme.as_ref().is_some_and(|t| t.chars().count() > 20) {
+        return Err("theme 最长 20 个字符".into());
+    }
+    if let Some(pat) = &f.level_pattern {
+        if pat.chars().count() > 100 {
+            return Err("level_pattern 最长 100 个字符".into());
+        }
+        let re = regex::Regex::new(pat).map_err(|e| format!("level_pattern 不是合法的正则：{e}"))?;
+        // captures_len 含整体匹配那一个，所以「恰好一个捕获组」是 2
+        if re.captures_len() != 2 {
+            return Err(format!("level_pattern 要恰好有一个括号捕获组（关卡号），现在有 {} 个", re.captures_len() - 1));
+        }
+    }
+    if let Some(w) = &f.weights {
+        for (name, v) in [
+            ("cleared", w.cleared),
+            ("cascade", w.cascade),
+            ("striped", w.striped),
+            ("wrapped", w.wrapped),
+            ("bomb", w.bomb),
+            ("triggered", w.triggered),
+            ("special_swap", w.special_swap),
+            ("low_row", w.low_row),
+        ] {
+            if let Some(v) = v {
+                if !(0.0..=100.0).contains(&v) {
+                    return Err(format!("[weights] 的 {name} 要在 0 到 100 之间，现在写的是 {v}"));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -169,5 +314,142 @@ mod tests {
         for bad in ["", "../x", "A", "a/b", "a.b"] {
             assert!(load(h.path(), bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn class_tables_split_into_fixed_colours_and_ignored_candies() {
+        let text = format!(
+            "{CANDY_CRUSH}\n[[class]]\nname = \"honey\"\nrgb = [196, 148, 101]\nkind = \"fixed\"\n\n[[class]]\nname = \"gap\"\nrgb = [10, 20, 30]\nkind = \"fixed\"\n\n[[class]]\nname = \"red\"\nrgb = [200, 30, 30]\nkind = \"candy\"\n"
+        );
+        let h = home_with("candy-crush", &text);
+        let l = load(h.path(), "candy-crush").unwrap();
+        assert_eq!(l.profile.fixed_rgb, vec![[196, 148, 101], [10, 20, 30]]);
+        assert_eq!(l.profile.match_de, 24.0);
+    }
+
+    #[test]
+    fn match_de_follows_class_de_when_the_file_has_one() {
+        let h = home_with("candy-crush", &CANDY_CRUSH.replace("class_de = 24", "class_de = 18"));
+        assert_eq!(load(h.path(), "candy-crush").unwrap().profile.match_de, 18.0);
+    }
+
+    #[test]
+    fn a_bad_kind_is_refused_naming_the_file() {
+        let text = format!("{CANDY_CRUSH}\n[[class]]\nname = \"x\"\nrgb = [1, 2, 3]\nkind = \"wall\"\n");
+        let h = home_with("candy-crush", &text);
+        let e = load(h.path(), "candy-crush").err().unwrap();
+        assert!(e.contains("candy-crush.toml") && e.contains("kind"), "{e}");
+    }
+
+    #[test]
+    fn an_rgb_out_of_range_or_a_missing_field_is_refused() {
+        let bad_rgb = format!("{CANDY_CRUSH}\n[[class]]\nname = \"x\"\nrgb = [300, 2, 3]\nkind = \"fixed\"\n");
+        let e = load(home_with("candy-crush", &bad_rgb).path(), "candy-crush").err().unwrap();
+        assert!(e.contains("candy-crush.toml") && e.contains("rgb"), "{e}");
+        let missing = format!("{CANDY_CRUSH}\n[[class]]\nname = \"x\"\nkind = \"fixed\"\n");
+        let e = load(home_with("candy-crush", &missing).path(), "candy-crush").err().unwrap();
+        assert!(e.contains("candy-crush.toml"), "{e}");
+    }
+
+    #[test]
+    fn a_file_without_class_tables_has_no_fixed_colours() {
+        let h = home_with("candy-crush", CANDY_CRUSH);
+        assert!(load(h.path(), "candy-crush").unwrap().profile.fixed_rgb.is_empty());
+    }
+
+    #[test]
+    fn a_weights_table_loads_its_numbers_and_keeps_defaults_for_missing_keys() {
+        let text = format!("{}\n[weights]\nstriped = 3.5\nspecial_swap = 20\n", CANDY_CRUSH.split("\n# 打分权重").next().unwrap());
+        let w = load(home_with("candy-crush", &text).path(), "candy-crush").unwrap().profile.weights;
+        assert_eq!((w.striped, w.special_swap), (3.5, 20.0));
+        assert_eq!((w.cleared, w.cascade, w.wrapped, w.low_row), (1.0, 0.5, 0.0, 1.0));
+    }
+
+    #[test]
+    fn weights_out_of_range_or_unknown_are_refused_naming_the_file() {
+        let base = CANDY_CRUSH.split("\n# 打分权重").next().unwrap();
+        for body in ["striped = 101", "bomb = -1", "sparkle = 3"] {
+            let e = load(home_with("candy-crush", &format!("{base}\n[weights]\n{body}\n")).path(), "candy-crush").err().unwrap();
+            assert!(e.contains("candy-crush.toml"), "{body}: {e}");
+        }
+    }
+
+    #[test]
+    fn level_pattern_loads_and_bad_ones_are_refused_naming_the_file() {
+        let base = CANDY_CRUSH.split("\nlevel_pattern").next().unwrap().to_string() + "\n";
+        let rest = format!("\n[weights]{}", CANDY_CRUSH.split("\n[weights]").nth(1).unwrap());
+        let with = |pat: &str| format!("{base}level_pattern = '{pat}'\n{rest}");
+        let l = load(home_with("candy-crush", &with(r"(\d+)/")).path(), "candy-crush").unwrap();
+        assert_eq!(l.profile.level_pattern.as_deref(), Some(r"(\d+)/"));
+        assert_eq!(load(tempfile::tempdir().unwrap().path(), "candy-crush").unwrap().profile.level_pattern.as_deref(), Some(r"(\d{3,5})\s*/"));
+        let long = format!("({})", "a".repeat(100));
+        for bad in ["(unclosed", r"\d+/", r"(\d+)/(\d+)", long.as_str()] {
+            let e = load(home_with("candy-crush", &with(bad)).path(), "candy-crush").err().unwrap();
+            assert!(e.contains("candy-crush.toml") && e.contains("level_pattern"), "{bad}: {e}");
+        }
+        let none = home_with("candy-crush", &format!("{base}{rest}"));
+        assert_eq!(load(none.path(), "candy-crush").unwrap().profile.level_pattern, None);
+    }
+
+    #[test]
+    fn theme_loads_and_a_too_long_one_is_refused() {
+        let base = CANDY_CRUSH.split("\nlevel_pattern").next().unwrap().to_string() + "\n";
+        let rest = format!("\nlevel_pattern{}", CANDY_CRUSH.split("\nlevel_pattern").nth(1).unwrap());
+        let with = |t: &str| format!("{base}theme = \"{t}\"\n{rest}");
+        let l = load(home_with("candy-crush", &with("candy")).path(), "candy-crush").unwrap();
+        assert_eq!(l.profile.theme.as_deref(), Some("candy"));
+        assert!(load(home_with("candy-crush", &with(&"a".repeat(20))).path(), "candy-crush").is_ok());
+        let e = load(home_with("candy-crush", &with(&"a".repeat(21))).path(), "candy-crush").err().unwrap();
+        assert!(e.contains("candy-crush.toml") && e.contains("theme"), "{e}");
+        assert_eq!(load(tempfile::tempdir().unwrap().path(), "candy-crush").unwrap().profile.theme, None);
+    }
+
+    #[test]
+    fn a_file_without_weights_loads_neutral_weights() {
+        let base = CANDY_CRUSH.split("\n# 打分权重").next().unwrap();
+        let w = load(home_with("candy-crush", base).path(), "candy-crush").unwrap().profile.weights;
+        assert_eq!(w, Weights::default());
+        assert_eq!((w.striped, w.special_swap), (0.0, 0.0));
+    }
+
+    #[test]
+    fn the_built_in_candy_crush_carries_its_tuning_without_the_junk_special_swap() {
+        let w = load(tempfile::tempdir().unwrap().path(), "candy-crush").unwrap().profile.weights;
+        assert_eq!((w.striped, w.wrapped, w.bomb, w.triggered), (6.0, 8.0, 15.0, 5.0));
+        assert_eq!((w.special_swap, w.cleared, w.cascade, w.low_row), (0.0, 1.0, 0.5, 1.0));
+    }
+
+    const MIN: &str = "window = { app = \"x\" }\nregion = { x = 0.1, y = 0.1, w = 0.5, h = 0.5 }\nrows = 2\ncols = 2\n";
+
+    #[test]
+    fn no_tap_defaults_to_empty_and_never_touches_the_built_in_game() {
+        let h = tempfile::tempdir().unwrap();
+        assert!(load(h.path(), "candy-crush").unwrap().no_tap.is_empty());
+        let h = home_with("x", MIN);
+        assert!(load(h.path(), "x").unwrap().no_tap.is_empty());
+    }
+
+    #[test]
+    fn no_tap_blocks_become_basis_points() {
+        let h = home_with("x", &format!("{MIN}no_tap = [{{ x = 0.78, y = 0.0, w = 0.22, h = 0.2 }}, {{ x = 0.0, y = 0.82, w = 1.0, h = 0.18 }}]\n"));
+        let r = load(h.path(), "x").unwrap().no_tap;
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].x_bp, r[0].y_bp, r[0].w_bp, r[0].h_bp), (7800, 0, 2200, 2000));
+        assert_eq!((r[1].x_bp, r[1].y_bp, r[1].w_bp, r[1].h_bp), (0, 8200, 10000, 1800));
+    }
+
+    #[test]
+    fn no_tap_out_of_range_or_too_many_is_refused_with_a_reason() {
+        for bad in ["{ x = 0.9, y = 0.0, w = 0.2, h = 0.1 }", "{ x = -0.1, y = 0.0, w = 0.2, h = 0.1 }", "{ x = 0.1, y = 0.1, w = 0.0, h = 0.1 }", "{ x = 0.1, y = 0.1, w = 1.5, h = 0.1 }"] {
+            let h = home_with("x", &format!("{MIN}no_tap = [{bad}]\n"));
+            let e = load(h.path(), "x").err().unwrap_or_else(|| panic!("{bad} 应当被拒绝"));
+            assert!(e.contains("no_tap 第 1 块"), "{e}");
+        }
+        let many = vec!["{ x = 0.0, y = 0.0, w = 0.1, h = 0.1 }"; 17].join(", ");
+        let h = home_with("x", &format!("{MIN}no_tap = [{many}]\n"));
+        assert!(load(h.path(), "x").err().unwrap().contains("最多 16 块"));
+        let sixteen = vec!["{ x = 0.0, y = 0.0, w = 0.1, h = 0.1 }"; 16].join(", ");
+        let h = home_with("x", &format!("{MIN}no_tap = [{sixteen}]\n"));
+        assert_eq!(load(h.path(), "x").unwrap().no_tap.len(), 16);
     }
 }

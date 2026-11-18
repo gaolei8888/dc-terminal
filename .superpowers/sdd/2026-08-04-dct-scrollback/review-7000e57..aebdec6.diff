@@ -1,0 +1,497 @@
+# Review package: 7000e57..aebdec6
+
+## Commits
+aebdec6 feat: 会话层贯通滚动状态，打字和改尺寸都回到底部
+
+## Files changed
+ src/daemon.rs  |  12 ++-
+ src/session.rs | 233 +++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 224 insertions(+), 21 deletions(-)
+
+## Diff
+diff --git a/src/daemon.rs b/src/daemon.rs
+index c581531..7a89a5c 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -252,27 +252,25 @@ fn handle(
+                 st.touch(&dir);
+                 // remember=false 是「帮你装 CLI」那条路径：它开的 shell 会话
+                 // 不是用户选的 agent，记了下次按 n 会掉进命令行。
+                 if remember {
+                     st.set_last_profile(&profile);
+                 }
+             }
+             r
+         }
+         Request::Input { id, text } => mgr.send_input(id, &text).map(|_| Response::Ok),
+-        Request::Screen { id } => mgr
+-            .screen(id)
+-            .map(|(lines, cursor, state)| Response::Screen {
+-                lines,
+-                cursor,
+-                state,
+-            }),
++        Request::Screen { id } => mgr.screen(id).map(|snap| Response::Screen {
++            lines: snap.lines,
++            cursor: snap.cursor,
++            state: snap.state,
++        }),
+         Request::Screens { ids } => Ok(Response::Screens {
+             screens: mgr.screens(&ids),
+         }),
+         Request::Resize { id, rows, cols } => mgr.resize(id, rows, cols).map(|_| Response::Ok),
+         Request::Stop { id } => mgr.stop(id).map(|_| Response::Ok),
+         Request::Kill { id } => mgr.kill(id).map(|_| Response::Ok),
+         Request::Prune => Ok(Response::Pruned(mgr.prune())),
+         Request::Undo { id } => mgr.undo(id).map(|_| Response::Ok),
+         Request::Diff { id } => mgr.diff(id).map(Response::Diff),
+         Request::SetSecret { profile, value } => recover(secrets.lock())
+diff --git a/src/session.rs b/src/session.rs
+index 4667283..ea75a0c 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -3,28 +3,55 @@ use anyhow::Result;
+ use serde::{Deserialize, Serialize};
+ use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex};
+ 
+ use crate::git::{self, FileStat};
+ use crate::profile::Profile;
+ use crate::pty::{PtySession, ScreenSpan};
+ 
+-/// 一屏文字、光标位置、会话状态：`screen()` 的返回值，行的集合按 (行, 列)
+-/// 排布 span，光标是 (行, 列)。type_complexity 报警要求给这个组合起个名字。
++/// 一屏文字 + 光标 + 滚动状态 + 会话状态：`screen()` 的返回值，行的集合按
++/// (行, 列) 排布 span，光标是 (行, 列)。
+ ///
+ /// 状态挤在这里而不是让界面另发一次 `List`：贴在会话里时界面只调 `Screen`
+ /// （`List` 要逐个锁所有会话、取每个的最后一行，16ms 一轮太贵），所以进程
+ /// 死了它一无所知——会永远画那张空缓冲，底栏还写着「其余按键都发给 agent」。
+ /// 状态是这条 16ms 通路上唯一能捎回来的存活信号，而这里本来就已经持着锁了。
+-pub type ScreenSnapshot = (Vec<Vec<ScreenSpan>>, (u16, u16), SessionState);
++pub struct ScreenSnapshot {
++    pub lines: Vec<Vec<ScreenSpan>>,
++    pub cursor: (u16, u16),
++    pub scroll: ScrollState,
++    pub state: SessionState,
++}
++
++/// 界面画底栏要用的全部滚动事实。
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ScrollState {
++    #[serde(default)]
++    pub agent_owns: bool,
++    #[serde(default)]
++    pub alt_screen: bool,
++    #[serde(default)]
++    pub max: usize,
++    #[serde(default)]
++    pub offset: usize,
++    #[serde(default)]
++    pub new_lines: usize,
++}
++
++/// `SessionManager::scroll` 的入参：相对滚几行，或者干脆回到底部。
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ScrollBy {
++    Rows(i32),
++    Bottom,
++}
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ pub enum SessionState {
+     Working,
+     /// 由后续的 Bridge 在 agent 调用 ask_human 时设置；本计划内不会出现
+     Asking,
+     Idle,
+     Stopped,
+     /// agent 报错了（`error_pattern` 命中）。会话还活着、进程还在，
+     /// 但屏幕上摆着一句失败——这跟「空闲」是两回事。
+@@ -132,20 +159,28 @@ struct Session {
+     /// 出错原因的人话解释，由后台线程写回（见 `SessionManager::request_explanation`）。
+     /// **必须是 `Arc<Mutex<_>>`**：那个线程拿不到 `Session` 的锁——`tick()`
+     /// 正持着它。裸 `Option<String>` 编不过。
+     explanation_slot: Arc<Mutex<Option<String>>>,
+     /// 第几次问过解释了。每次**进入** Failed 都自增，连同当时的号码一起
+     /// 交给那一轮的后台线程——线程算完之后先比一遍号码还对不对，不对就
+     /// 说明中途又失败过一次、有更新的问题在问，这份迟到的旧答案就不写了。
+     /// 没有这道防线的话，一个卡了很久的旧回答有可能在新一轮的新回答
+     /// 写回去**之后**才姗姗来迟，把新答案覆盖成旧的。
+     explanation_gen: Arc<AtomicU64>,
++    /// 用户上次**主动**滚动时的偏移。`new_lines` 靠它算：vt100 会在新行
++    /// 推入时自动把偏移 +1（grid.rs:556-558，画面因此不动），所以
++    /// 「偏移 - 这个标记」就正好是用户没看过的行数。
++    ///
++    /// 边界：偏移增长被历史总行数封顶，缓冲满 2000 行之后 new_lines 会
++    /// 少算，画面也会开始往上飘（最老的行被挤掉了）。这是环形缓冲的
++    /// 固有代价。
++    scroll_mark: usize,
+ }
+ 
+ /// `SessionManager` 内部可变——所有方法都是 `&self`，好让它以 `Arc<SessionManager>`
+ /// 的形式在多个连接线程之间共享，而不需要一把包住整个 manager 的外层大锁。
+ ///
+ /// 关键设计：`create()` 里唯一的共享状态改动是最后把新 `Session` 插进 `sessions`
+ /// 这个 `HashMap`；开 worktree、跑 checkpoint、起 PTY 这些可能很慢的操作全部在
+ /// 拿到锁之前做完。这样一个客户端在建慢会话（比如仓库文件很多，`git worktree add`
+ /// 要跑上大半秒）的时候，其它客户端的 `list`/`screen`/`tick` 不会被一起拖住——
+ /// 它们最多等一次 `HashMap` 插入/查找的时间，跟文件数量无关。
+@@ -330,20 +365,21 @@ impl SessionManager {
+             dir: dir.to_path_buf(),
+             is_agent,
+             checkpoints,
+             state,
+             idle_re,
+             busy_re,
+             error_re,
+             pty,
+             explanation_slot: Arc::new(Mutex::new(None)),
+             explanation_gen: Arc::new(AtomicU64::new(0)),
++            scroll_mark: 0,
+         };
+ 
+         // 出生也记一笔：只有死亡记录的话，日志里满是「某某没了」却看不出
+         // 它是什么时候、在哪个项目起来的，对不上「我刚才按了什么」。
+         self.journal
+             .born(id, &session.profile.name, dir, session.pty.process_id());
+ 
+         // 唯一需要锁的地方，而且只做一次 HashMap 插入，跟慢操作耗时无关。
+         recover(self.sessions.lock()).insert(id, Arc::new(Mutex::new(session)));
+         Ok(id)
+@@ -416,53 +452,89 @@ impl SessionManager {
+                     .map_err(|_| coded(ErrorCode::OperationFailed(Operation::Checkpoint)))?;
+                 let mut s = recover(arc.lock());
+                 if s.checkpoints.last() != Some(&sha) {
+                     s.checkpoints.push(sha);
+                 }
+                 s.state = SessionState::Working;
+             } else {
+                 recover(arc.lock()).state = SessionState::Working;
+             }
+ 
+-            let g = recover(arc.lock());
++            let mut g = recover(arc.lock());
++            // 一敲键就回到底部。滚上去的时候打字，字会落在看不见的地方，
++            // 用户会以为键盘坏了。归零之后字符照常送出去，不吞。
++            g.pty.scroll_to_bottom();
++            g.scroll_mark = 0;
+             return g.pty.write(b"\r");
+         }
+ 
+-        let g = recover(arc.lock());
++        let mut g = recover(arc.lock());
++        // 一敲键就回到底部。滚上去的时候打字，字会落在看不见的地方，
++        // 用户会以为键盘坏了。归零之后字符照常送出去，不吞。
++        g.pty.scroll_to_bottom();
++        g.scroll_mark = 0;
+         g.pty.write(text.as_bytes())
+     }
+ 
+-    /// 返回 agent 屏幕文本和光标位置 (行, 列)。光标必须跟文本一起取，
+-    /// 否则界面只是一张死截图，用户看不出自己打的字落在哪。
++    /// 返回 agent 屏幕文本、光标位置 (行, 列)、滚动状态、会话状态。光标必须
++    /// 跟文本一起取，否则界面只是一张死截图，用户看不出自己打的字落在哪。
+     pub fn screen(&self, id: u32) -> Result<ScreenSnapshot> {
+-        self.with_session(id, |s| Ok((s.pty.screen_spans(), s.pty.cursor(), s.state)))
++        self.with_session(id, |s| {
++            let v = s.pty.scroll_state();
++            Ok(ScreenSnapshot {
++                lines: s.pty.screen_spans(),
++                cursor: s.pty.cursor(),
++                scroll: state_of(v, s.scroll_mark),
++                state: s.state,
++            })
++        })
++    }
++
++    /// 用户主动滚动：相对滚几行，或者直接回到底部。
++    pub fn scroll(&self, id: u32, by: ScrollBy) -> Result<ScrollState> {
++        self.with_session(id, |s| {
++            let v = match by {
++                ScrollBy::Rows(n) => s.pty.scroll_by(n),
++                ScrollBy::Bottom => s.pty.scroll_to_bottom(),
++            };
++            // 用户主动滚过了，「没看过的行数」从这一刻重新算
++            s.scroll_mark = v.offset;
++            Ok(state_of(v, s.scroll_mark))
++        })
+     }
+ 
+     /// 一次取多个会话的屏幕，九宫格用。锁的纪律跟 `list()` 一致：
+     /// 逐个短暂拿锁，不跨会话持有任何东西。不存在的 id 跳过——
+     /// 会话可能在两次轮询之间被停掉，这不是错误。
+     pub fn screens(&self, ids: &[u32]) -> Vec<crate::proto::ScreenEntry> {
+         ids.iter()
+             .filter_map(|id| {
+                 let arc = self.get_arc(*id).ok()?;
+                 let s = recover(arc.lock());
+                 Some(crate::proto::ScreenEntry {
+                     id: *id,
+                     lines: s.pty.screen_spans(),
+                 })
+             })
+             .collect()
+     }
+ 
+     /// 改会话的显示尺寸。界面尺寸变了就要跟着调，否则 agent 按错的宽度排版。
+     pub fn resize(&self, id: u32, rows: u16, cols: u16) -> Result<()> {
+-        self.with_session(id, |s| s.pty.resize(rows, cols))
++        self.with_session(id, |s| {
++            s.pty.resize(rows, cols)?;
++            // vt100 会按新宽度重排，偏移指向的行跟改之前不是同一行了。
++            // 与其显示一个错位的画面，不如老老实实回到底部。
++            s.pty.scroll_to_bottom();
++            s.scroll_mark = 0;
++            Ok(())
++        })
+     }
+ 
+     pub fn stop(&self, id: u32) -> Result<()> {
+         self.with_session(id, |s| {
+             // pid 要在 kill 之前取：杀完再问就已经被回收了。
+             let pid = s.pty.process_id();
+             s.pty.kill()?;
+             s.state = SessionState::Stopped;
+             // `requested` 和 `tick()` 里那条 `vanished` 是这本日志唯一
+             // 分得开的两件事——见 `journal` 的模块注释。
+@@ -635,20 +707,30 @@ impl SessionManager {
+                     if let Ok(mut g) = slot.lock() {
+                         *g = Some(text);
+                     }
+                 }
+             }
+             // 失败就什么都不做——界面显示今天就有的那句失败提示
+         });
+     }
+ }
+ 
++fn state_of(v: crate::pty::ScrollView, mark: usize) -> ScrollState {
++    ScrollState {
++        agent_owns: v.agent_owns,
++        alt_screen: v.alt_screen,
++        max: v.max,
++        offset: v.offset,
++        new_lines: v.offset.saturating_sub(mark),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use crate::secrets::SecretStore;
+     use std::fs;
+     use std::process::Command;
+     use std::thread::sleep;
+     use std::time::{Duration, Instant};
+ 
+     /// 一台真机上 Claude Code **停在提示符等人** 时的屏幕底部，照抄。
+@@ -1264,24 +1346,24 @@ mod tests {
+ 
+     #[test]
+     fn resize_changes_the_screen_size() {
+         // agent 必须按界面的真实宽度排版，否则窗口再宽也只用得到左边一块
+         let dir = tempfile::tempdir().unwrap();
+         let m = SessionManager::new();
+         let id = m.create(dir.path(), "shell", empty_secrets(), &[]).unwrap();
+ 
+         m.resize(id, 30, 200).unwrap();
+ 
+-        let (lines, _, _) = m.screen(id).unwrap();
+-        assert_eq!(lines.len(), 30, "行数应当跟着改");
++        let snap = m.screen(id).unwrap();
++        assert_eq!(snap.lines.len(), 30, "行数应当跟着改");
+ 
+-        let width: usize = lines[0].iter().map(|sp| sp.text.chars().count()).sum();
++        let width: usize = snap.lines[0].iter().map(|sp| sp.text.chars().count()).sum();
+         assert_eq!(width, 200, "列数应当跟着改，实际 {width}");
+     }
+ 
+     /// agent 自己退出（用户在 Claude Code 里敲 /exit、或 shell 里敲 exit）之后，
+     /// `screen()` 必须把 `Stopped` 捎回去。界面贴在会话里时只调 `Screen`，这是它
+     /// 唯一能知道进程已经没了的途径；捎不回来就会一直画那张空缓冲。
+     ///
+     /// 空缓冲本身是正常的：agent 在 alternate screen 里画，退出时恢复主屏，
+     /// 而主屏从来没被写过。所以「屏是空的」不能用来判断会话死活，只有状态能。
+     #[test]
+@@ -1292,42 +1374,42 @@ mod tests {
+         // 立刻退出的命令：模拟 agent 自己结束，而不是被 stop() 杀掉
+         exits.command = vec!["true".into()];
+         exits.idle_pattern = None;
+         m.register_profile(exits);
+         let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+ 
+         // 进程退出要一点时间，tick() 是把 is_alive() 落成 Stopped 的那一步
+         let deadline = std::time::Instant::now() + Duration::from_secs(5);
+         loop {
+             m.tick();
+-            let (_, _, state) = m.screen(id).unwrap();
++            let state = m.screen(id).unwrap().state;
+             if state == SessionState::Stopped {
+                 break;
+             }
+             assert!(
+                 std::time::Instant::now() < deadline,
+                 "进程早该退出了，screen() 却一直报 {state:?}"
+             );
+             std::thread::sleep(Duration::from_millis(20));
+         }
+     }
+ 
+     /// 活着的会话不能被误报成 Stopped——否则界面会把用户从一个好端端的
+     /// 会话里踢回看板。
+     #[test]
+     fn screen_reports_a_live_session_as_not_stopped() {
+         let repo = init_repo();
+         let m = SessionManager::new();
+         m.register_profile(fake_agent());
+         let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+         m.tick();
+-        let (_, _, state) = m.screen(id).unwrap();
++        let state = m.screen(id).unwrap().state;
+         assert_ne!(state, SessionState::Stopped, "cat 还在跑，不该报 Stopped");
+     }
+ 
+     #[test]
+     fn stop_marks_stopped() {
+         let repo = init_repo();
+         let m = SessionManager::new();
+         m.register_profile(fake_agent());
+         let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+         m.stop(id).unwrap();
+@@ -1654,11 +1736,134 @@ mod tests {
+             panic!("应当是「启动不了」这一类：{code:?}");
+         };
+         assert_eq!(cmd, "/绝对不存在/x9", "要点名是哪个命令");
+         let line = crate::i18n::msg::error(crate::i18n::Lang::Zh, &code);
+         assert!(line.contains("启动不了"), "要说人话：{line}");
+         assert!(
+             !line.to_lowercase().contains("enoent"),
+             "别把系统错误码甩给用户：{line}"
+         );
+     }
++
++    /// 造一个吐 N 行然后挂着的 shell 会话
++    fn scrolling_session(mgr: &SessionManager, dir: &Path, n: usize) -> u32 {
++        let mut p = fake_agent();
++        p.is_agent = false;
++        p.command = vec![
++            "/bin/sh".into(),
++            "-c".into(),
++            format!("i=1; while [ $i -le {n} ]; do echo line-$i; i=$((i+1)); done; sleep 30"),
++        ];
++        mgr.register_profile(p.clone());
++        mgr.create(dir, &p.name, empty_secrets(), &[]).unwrap()
++    }
++
++    fn wait_for_screen(mgr: &SessionManager, id: u32, needle: &str) {
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while Instant::now() < deadline {
++            if mgr.screen_text_for_test(id).contains(needle) {
++                return;
++            }
++            sleep(Duration::from_millis(50));
++        }
++        panic!("等不到 {needle}");
++    }
++
++    #[test]
++    fn typing_jumps_back_to_the_bottom() {
++        let dir = init_repo();
++        let mgr = SessionManager::new();
++        let id = scrolling_session(&mgr, dir.path(), 100);
++        wait_for_screen(&mgr, id, "line-100");
++
++        mgr.scroll(id, ScrollBy::Rows(30)).unwrap();
++        assert!(mgr.screen(id).unwrap().scroll.offset > 0);
++
++        mgr.send_input(id, "x").unwrap();
++        assert_eq!(
++            mgr.screen(id).unwrap().scroll.offset,
++            0,
++            "一敲键就该回到底部，否则用户看不见自己打的字"
++        );
++    }
++
++    #[test]
++    fn resizing_jumps_back_to_the_bottom() {
++        let dir = init_repo();
++        let mgr = SessionManager::new();
++        let id = scrolling_session(&mgr, dir.path(), 100);
++        wait_for_screen(&mgr, id, "line-100");
++
++        mgr.scroll(id, ScrollBy::Rows(30)).unwrap();
++        mgr.resize(id, 40, 100).unwrap();
++        assert_eq!(
++            mgr.screen(id).unwrap().scroll.offset,
++            0,
++            "重排之后偏移的含义就失效了，只能回底"
++        );
++    }
++
++    #[test]
++    fn scroll_to_bottom_works() {
++        let dir = init_repo();
++        let mgr = SessionManager::new();
++        let id = scrolling_session(&mgr, dir.path(), 100);
++        wait_for_screen(&mgr, id, "line-100");
++
++        mgr.scroll(id, ScrollBy::Rows(30)).unwrap();
++        let st = mgr.scroll(id, ScrollBy::Bottom).unwrap();
++        assert_eq!(st.offset, 0);
++    }
++
++    #[test]
++    fn new_lines_counts_only_what_arrived_since_the_user_last_scrolled() {
++        let dir = init_repo();
++        let mgr = SessionManager::new();
++        let mut p = fake_agent();
++        p.is_agent = false;
++        p.command = vec![
++            "/bin/sh".into(),
++            "-c".into(),
++            "i=1; while [ $i -le 60 ]; do echo line-$i; i=$((i+1)); done; \
++             sleep 1; i=1; while [ $i -le 5 ]; do echo new-$i; i=$((i+1)); done; sleep 30"
++                .into(),
++        ];
++        mgr.register_profile(p.clone());
++        let id = mgr
++            .create(dir.path(), &p.name, empty_secrets(), &[])
++            .unwrap();
++        wait_for_screen(&mgr, id, "line-60");
++
++        // 刚滚完，底下没有新东西
++        let st = mgr.scroll(id, ScrollBy::Rows(20)).unwrap();
++        assert_eq!(st.new_lines, 0);
++
++        // 滚上去之后新行不会出现在当前视口里——vt100 会自动把偏移往上顶，
++        // 让画面看起来"没动"（这正是 new_lines 存在的理由：界面得靠这个
++        // 数字告诉用户"底下有你还没看过的东西"，屏幕内容本身根本不会变）。
++        // 所以这里不能像别处那样等屏幕文字出现，只能等 scroll.new_lines
++        // 本身涨到 5。
++        let deadline = Instant::now() + Duration::from_secs(5);
++        loop {
++            let st = mgr.screen(id).unwrap().scroll;
++            if st.new_lines == 5 {
++                break;
++            }
++            assert!(
++                Instant::now() < deadline,
++                "5 行新内容进来了，得数得出来，实际 new_lines={}",
++                st.new_lines
++            );
++            sleep(Duration::from_millis(50));
++        }
++
++        // 用户再滚一次，计数重新归零
++        let st = mgr.scroll(id, ScrollBy::Rows(1)).unwrap();
++        assert_eq!(st.new_lines, 0);
++    }
++
++    #[test]
++    fn scrolling_a_session_that_does_not_exist_says_so() {
++        let mgr = SessionManager::new();
++        assert!(mgr.scroll(999, ScrollBy::Rows(1)).is_err());
++    }
+ }

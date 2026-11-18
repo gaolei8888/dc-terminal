@@ -468,6 +468,7 @@ mod tests {
             activity: "背后的看板".into(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         open(&mut app);
 
@@ -493,6 +494,7 @@ mod tests {
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         app.list_state.select(Some(1));
         open(&mut app);

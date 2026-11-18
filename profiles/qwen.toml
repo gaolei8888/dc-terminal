@@ -10,6 +10,11 @@ name = "qwen"
 # 实测于 qwen-code 0.22.2。
 command = ["qwen", "--approval-mode=yolo"]
 is_agent = true
+# 开会话时由 dct 指定对话 id，重启后按 id 接回同一段对话。
+# `qwen --help` 有 `--session-id`/`--resume`；2026-10-14 实测按 id 接回成功
+# （-p 模式，走训练营网关）。对话记录默认就开着，命令里不用另带 --chat-recording。
+session_id_args = ["--session-id", "{id}"]
+resume_id_args = ["--resume", "{id}"]
 # 两个 pattern 仍然不填：TUI 没实测过，编一个假的会让正在干活的会话在看板上
 # 显示成空闲。状态显示「—」是承认不知道。
 # 跟 dc.toml 用同一把钥匙、同一个网关（见下面 [secret.hint] 那句），先点

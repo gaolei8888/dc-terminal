@@ -1,0 +1,181 @@
+# Review package: e88dca6..8600e1e
+
+## Commits
+8600e1e feat(restart): detached __swap helper waits for the old daemon to exit and starts the new one
+
+## Files changed
+ src/client.rs | 97 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/main.rs   | 12 ++++++++
+ 2 files changed, 109 insertions(+)
+
+## Diff
+diff --git a/src/client.rs b/src/client.rs
+index 753c0f4..e6df513 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -72,20 +72,88 @@ pub fn spawn_daemon(exe: &Path, socket: &Path) -> Result<()> {
+         .arg(socket)
+         // 守护进程的输出必须全部丢弃：它和 TUI 共用同一个终端，
+         // 任何一行 stderr 都会直接糊在界面上。
+         .stdin(std::process::Stdio::null())
+         .stdout(std::process::Stdio::null())
+         .stderr(std::process::Stdio::null());
+     crate::sys::proc::spawn_detached(&mut cmd)?;
+     Ok(())
+ }
+ 
++/// 平稳重启的最后一步：起一个脱离任何会话的小进程 `exe __swap <旧后台pid> <socket>`。
++/// 旧后台自己马上就要退出，而重启可能是在 dct 会话里敲的——会话一断，
++/// 「等旧的走、再起新的」这件事不能跟着没。脱离的办法同 `spawn_daemon`。
++pub fn spawn_swap(old_pid: u32, socket: &Path, exe: &Path) -> Result<()> {
++    let mut cmd = std::process::Command::new(exe);
++    cmd.arg("__swap")
++        .arg(old_pid.to_string())
++        .arg(socket)
++        .stdin(std::process::Stdio::null())
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::null());
++    crate::sys::proc::spawn_detached(&mut cmd)?;
++    Ok(())
++}
++
++/// 等旧后台退出，最多 `grace`。返回 true = 自己走了；false = 超时，已被硬杀。
++fn wait_old_gone(pid: u32, grace: Duration) -> bool {
++    if wait_up_to(grace, || !process_alive(pid)) {
++        return true;
++    }
++    crate::sys::proc::hard_kill(pid);
++    wait_up_to(Duration::from_secs(2), || !process_alive(pid));
++    false
++}
++
++/// 失败原因追加一行到 `<socket 所在目录>/daemon.log`。写不进去就算了。
++fn log_swap_failure(socket: &Path, reason: &str) {
++    let Some(dir) = socket.parent() else { return };
++    let secs = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or(0);
++    let line = format!("[{secs}] 平稳重启失败：{reason}\n");
++    if let Ok(mut f) = std::fs::OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open(dir.join("daemon.log"))
++    {
++        let _ = f.write_all(line.as_bytes());
++    }
++}
++
++/// `dct __swap` 的本体：等旧后台走（最多 `grace`，超时硬杀），起新后台，
++/// 等它真能应答且协议号对上（最多 10 秒——比 `restart_daemon` 的 5 秒长，
++/// 因为新后台要先把所有会话接回来才开始应答）。失败写 daemon.log。
++pub fn swap_daemon(old_pid: u32, socket: &Path, exe: &Path, grace: Duration) -> Result<()> {
++    if old_pid != 0 {
++        wait_old_gone(old_pid, grace);
++    }
++    if let Err(e) = spawn_daemon(exe, socket) {
++        log_swap_failure(socket, "新的后台没能启动，请手动再启动一次 dct。");
++        return Err(e);
++    }
++    let up = wait_up_to(Duration::from_secs(10), || {
++        Client::connect(socket)
++            .ok()
++            .and_then(|mut c| c.protocol())
++            .is_some_and(|v| v == crate::proto::PROTOCOL_VERSION)
++    });
++    if !up {
++        log_swap_failure(socket, "新的后台起来后一直没有应答，请手动再启动一次 dct。");
++        return Err(crate::proto::coded(
++            crate::proto::ErrorCode::DaemonNotResponding,
++        ));
++    }
++    Ok(())
++}
++
+ fn process_alive(pid: u32) -> bool {
+     crate::sys::proc::alive(pid)
+ }
+ 
+ fn wait_up_to(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+     let deadline = std::time::Instant::now() + limit;
+     while std::time::Instant::now() < deadline {
+         if cond() {
+             return true;
+         }
+@@ -199,10 +267,39 @@ impl Client {
+             .read_line(&mut line)
+             .map_err(|_| crate::proto::coded(crate::proto::ErrorCode::DaemonNotResponding))?;
+         if n == 0 {
+             return Err(crate::proto::coded(
+                 crate::proto::ErrorCode::DaemonNotResponding,
+             ));
+         }
+         Ok(serde_json::from_str(&line)?)
+     }
+ }
++
++#[cfg(all(test, unix))]
++mod swap_tests {
++    use super::*;
++
++    /// 起一个子进程，并在后台线程里 wait 它——否则被杀后留下僵尸，
++    /// `kill(pid, 0)` 仍然成功，测不出「已不在」。
++    fn spawn_reaped(secs: &str) -> u32 {
++        let mut child = std::process::Command::new("sleep")
++            .arg(secs)
++            .spawn()
++            .unwrap();
++        let pid = child.id();
++        std::thread::spawn(move || {
++            let _ = child.wait();
++        });
++        pid
++    }
++
++    #[test]
++    fn swap_waits_for_old_process_then_hard_kills_it() {
++        let pid = spawn_reaped("30");
++        assert!(!wait_old_gone(pid, Duration::from_millis(200)));
++        assert!(!process_alive(pid));
++
++        let pid = spawn_reaped("0.1");
++        assert!(wait_old_gone(pid, Duration::from_secs(5)));
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 99c697b..c6dd876 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -60,20 +60,32 @@ ps / status / stop / kill / prune 都不会拉起守护进程：问「有没有
+ 后台跑着新的」。
+ ";
+ 
+ fn main() -> Result<()> {
+     let args: Vec<String> = std::env::args().skip(1).collect();
+ 
+     match args.first().map(|s| s.as_str()) {
+         None => run_ui(),
+         // 第二个参数是 socket 路径，重启守护进程时由界面显式传进来
+         // （见 `client::spawn_daemon`）。不传就还是从 HOME 推。
++        // 平稳重启的最后一步，由旧后台起、脱离任何会话。不给用户敲，不进帮助。
++        Some("__swap") => {
++            let pid: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
++            let sock = args.get(2).map(PathBuf::from).unwrap_or_else(socket_path);
++            let exe = std::env::current_exe()?;
++            std::process::exit(
++                match dct::client::swap_daemon(pid, &sock, &exe, Duration::from_secs(10)) {
++                    Ok(()) => 0,
++                    Err(_) => 1,
++                },
++            )
++        }
+         Some("daemon") => {
+             let sock = args.get(1).map(PathBuf::from).unwrap_or_else(socket_path);
+             dct::daemon::run(&sock)
+         }
+         // `gate` 也不连守护进程：它守的是一个 TCP 端口，读的是密钥仓里那把
+         // 钥匙，跟有没有会话在跑无关。远程版（容器）里它由 entrypoint 起，
+         // 跟 `dct daemon` 是同一层的两个进程。
+         Some("gate") => std::process::exit(dct::gate::run_cli(&args[1..], cli_lang())),
+         // ps / stop 走的是**已经在跑**的守护进程，连不上就如实说没有，
+         // 绝不顺手拉起一个——见 `cli` 的模块注释。

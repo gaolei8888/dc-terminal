@@ -8,6 +8,7 @@ import {Publishing} from './publishing.mjs';
 import {DockerDriver, localRequest} from './docker.mjs';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
+const DEVICE_DAYS = 180;
 const json = (res, status, value) => { const body = JSON.stringify(value); res.writeHead(status, {'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'}); res.end(body); };
 const html = (res, body) => { res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "frame-ancestors 'self'"}); res.end(body); };
 const fail = (status, message) => Object.assign(new Error(message), {status});
@@ -51,8 +52,28 @@ function finishedPage(prefix) {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>学习已结束</title><body style="font:16px/1.7 system-ui;padding:8vh 8vw;background:#f5f7fa"><h1>本次学习已结束</h1><p>你的作品已保留，下次可以继续。</p><button style="font:inherit;padding:10px 20px" id="continue">继续学习</button><p id="error"></p><script>document.querySelector('#continue').onclick=async function(){this.disabled=true;try{const r=await fetch(${js(prefix + '/start')},{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!r.ok)throw Error((await r.json()).error);location.href=${js(prefix + '/')};}catch(e){document.querySelector('#error').textContent=e.message;this.disabled=false;}};</script></body></html>`;
 }
 
+// 这两种 GET 是平板/页面在后台也会一直发的（断线重连、心跳），不能算「有人在用」。
+const PASSIVE = /^\/_dct\/authoring\/v1\/(?:events|health)\/?$/;
+const AUDIO_NAMES = {'audio/webm': 'speech.webm', 'audio/mp4': 'speech.m4a', 'audio/ogg': 'speech.ogg'};
+// 读容器里创作服务的 health（忙闲）。任何失败都返回 null——调用方把「问不出来」当成「不能停」。
+function readHealth(backend) {
+  return new Promise(resolve => {
+    const req = http.request({host: '127.0.0.1', port: backend.port, path: '/_dct/authoring/v1/health', method: 'GET', headers: {cookie: `dct_gate=${backend.token}`, connection: 'close'}}, res => {
+      if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', c => { text += c; if (text.length > 65536) { res.destroy(); resolve(null); } });
+      res.on('end', () => { try { resolve(JSON.parse(text)); } catch { resolve(null); } });
+      res.on('error', () => resolve(null));
+    });
+    req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+const AUTHORING = /^\/_dct\/authoring\/v1\/(health|projects|events)(?:\/|$|\?)/;
 export class Classroom {
-  constructor({store, driver, origin = 'https://dataclue.cn', secure = true, terminalFile = here + 'terminal.html', issuers = {}, ssoAllowHttp = false, publishing, live, stt = {}} = {}) {
+  constructor({store, driver, origin = 'https://dataclue.cn', secure = true, terminalFile = here + 'terminal.html', issuers = {}, ssoAllowHttp = false, publishing, live, stt = {}, idleMinutes} = {}) {
     // 语音转写的上游。**没配也要能正常开课**——按钮那边会说「还没配」，
     // 而不是每按一次就抛一个看不懂的错。
     this.stt = {
@@ -61,6 +82,12 @@ export class Classroom {
       model: stt.model ?? process.env.CLASSROOM_STT_MODEL ?? 'whisper-1',
       language: stt.language ?? process.env.CLASSROOM_STT_LANGUAGE ?? 'zh',
     };
+    // 学生工作区空闲多久自动停（分钟）。不是数字按 20；最少 5 分钟——
+    // 配成 1 的话学生起身倒杯水回来工作区就没了。
+    const rawMinutes = idleMinutes ?? process.env.CLASSROOM_IDLE_MINUTES;
+    const minutes = typeof rawMinutes === 'string' && !rawMinutes.trim() ? NaN : Number(rawMinutes);
+    this.idleMs = (Number.isFinite(minutes) ? Math.max(5, minutes) : 20) * 60000;
+    this.activity = new Map(); this.reaping = false; this.stopping = new Set();
     this.store = store;
     this.driver = driver;
     this.origin = new URL(origin).origin;
@@ -68,12 +95,13 @@ export class Classroom {
     this.terminalFile = terminalFile;
     this.sso = new Federation(this, issuers, ssoAllowHttp);
     this.publishing = publishing ? new Publishing(this, publishing) : null;
+    this.persistedAt = new Map();
     this.sessions = new Map((store.data.sessions || []).filter(s => s.expires > Date.now()).map(s => [s.key, s]));
     this.assistance = new Map(); this.connections = new Set(); this.rates = new Map(); this.stats = null;
     // 公开直播：管理台自己的发布密钥 + 中转地址。缺一样就不开这个功能。
     this.publicLive = live && live.relay && live.publishKey ? {relay: live.relay.replace(/\/+$/, ''), key: live.publishKey} : null;
     if (this.publicLive) this.healTimer = setInterval(() => this.healPublic().catch(() => {}), 30000).unref();
-    this.server = http.createServer((req, res) => this.handle(req, res).catch(e => { if (!res.headersSent) json(res, e.status || 409, {error: e.publicMessage || (e.status ? e.message : '操作未完成，请稍后重试；学生文件已保留')}); else res.destroy(); }));
+    this.server = http.createServer((req, res) => this.handle(req, res).catch(e => { if (!res.headersSent) json(res, e.status || 409, e.code === 'workspace_stopped' ? {error: '工作区在休息', code: 'workspace_stopped'} : {error: e.publicMessage || (e.status ? e.message : '操作未完成，请稍后重试；学生文件已保留')}); else res.destroy(); }));
     this.server.on('upgrade', (req, socket, head) => this.upgrade(req, socket, head).catch(() => socket.destroy()));
     this.timer = setInterval(() => {
       for (const [id, lease] of this.assistance) if (lease.expires < Date.now()) this.endAssistance(id);
@@ -81,8 +109,56 @@ export class Classroom {
       const active = new Map([...this.connections].map(c => [c.session.key, c.session]));
       for (const session of active.values()) if (session.external) this.sso.ensure(session).catch(() => {});
     }, 5000).unref();
+    this.idleTimer = setInterval(() => this.reapIdle().catch(() => {}), 60000).unref();
   }
-  close() { clearInterval(this.timer); clearInterval(this.healTimer); for (const c of this.connections) c.socket.destroy(); this.publishing?.server.close(); return new Promise(r => this.server.close(r)); }
+  readHealth(backend) { return readHealth(backend); }
+  // 停掉空闲的学生工作区。**拿不准就不停**：进行中的一轮、问不出忙闲、
+  // 有人连着/协助、最近有请求，都不停。停法同 /finish：不 revoke，设备会话照样有效。
+  async reapIdle(now = Date.now()) {
+    if (this.reaping) return [];
+    this.reaping = true;
+    const stopped = [];
+    try {
+      for (const w of [...this.store.data.students]) {
+        if (w.shared || w.id === 'shared') continue;
+        try {
+          if ((await this.driver.status(w)).status !== 'running') { this.activity.delete(w.id); continue; }
+          if (!this.activity.has(w.id)) { this.activity.set(w.id, now); continue; }
+          const busy = () => [...this.connections].some(c => c.student === w.id) || this.lease(w) || now - this.activity.get(w.id) < this.idleMs;
+          if (busy()) continue;
+          const seen = this.activity.get(w.id);
+          const health = await this.readHealth(await this.driver.backend(w));
+          if (!health || typeof health.activeTurns !== 'number' || typeof health.lastActivityAt !== 'number') continue;
+          if (health.activeTurns > 0 || now - health.lastActivityAt < this.idleMs) continue;
+          // 网页终端里跑着的 agent（学生起了 claude 就关了页）和直播，云端 health
+          // 都看不见，要问容器里的 dct 守护进程。问不出来（抛错）就落到下面的
+          // catch，不停。
+          if (w.livePublic) continue;
+          const list = await this.driver.rpc(w, 'List');
+          if (!Array.isArray(list?.Sessions) || list.Sessions.some(x => x.state === 'Working' || x.state === 'Asking')) continue;
+          if (await this.liveStatus(w)) continue;
+          const did = await this.store.mutate(async () => {
+            // 读 health 的这段时间里有人来过，就算了。
+            if (this.activity.get(w.id) !== seen || busy()) return false;
+            // 停的这十几秒里容器还显示在跑；先挂牌，进来的请求直接得到
+            // workspace_stopped，不会被转进一个正在被杀的容器。
+            this.stopping.add(w.id);
+            try {
+              await this.driver.stop(w);
+              this.endAssistance(w.id);
+              for (const c of this.connections) if (c.student === w.id) c.socket.destroy();
+              this.activity.delete(w.id);
+              this.store.audit('空闲自动停止', w);
+              return true;
+            } finally { this.stopping.delete(w.id); }
+          });
+          if (did) stopped.push(w.id);
+        } catch { /* 这一个出错不影响别的工作区；下一轮再看 */ }
+      }
+    } finally { this.reaping = false; }
+    return stopped;
+  }
+  close() { clearInterval(this.timer); clearInterval(this.idleTimer); clearInterval(this.healTimer); for (const c of this.connections) c.socket.destroy(); this.publishing?.server.close(); return new Promise(r => this.server.close(r)); }
   writeOrigin(req) {
     if (req.headers.origin && req.headers.origin !== this.origin) throw fail(403, '请从当前管理台或工作区操作');
     if (req.headers['sec-fetch-site'] && !['same-origin', 'none'].includes(req.headers['sec-fetch-site'])) throw fail(403, '请从当前工作区操作');
@@ -100,8 +176,15 @@ export class Classroom {
     const session = this.sessions.get(digest(token));
     if (!session || session.role !== role || session.expires < Date.now()) return null;
     if (role === 'student' && (!w || w.disabled || session.student !== w.id || session.generation !== w.generation)) return null;
+    if (session.device) { const now = Date.now(); if (session.expires - now < (DEVICE_DAYS - 1) * 86400000) this.renewDevice(session, now); }
     return session;
   }
+  // 设备会话：平板登录一次，滑动续期到 180 天；仍然每次请求按 stu 权限复查。持久化一天最多一次。
+  renewDevice(session, now = Date.now()) {
+    session.expires = now + DEVICE_DAYS * 86400000;
+    if (now - (this.persistedAt.get(session.key) || 0) > 86400000) { this.persistedAt.set(session.key, now); this.persistSessions(); }
+  }
+  deviceCookie(res, w, token) { res.setHeader('Set-Cookie', `dcw_student=${token}; Path=/w/${w.id}/; HttpOnly; SameSite=Strict; Max-Age=${DEVICE_DAYS * 86400}${this.secure ? '; Secure' : ''}`); }
   login(res, role, w, external) {
     const token = secret(), key = digest(token);
     const session = {key, role, student: w?.id, generation: w?.generation, expires: Date.now() + (role === 'admin' || external ? 8 * 3600000 : 7 * 86400000), ...(external ? {external} : {})};
@@ -111,7 +194,10 @@ export class Classroom {
   }
   persistSessions() {
     const now = Date.now(); for (const [key, s] of this.sessions) if (s.expires < now) this.sessions.delete(key);
+    // 超限时先淘汰最老的非设备会话，设备会话只在没有别的可淘汰时才动。
+    if (this.sessions.size > 10000) for (const [key, s] of this.sessions) { if (this.sessions.size <= 10000) break; if (!s.device) this.sessions.delete(key); }
     while (this.sessions.size > 10000) this.sessions.delete(this.sessions.keys().next().value);
+    for (const key of this.persistedAt.keys()) if (!this.sessions.has(key)) this.persistedAt.delete(key);
     this.store.data.sessions = [...this.sessions.values()].slice(-10000); this.store.save();
   }
   revoke(w) {
@@ -334,9 +420,29 @@ export class Classroom {
     if (w.disabled) throw fail(403, '此链接已停用，请联系老师');
     if (sub === '') { res.writeHead(302, {Location: prefix + '/' + u.search}); return res.end(); }
     if (sub === '/login' && req.method === 'POST') { this.rate(req, w.id); const data = await body(req); if (typeof data.token !== 'string' || data.token.length !== 64 || !equal(data.token, w.token)) throw fail(401, '链接已失效，请向老师获取新链接'); this.login(res, 'student', w); return json(res, 200, {ok: true}); }
+    if (sub === '/_device/session' && req.method === 'POST') {
+      this.rate(req, 'device:' + w.id);
+      const current = this.authenticate(req, 'student', w); if (!current) throw fail(401, '请重新登录');
+      if (!current.external) throw fail(403, '请用学校账号登录后再试');
+      await this.sso.ensure(current);
+      const data = await body(req); if (data.client !== 'dc-android') throw fail(400, '请求无效');
+      let session = current, token = cookie(req, 'dcw_student');
+      // 续期发生在 ensure 之后；authenticate() 里的滑动续期先于 ensure，但每个请求仍会被 ensure 拒绝，不削弱撤销。
+      if (current.device) this.renewDevice(current);
+      else {
+        token = secret(); session = {...current, key: digest(token), device: true, expires: Date.now() + DEVICE_DAYS * 86400000};
+        this.sessions.set(session.key, session); this.sessions.delete(current.key); this.persistedAt.set(session.key, Date.now()); this.persistSessions();
+      }
+      this.deviceCookie(res, w, token);
+      return json(res, 200, {ok: true, expiresAt: session.expires});
+    }
     const session = this.authenticate(req, 'student', w) || (w.shared ? this.legacyAuth(req, w) : null);
     if (!session) { if (sub === '/' && req.method === 'GET') return html(res, studentPage(prefix)); throw fail(401, '请重新打开老师发给你的完整链接'); }
     await this.sso.ensure(session);
+    if (!(req.method === 'GET' && PASSIVE.test(sub.split('?')[0]))) this.activity.set(w.id, Date.now());
+    // 转写由课堂服务自己接住、不进容器，停的时候也照样能用——孩子说的
+    // 那句话不该因为工作区在停就丢了。
+    if (this.stopping.has(w.id) && sub.startsWith('/_dct/') && sub !== '/_dct/transcribe') throw Object.assign(new Error('工作区在休息'), {code: 'workspace_stopped'});
     if (sub === '/finish' && req.method === 'POST' && !w.shared) {
       await body(req);
       return this.store.mutate(async () => {
@@ -357,9 +463,11 @@ export class Classroom {
       this.rate(req, 'stt:' + w.id);
       if (!this.stt.url || !this.stt.key) throw fail(503, '还没配语音转写，请联系老师');
       const audio = await rawBody(req, STT_MAX_BYTES);
-      const type = String(req.headers['content-type'] || 'audio/webm').split(';')[0];
+      const type = String(req.headers['content-type'] || 'audio/webm').split(';')[0].trim().toLowerCase();
+      const filename = AUDIO_NAMES[type];
+      if (!filename) throw fail(415, '这种录音格式用不了');
       const form = new FormData();
-      form.append('file', new Blob([audio], {type}), 'speech.webm');
+      form.append('file', new Blob([audio], {type}), filename);
       form.append('model', this.stt.model);
       // 说中文的学生里夹着英文术语（「import 那个包」），不写死语言的话
       // 整句会被猜成英文。
@@ -460,12 +568,15 @@ export class Classroom {
       throw fail(404, '接口不存在');
     });
   }
-  allowed(path) { return path === '/' || path === '/token' || path === '/ws' || /^\/_dct\/projects(?:\/|$)/.test(path); }
+  allowed(path) { return path === '/' || path === '/token' || path === '/ws' || /^\/_dct\/projects(?:\/|$)/.test(path) || AUTHORING.test(path); }
   async proxy(req, res, w, target, prefix, session, adminDownload = false) {
     const p = new URL(target, this.origin).pathname;
     if (p.startsWith('/_dct/publish/')) { if (!this.publishing) throw fail(503, '作品发布尚未配置'); return this.publishing.browser(req, res, w, target, prefix, session); }
     if (p === '/_dct/presence' && req.method === 'GET') return json(res, 200, {assisting: !!this.lease(w)});
     if (!this.allowed(p)) throw fail(404, '接口不存在');
+    const authoring = AUTHORING.test(p);
+    // 云端创作只属于学生自己的路由；管理员查看/协助走的是同一个 proxy，不放行。
+    if (authoring && session.role !== 'student') throw fail(404, '接口不存在');
     if (req.method !== 'GET') this.writeOrigin(req);
     if (w.disabled && session.role === 'student') throw fail(403, '链接已停用');
     const backend = await this.driver.backend(w);
@@ -479,14 +590,26 @@ export class Classroom {
       return html(res, fs.readFileSync(this.terminalFile, 'utf8').replace('</head>', config + '</head>'));
     }
     const headers = {host: new URL(this.origin).host, cookie: `dct_gate=${backend.token}`, connection: 'close'};
-    for (const key of ['content-type', 'content-length', 'origin', 'sec-fetch-site']) if (req.headers[key]) headers[key] = req.headers[key];
+    for (const key of ['content-type', 'content-length', 'origin', 'sec-fetch-site', ...(authoring ? ['last-event-id', 'accept'] : [])]) if (req.headers[key]) headers[key] = req.headers[key];
+    const requestMax = 12 * 1024 ** 2;
+    if (authoring && Number(req.headers['content-length']) > requestMax) throw fail(413, '请求内容过大');
     const port = p.startsWith('/_dct/projects') ? backend.apiPort : backend.port;
     return new Promise((resolve, reject) => {
       const upstream = http.request({host: '127.0.0.1', port, path: target, method: req.method, headers}, response => {
+        // 只有事件流那一个路由透传；别的创作路由回什么都当 JSON，受 16 MiB 上限。
+        if (authoring && p === '/_dct/authoring/v1/events' && /^text\/event-stream\b/i.test(String(response.headers['content-type'] || '')) && response.statusCode === 200) {
+          res.writeHead(200, {'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; sandbox", 'content-type': 'text/event-stream; charset=utf-8', 'x-accel-buffering': 'no'});
+          res.flushHeaders?.();
+          upstream.setTimeout(0); response.socket?.setTimeout(0);
+          const stop = () => { response.destroy(); upstream.destroy(); };
+          res.on('close', stop); response.on('error', () => res.destroy()); response.on('end', () => { res.end(); resolve(); });
+          response.pipe(res, {end: false});
+          return;
+        }
         const download = /\/(file|download)$/.test(p) && response.statusCode === 200;
         const responseHeaders = {'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; sandbox", 'content-type': download ? 'application/octet-stream' : 'application/json; charset=utf-8'};
         if (download) responseHeaders['content-disposition'] = 'attachment; filename="download"';
-        const max = download ? 136 * 1024 ** 2 : 8 * 1024 ** 2;
+        const max = download ? 136 * 1024 ** 2 : authoring ? 16 * 1024 ** 2 : 8 * 1024 ** 2;
         const length = Number(response.headers['content-length']);
         if (Number.isFinite(length) && length > max) { response.destroy(); return reject(fail(502, '工作区响应过大')); }
         if (Number.isFinite(length) && length >= 0) responseHeaders['content-length'] = length;
@@ -499,7 +622,9 @@ export class Classroom {
         response.on('error', reject);
       });
       upstream.setTimeout(120000, () => upstream.destroy(new Error('工作区响应超时')));
-      upstream.on('error', reject); req.on('aborted', () => upstream.destroy()); req.pipe(upstream);
+      upstream.on('error', reject); req.on('aborted', () => upstream.destroy());
+      if (authoring) { let n = 0; req.on('data', c => { n += c.length; if (n > requestMax) { upstream.destroy(); reject(fail(413, '请求内容过大')); } }); }
+      req.pipe(upstream);
     });
   }
   async upgrade(req, socket, head) {
@@ -528,7 +653,8 @@ export class Classroom {
       socket.write(`HTTP/1.1 101 Switching Protocols\r\n${lines.join('\r\n')}\r\n\r\n`);
       if (upHead.length) socket.write(upHead); if (head.length) up.write(head);
       const connection = {student: w.id, session, socket}; this.connections.add(connection);
-      socket.on('close', () => { this.connections.delete(connection); up.destroy(); });
+      // 关掉终端页算一次活动：从这一刻起再给满空闲时长，而不是按打开它的那次请求算。
+      socket.on('close', () => { this.connections.delete(connection); this.activity.set(w.id, Date.now()); up.destroy(); });
       socket.on('error', () => up.destroy()); up.on('error', () => socket.destroy()); up.on('close', () => socket.destroy());
       socket.pipe(up); up.pipe(socket);
     });

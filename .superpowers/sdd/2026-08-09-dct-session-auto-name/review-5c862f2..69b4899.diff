@@ -1,0 +1,914 @@
+# Review package: 5c862f2..69b4899
+
+## Commits
+69b4899 docs: append the round-3 fix report for the render-path filter
+7c96b54 fix: filter control characters in truncate, close the render-path gap
+65bea36 docs: append the round-2 fix report for the naming-gate and test-layer findings
+70b3b90 fix: bound the naming attempt to exactly once, add render-layer test
+
+## Files changed
+ .../fix-1-report.md                                | 283 +++++++++++++++++++++
+ src/session.rs                                     | 155 +++++++----
+ src/ui/board.rs                                    |  42 +++
+ src/ui/widgets.rs                                  |  71 ++++++
+ 4 files changed, 499 insertions(+), 52 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md
+index 397aceb..f506b7d 100644
+--- a/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md
++++ b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md
+@@ -217,10 +217,293 @@ None blocking. Two notes for whoever reviews this:
+   knowing about if this function is ever reused somewhere with an unbounded
+   input size.
+ - I extracted `fallback_name`/`model_name` beyond what the brief's "要改什么"
+   section literally asked for (it only asked for a shared `sanitize` called
+   at the two write points). I judged this necessary rather than optional
+   because mutation M3 could not otherwise be honestly closed — the
+   alternative was leaving a genuinely dead/untestable line in `request_name`,
+   which conflicts with the brief's own "no test failure = test not written
+   well enough" instruction. Flagging this as a deliberate scope decision in
+   case the reviewer disagrees with the trade-off.
++
++## Round 2 — fixes from the task review (spec ❌, two Important findings)
++
++The task review confirmed the sanitizing filter itself (`apply_keystrokes`/
++`sanitize`) was correct and left it untouched. Two Important findings were
++about consequences and coverage, not the filter, plus two minor cleanups.
++
++### Important 1 — the reopened naming gate was unbounded
++
++The review's diagnosis was correct and its root-cause analysis of its own
++brief's error was correct too: leaving `name_slot` as `None` on an empty
++fallback does *not* give a later real user input a second chance, because
++`collect_first_input` returns early once `first_input_sealed` is set — no
++later input ever reaches `first_input`. Only the model can ever name such a
++session, and gating on `name_slot.is_none()` reopened `request_name` on
++*every* subsequent Working→Idle transition, which meant: an unbounded
++stream of 15-second LLM calls for a session that will never usefully
++produce a name, and a real lost-update race — a second `request_name`
++firing before the first one's background thread completes would
++synchronously overwrite `name_slot` back to `None` (since a still-empty
++fallback recomputes to `None` every time), discarding a real name the first
++thread had already written.
++
++Fix: added a separate `Session::name_attempted: bool` field, set to `true`
++as the very first statement in `request_name` (before the fallback write,
++before the backend check — so there is no window where two calls could both
++see "not yet attempted"). `tick()`'s gate now checks `!s.name_attempted`
++instead of `name_slot.is_none()`. This restores true "ask once, ever"
++semantics — matching what the original (pre-existing, pre-fix-1) code
++comments claimed but, after my first pass, no longer delivered.
++
++Comments corrected to stop claiming `name_slot`'s `None`-ness is the "have
++we tried" signal:
++- `SessionInfo::tag`'s doc (was line 376-377, the "一次干完活时起一次，
++  之后不变" claim) — now points at `Session::name_attempted` as the
++  mechanism that actually guarantees this.
++- `request_name`'s doc and the `Session::name_slot` field doc (was line
++  1019-1021 in the reviewed diff) — rewritten to state the gate is
++  `name_attempted`, not `name_slot`.
++- Two test doc comments (`recovering_from_a_failure_does_not_count_as_finishing_a_round`,
++  and the test formerly named
++  `whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt`)
++  also asserted the old, wrong mechanism and were rewritten.
++
++**The whitespace-only test had to be inverted, not just relabeled.** The
++old test proved the gate *reopens* after an empty fallback — that was
++exactly the bug. It's renamed
++`whitespace_only_input_is_asked_about_exactly_once_not_forever` and now
++proves the opposite: after the first (empty-fallback) attempt, a second
++forced Working→Idle transition, even with a backend that *would* produce a
++real name, must **not** change the tag. Verified this test actually
++discriminates: reverted to the old assertion direction against the fixed
++code and confirmed it fails (see mutation table below, M9/M10 use the same
++mechanism).
++
++Mutation testing on the new gate:
++
++| # | Mutation | Result | Test(s) that caught it |
++|---|---|---|---|
++| M9 | Negate the tick() gate: `!s.name_attempted` → `s.name_attempted` | Caught | 8 tests failed, incl. `a_session_gets_named_after_its_first_round_of_work`, `a_name_is_pinned_and_never_asked_for_twice` |
++| M10 | Remove `s.name_attempted = true;` from `request_name` | Caught | `a_name_is_pinned_and_never_asked_for_twice`, `whitespace_only_input_is_asked_about_exactly_once_not_forever` |
++
++### Important 2 — the core regression test was at the wrong layer
++
++Correct finding, and the review's prediction was right: I added
++`ui::board::tests::a_tag_with_control_bytes_never_reaches_the_rendered_buffer`
++in `src/ui/board.rs`, using the existing `TestBackend` + `screen_text()`
++harness (`board.rs:266`), setting `SessionInfo.tag = "\x1b[Afix\x7f"`
++directly (bypassing the daemon entirely, simulating what a UI talking to an
++unpatched daemon would receive) and rendering a real frame.
++
++**The test fails.** `screen_text()`'s output contains the literal bytes
++`\u{1b}[Afix\u{7f}` — the board's list-item rendering path
++(`Span::raw` → `List`/`ListItem` → `Line` → `Span::render_ref`, `board.rs:211`)
++has no control-character filter of its own, exactly as the review predicted
++from reading the `ratatui` source. The daemon-side `sanitize` added in
++Round 1 is necessary and correct for the primary path (new daemon → new
++UI), but does not close the socket-boundary path (old/unpatched daemon →
++new UI) the review pointed at — `SessionInfo.tag` crosses that boundary as
++`#[serde(default)]` JSON with no guarantee about what produced it.
++
++Per the review's explicit instruction, I did **not** silently add a filter
++to `truncate`/`session_label`/the render path — that code is `grid.rs:475`
++/ `board.rs` territory that the review's own message describes as the
++subject of a *different* Important finding (about `grid.rs:475` dropping
++`truncate(session_label(info), 20)`), i.e. arguably someone else's fix task.
++Instead: the test is marked `#[ignore = "..."]` with a reason string that
++states the gap and cites this report, so `cargo test` stays green while the
++test remains in the tree, discoverable, and immediately runnable
++(`cargo test -- --ignored`) by whoever picks up UI-side filtering — they
++won't need to reconstruct the threat model, just delete the `#[ignore]` and
++watch it turn green once fixed.
++
++**Recommendation for whoever owns the UI side**: the fix likely belongs in
++`session_label` (`widgets.rs:168`) — a single choke point for both
++`board.rs` and `grid.rs`'s title rendering — running the tag through the
++same kind of control-character strip before it's ever handed to `Span`.
++Whether to reuse `session::sanitize`-shaped logic or something UI-local is
++a decision for that task, not this one.
++
++### Minor findings
++
++- `sanitize` changed from `pub(crate)` to private (`fn sanitize`, was
++  `pub(crate) fn sanitize`) — no caller outside `session.rs` (verified with
++  `grep -rn "session::sanitize\|::sanitize(" src/` excluding `session.rs`
++  itself: no matches). Tests still see it fine since `mod tests` is a
++  submodule.
++- Added a paragraph to `model_name`'s doc comment explaining that its call
++  to `sanitize` borrows keystroke semantics (backspace-pops) for text that
++  isn't a keystroke stream, and why that's harmless here (a model answer
++  containing `\x7f`/`\x08` is already an edge case — screen content the
++  model is echoing back after being manipulated — and either "pop" or
++  "drop" reads leave the same safety property: the byte never survives
++  into the name; "pop" was kept only so `sanitize` stays a single
++  implementation instead of one per caller).
++
++### Re-verification
++
++```
++$ cargo test --lib session:: -- --test-threads=1
++test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out
++
++$ cargo test --lib ui::board:: -- --test-threads=1
++test result: ok. 14 passed; 0 failed; 1 ignored; 0 measured; 672 filtered out
++(the 1 ignored is the new, deliberately-red-if-run render-layer test — see
++Important 2 above)
++
++$ cargo test -- --test-threads=1        # full workspace: unit + all integration binaries
++test result: ok. 686 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
++... (16 more "ok" lines, one per integration test binary, all 0 failed)
++
++$ cargo fmt --check
++(clean)
++
++$ cargo clippy --all-targets
++(clean, no warnings)
++
++$ git diff --check
++(clean)
++```
++
++Files touched this round: `src/session.rs` (the `name_attempted` fix and
++comment corrections), `src/ui/board.rs` (the new render-layer test).
++
++### Concerns
++
++- The `#[ignore]`d test in `board.rs` is, as far as I could find, the first
++  use of `#[ignore]` in this codebase (`grep -rn "#\[ignore" src/` had no
++  prior hits). I judged it the right tool for "known failing, deliberately
++  not fixed here, must stay discoverable" rather than inventing a
++  codebase-local convention, but flagging the precedent in case the
++  reviewer prefers a different way to record an intentionally-still-broken
++  regression test (e.g. tracking it purely in this report with no test
++  artifact at all).
++- The UI-side gap Important 2 surfaced is real and is not fixed by this
++  task. `tag` reaching the UI unsanitized from an old daemon is a genuine,
++  if narrower, instance of the same injection class Finding 1 was about.
++
++## Round 3 — closing the render-path gap (Important 2, acted on)
++
++The coordinator clarified that "say so in your report rather than adding it
++silently" meant *report before acting*, not *leave it broken* — and set the
++scope explicitly to include the UI-side filter. Implemented it.
++
++### Where the filter went, and why
++
++Added the filter inside `truncate` (`src/ui/widgets.rs`), not
++`session_label`. Reasoning:
++
++1. **Coverage.** `truncate` is the single choke point every rendered title
++   in this codebase passes through, not just the tag: `board.rs:211`
++   (`truncate(session_label(s), 15)`), `grid.rs:369` and `grid.rs:481`
++   (`truncate(session_label(info), 20)`), and `attach.rs:257`
++   (`truncate(&s.tag, 15)`). Filtering in `session_label` would only cover
++   `tag` — `truncate`'s other callers (`board.rs`'s group name/parent dir,
++   `s.activity` which is a rendering of live agent screen content, `pick.rs`'s
++   labels/notes, `secret.rs`'s labels) get hardened for free, and none of
++   those are more trustworthy than `tag` — a directory name or an agent's
++   last screen line can contain arbitrary bytes too.
++2. **No signature change.** `session_label` currently returns a zero-copy
++   `&str` (either `&s.tag` or `&s.profile`); filtering there means
++   allocating and changing the return type to `String`, rippling through
++   every call site. `truncate` already takes and returns an owned `String` —
++   the fix is entirely internal to the function.
++3. **Confirmed no CJK/width regression** (this was the specific thing I was
++   asked to check for before proceeding, and did before writing the fix):
++   `char_width` already returns 0 for every control character (see its own
++   doc comment — this was already true before this round). The old loop
++   pushed 0-width control characters into `out` without them ever
++   contributing to `w`; the new code just skips the `push` for those same
++   characters via `continue` before reaching the width/cap logic. `w`'s
++   accumulated value is byte-for-byte identical with or without the
++   control characters in the input, so the truncation point for the
++   surrounding real characters cannot move. Added
++   `truncate_control_byte_stripping_does_not_disturb_cjk_width_accounting`
++   and `truncate_dropping_control_bytes_does_not_shift_the_width_budget` to
++   pin exactly this — both check that a control byte's presence/absence
++   changes nothing about where the *next* real character gets cut.
++
++The filter drops any `char::is_control()` character outright — it does
++*not* do the daemon-side `sanitize`'s full CSI-sequence consumption (ESC +
++`[` + params + terminator, all treated as one unit). That asymmetry is
++deliberate, not an oversight: the daemon-side function additionally has to
++reconstruct "what the user meant to type" (so a stray `[A` left over from a
++half-processed escape sequence would be a real, if minor, correctness bug
++there). At the render layer the only property that needs to hold is "no
++raw control byte reaches the terminal" — and dropping just the `ESC` byte
++already breaks the sequence: a terminal emulator needs the leading `ESC` to
++recognize `[A` as a live cursor-movement command; without it, `[A` is inert
++printable text. Per-character `is_control()` filtering is sufficient for
++that property and is what `Buffer::set_stringn`/`Paragraph` already do
++elsewhere in `ratatui`, so this keeps the same simple model rather than
++importing a second, heavier CSI-aware state machine into a generic
++string-truncation utility.
++
++### Grid tile title / attach block title coverage (asked, not tested here)
++
++Both route through `truncate` and are therefore covered by this fix:
++
++- **Grid tile title**: `grid.rs:369` (compose-reply header) and
++  `grid.rs:481` (the tile's own title bar) both call
++  `truncate(session_label(info), 20)` unconditionally — `truncate` always
++  runs the same per-character loop regardless of whether the string
++  actually needs cutting, so the filter applies even to tags that fit
++  comfortably under the width cap.
++- **Attach block title**: `attach.rs:257` calls `truncate(&s.tag, 15)`
++  directly, same unconditional path.
++
++Grepped every `.tag`/`session_label(` occurrence in `src/ui/*.rs` to check
++for a path that reads the tag without going through `truncate`
++(`attach.rs:240` is the only other production use, and it's an
++`is_empty()` check, not a render) — found none. No new tests added for the
++grid title or attach title per the instruction; Fix 2 owns `grid.rs` and
++was asked to be told rather than have tests added preemptively.
++
++### Test the coordinator asked to see turn green
++
++`#[ignore]` removed from
++`ui::board::tests::a_tag_with_control_bytes_never_reaches_the_rendered_buffer`.
++It now passes in the default suite with no flag needed.
++
++### Mutation testing
++
++| # | Mutation | Result | Test(s) that caught it |
++|---|---|---|---|
++| M11 | Negate the filter condition: `if ch.is_control()` → `if !ch.is_control()` (keeps control chars, drops everything else) | Caught | 20 tests failed across `board`, `grid`, `keys`, `pick`, `widgets` — including `a_tag_with_control_bytes_never_reaches_the_rendered_buffer` |
++| M12 | Remove the filter entirely (revert to the old loop body) | Caught | `a_tag_with_control_bytes_never_reaches_the_rendered_buffer` plus the three new `truncate_*` tests |
++
++### Re-verification
++
++```
++$ cargo test --lib ui::widgets:: -- --test-threads=1
++test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 665 filtered out
++
++$ cargo test --lib ui::board:: -- --test-threads=1
++test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 675 filtered out
++(a_tag_with_control_bytes_never_reaches_the_rendered_buffer is in this 15,
++ no longer ignored)
++
++$ cargo test -- --test-threads=1        # full workspace
++test result: ok. 690 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
++... (16 more "ok" lines, one per integration test binary, all 0 failed)
++
++$ cargo fmt --check
++(clean)
++
++$ cargo clippy --all-targets
++(clean, no warnings)
++
++$ git diff --check
++(clean)
++```
++
++Files touched this round: `src/ui/widgets.rs` (the `truncate` filter + 3
++new tests), `src/ui/board.rs` (removed `#[ignore]`, updated its doc
++comment to point at where the defense actually lives now).
++
++### Concerns
++
++None. The render-path gap Important 2 identified is now closed with
++coverage that discriminates (verified by mutation), and both dependent
++titles (grid, attach) were confirmed covered by inspection rather than
++assumed.
+diff --git a/src/session.rs b/src/session.rs
+index 47ca8bd..689bc24 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -227,60 +227,74 @@ fn apply_keystrokes(out: &mut String, text: &str, cap: Option<usize>) {
+ /// 终端上——这条渲染路径不像 `Buffer::set_stringn`/`Paragraph` 那样过滤
+ /// 控制字符，零宽的控制字符会原样穿过 `truncate`，再原样写进终端（细节见
+ /// fix-1-brief）。两条调用路各自的“脏”字符来源完全不同：`request_name`
+ /// 里的兜底源头是用户在附着视图里逐键敲出来的原始按键字节（方向键、Esc、
+ /// Ctrl+字母这些 README 明确记录“每一次按键都转发给 agent”的东西，虽然
+ /// `append_capped` 已经在收集阶段处理过一轮，这里再洗一次是防御性的，
+ /// 不依赖调用方记得先洗）；模型答的名字源头是 `clean_name`，它只管引号
+ /// 和标点、不管控制字符——一段被操纵过的屏幕内容可以诱导模型把控制字符
+ /// 原样吐回来。两条路落地前必须过同一道过滤，漏一条就是漏一条到用户
+ /// 终端的注入路径。
+-pub(crate) fn sanitize(text: &str) -> String {
++fn sanitize(text: &str) -> String {
+     let mut out = String::new();
+     apply_keystrokes(&mut out, text, None);
+     out
+ }
+ 
+ /// 把「已经封存的第一句话」变成一个能存进 `name_slot` 的兜底名字。
+ ///
+ /// 抽成自由函数，跟 `collect_first_input` 同一个理由：这是一条能测的
+ /// 纯逻辑（截断 → 洗 → 判空），跟 `request_name` 里那圈锁、线程、模型
+ /// 调用无关，不该混在一起只能靠跑一整个 `SessionManager` 才测得到。
+ ///
+ /// **不能假设 `first_input` 已经干净**：正常路径下它确实已经被
+ /// `append_capped` 洗过一轮（`collect_first_input` 是它唯一的写入口），
+ /// 但 `name_slot` 落地前的这道关卡不该依赖调用方记得先洗——`sanitize`
+ /// 在这里是防御性的最后一道，不是对上游的信任。
+ ///
+ /// 洗完再 `trim()` 一次，重新判断是否为空：如果什么都不剩（比如用户
+ /// 只敲了个空格就回车），返回 `None`——调用方据此把 `name_slot` 留成
+-/// `None`，不写一个看不见的空字符串。`name_slot` 非 `None` 就是「已经
+-/// 起过名」的标志位（见 `request_name`），写成 `Some("")` 会把这个
+-/// 会话永久钉死成一个看不见的名字，往后再也没有机会用一次真正的输入
+-/// 重新起名。
++/// `None`，不写一个看不见的空字符串（`Some("")` 在 `session_label` 里
++/// 跟真的没起出名字长得一模一样，`list()` 对两者做的都是
++/// `unwrap_or_default()`）。
++///
++/// **`None` 不等于「还没试过」**：「问过没有」单独用
++/// `Session::name_attempted` 记，不能再靠这个函数的返回值是不是 `None`
++/// 来判断——细节和为什么不能靠 `name_slot`，见 `name_attempted` 自己的
++/// 文档。
+ fn fallback_name(first_input: &str) -> Option<String> {
+     let capped: String = first_input.chars().take(NAME_MAX_CHARS).collect();
+     let cleaned = sanitize(&capped);
+     let cleaned = cleaned.trim();
+     if cleaned.is_empty() {
+         None
+     } else {
+         Some(cleaned.to_string())
+     }
+ }
+ 
+ /// 把模型答的名字变成一个能存进 `name_slot` 的名字。
+ ///
+ /// `clean_name` 只管引号和标点（见它自己的文档），不管控制字符——一段
+ /// 被操纵过的屏幕内容能诱导模型把控制字符原样吐回来，这里补上 `sanitize`
+ /// 那一道，跟 `fallback_name` 走的是同一份判空逻辑：洗完/去空白之后
+ /// 什么都不剩，返回 `None`，调用方不写、不覆盖已经在槽里的兜底。
++///
++/// 借用的是同一个 `sanitize`，所以模型答案里如果恰好带上 `\x7f`/`\x08`，
++/// 也会被读成「退格，弹掉上一个字符」——`sanitize` 那套弹出语义原本是
++/// 为**按键流**设计的（用户改错字），模型答案不是按键流，这里是把一个
++/// 键盘领域的语义借到了文本领域。无害：退格类字节混进模型答案本来就
++/// 极其罕见（那是屏幕内容被操纵之后模型复述出来的控制字节，不是正常
++/// 语言输出的一部分），就算真的出现，按「弹出」还是按「丢弃」处理，
++/// 结果都是「这个字节不会以原样留在名字里」——两种读法在这里要保的
++/// 安全性质上没有区别，选「弹出」只是为了让 `sanitize` 保持单一实现、
++/// 不用为两个调用方各写一套控制字符处理。
+ fn model_name(raw: &str) -> Option<String> {
+     let cleaned = sanitize(&clean_name(raw));
+     let cleaned = cleaned.trim();
+     if cleaned.is_empty() {
+         None
+     } else {
+         Some(cleaned.to_string())
+     }
+ }
+ 
+@@ -366,21 +380,24 @@ pub struct SessionInfo {
+     ///
+     /// 界面**必须**知道这件事：`u 回滚` / `d 改动` 只对 agent 会话有效
+     /// （`checkpoint_base` 对命令行会话直接返回 `NotAnAgentSession`），
+     /// 底栏不能对着一个 shell 会话写这两个键——屏幕上写着做不到的操作
+     /// 比不写更糟。
+     ///
+     /// 从守护进程侧的 `Session::is_agent` 原样带上来，不在界面侧靠 profile
+     /// 名字猜：那是 profile.toml 里的一个声明（`profile.rs` 的 `is_agent`），
+     /// 只有守护进程读得到，猜的迟早会跟真值分叉。
+     pub is_agent: bool,
+-    /// 这个会话的稳定名字，守护进程在它第一次干完活时起一次，之后不变。
++    /// 这个会话的稳定名字，守护进程在它第一次干完活时起一次，之后不变——
++    /// 「只起一次」由守护进程侧的 `Session::name_attempted` 保证，不是靠
++    /// 这个字段本身是不是空串（一个第一句话只有空白的会话也会被判定为
++    /// 「已经问过」，即使问出来的结果是空）。
+     ///
+     /// 空串 = 还没起出来（刚建、没配 LLM、不是 agent 会话，或者对面是
+     /// 认不得这个字段的旧守护进程）。**界面遇到空串一律退回 `profile`。**
+     ///
+     /// `#[serde(default)]` 是本版不升 `PROTOCOL_VERSION` 的依据：加纯读
+     /// 字段时旧 JSON 补默认值，而 serde 反序列化本来就忽略不认识的字段，
+     /// 所以新旧界面/守护进程怎么搭配都不会炸，只是没有名字。
+     #[serde(default)]
+     pub tag: String,
+ }
+@@ -398,26 +415,42 @@ struct Session {
+     busy_re: Option<regex::Regex>,
+     /// 出错时屏幕上一定有的串。跟上面两个一起在 `create()` 里编译一次，
+     /// 不在 tick 里每轮重编——tick 每秒跑 5 次。
+     error_re: Option<regex::Regex>,
+     pty: PtySession,
+     /// 出错原因的人话解释，由后台线程写回（见 `SessionManager::request_explanation`）。
+     /// **必须是 `Arc<Mutex<_>>`**：那个线程拿不到 `Session` 的锁——`tick()`
+     /// 正持着它。裸 `Option<String>` 编不过。
+     explanation_slot: Arc<Mutex<Option<String>>>,
+     /// 会话起名用的槽。跟 `explanation_slot` 平级、同一套用法。
+-    /// `None` = 还没触发过起名；`Some(_)` = 已经触发过（**只触发一次**）。
++    ///
++    /// **`None` 不等于「还没触发过起名」**：`fallback_name` 允许兜底
++    /// 本身就是 `None`（第一句话洗完/去空白之后什么都不剩，见它的
++    /// 文档），这种会话被问过之后 `name_slot` 也是 `None`。「问没问过」
++    /// 单独用 `name_attempted` 记，不能再靠这个字段是不是 `None` 判断。
+     name_slot: Arc<Mutex<Option<String>>>,
+     /// 用户对这个会话说的第一句话，起名用。只在 agent 会话上攒。
+     first_input: String,
+     /// 第一句攒完了没有。见 `collect_first_input`。
+     first_input_sealed: bool,
++    /// 起名有没有被**真正尝试过一次**——这是「只问一次」唯一的门槛。
++    ///
++    /// 不能拿 `name_slot.is_none()` 当门槛：`fallback_name` 允许兜底
++    /// 本身就是 `None`，如果继续靠 `name_slot` 判断「问过没有」，一个
++    /// 第一句话只有空白的会话会在**每一次** Working → Idle 都重新触发
++    /// `request_name`——白白多打一次模型（`request_explanation` 的文档
++    /// 里要躲的是同一种坑：一个失败会话能把额度烧光），而且会有两个
++    /// 后台起名线程同时在飞：后触发的那次 `request_name` 会同步把
++    /// `name_slot` 写回 `None`，把前一个线程已经写进去的真名字覆盖
++    /// 掉——一次丢失更新。`request_name` 一进门就把这里设成 `true`，
++    /// 之后这个会话再也不会被 `tick()` 认为该起名。
++    name_attempted: bool,
+     /// 第几次问过解释了。每次**进入** Failed 都自增，连同当时的号码一起
+     /// 交给那一轮的后台线程——线程算完之后先比一遍号码还对不对，不对就
+     /// 说明中途又失败过一次、有更新的问题在问，这份迟到的旧答案就不写了。
+     /// 没有这道防线的话，一个卡了很久的旧回答有可能在新一轮的新回答
+     /// 写回去**之后**才姗姗来迟，把新答案覆盖成旧的。
+     explanation_gen: Arc<AtomicU64>,
+     /// 用户上次**主动**滚动时的偏移。`new_lines` 靠它算：vt100 会在新行
+     /// 推入时自动把偏移 +1（grid.rs:556-558，画面因此不动），所以
+     /// 「偏移 - 这个标记」就正好是用户没看过的行数。
+     ///
+@@ -618,20 +651,21 @@ impl SessionManager {
+             checkpoints,
+             state,
+             idle_re,
+             busy_re,
+             error_re,
+             pty,
+             explanation_slot: Arc::new(Mutex::new(None)),
+             name_slot: Arc::new(Mutex::new(None)),
+             first_input: String::new(),
+             first_input_sealed: false,
++            name_attempted: false,
+             explanation_gen: Arc::new(AtomicU64::new(0)),
+             scroll_mark: 0,
+         };
+ 
+         // 出生也记一笔：只有死亡记录的话，日志里满是「某某没了」却看不出
+         // 它是什么时候、在哪个项目起来的，对不上「我刚才按了什么」。
+         self.journal
+             .born(id, &session.profile.name, dir, session.pty.process_id());
+ 
+         // 唯一需要锁的地方，而且只做一次 HashMap 插入，跟慢操作耗时无关。
+@@ -959,27 +993,34 @@ impl SessionManager {
+                     // 在 busy_pattern 存在时，busy 串**不在**屏幕上就判 Idle，
+                     // 而刚创建、还停在启动画面上的会话正是这样。没有这道判断，
+                     // `create()` 之后的第一个 tick 就会把 `was == Working`（创建时
+                     // 因为有 pattern 而置的初始状态）→ `next == Idle`（启动画面）
+                     // 读成「干完一轮活」，用空的 `first_input` 把名字永久钉成空串。
+                     // 注意这里特意用 `first_input`、不用 `first_input_sealed`：
+                     // 用户粘一大段需求、还没敲回车封存，agent 却已经抢先干完一轮
+                     // 活，这种情况下也该拿这段还没封存的话去起名，不该因为没封存
+                     // 就被这道判断拦下。
+                     //
+-                    // `name_slot` 非 None 就是已经起过了（`request_name` 一进门
+-                    // 就同步写兜底），所以这个条件同时管住了「只起一次」。
++                    // 「只起一次」的门槛是 `name_attempted`，**不是**
++                    // `name_slot.is_none()`：`fallback_name` 允许兜底本身
++                    // 就是 `None`（第一句话洗完/去空白之后什么都不剩），
++                    // 如果拿 `name_slot` 当门槛，这种会话会在每一轮
++                    // Working → Idle 都被重新读成「还没起过」，白白多打
++                    // 一次模型，还可能让两个后台起名线程同时在飞——后
++                    // 触发的那次会把先完成的线程刚写进去的真名字同步
++                    // 覆盖回 `None`，一次丢失更新（细节见 `name_attempted`
++                    // 自己的文档）。
+                     if was == SessionState::Working
+                         && matches!(next, SessionState::Idle | SessionState::Asking)
+                         && s.is_agent
+                         && !s.first_input.is_empty()
+-                        && recover(s.name_slot.lock()).is_none()
++                        && !s.name_attempted
+                     {
+                         self.request_name(&mut s);
+                     }
+                 }
+             }
+             // 两个都没有：状态不动，保持 Unknown
+         }
+     }
+ 
+     /// **绝不在 tick 里同步等模型。** tick 每 200ms 一轮，一次同步调用就能
+@@ -1007,31 +1048,42 @@ impl SessionManager {
+                 if gen.load(Ordering::SeqCst) == my_gen {
+                     if let Ok(mut g) = slot.lock() {
+                         *g = Some(text);
+                     }
+                 }
+             }
+             // 失败就什么都不做——界面显示今天就有的那句失败提示
+         });
+     }
+ 
+-    /// 给这个会话起个名字。**只在它第一次干完活时调用一次**（见 `tick`）。
++    /// 给这个会话起个名字。**只在它第一次干完活时调用一次**——门槛是
++    /// `Session::name_attempted`，`tick()` 在调用这里之前已经检查过
++    /// （不是 `name_slot` 是否为 `None`：`fallback_name` 允许兜底本身
++    /// 就是 `None`，拿 `name_slot` 当门槛会让这类会话每一轮都被重新
++    /// 触发，细节见 `name_attempted` 的文档）。
+     ///
+     /// 跟 `request_explanation` 是同一条路，但**不需要 generation 计数器**：
+-    /// 失败会反复发生、迟到的旧解释会盖掉新解释，而名字一辈子只问一次，
+-    /// 全程只有一个线程可能写这个槽。
++    /// 失败会反复发生、迟到的旧解释会盖掉新解释，而这里的门槛在函数
++    /// 一进门就同步立起来（见下面第一行），全程只有一个线程可能写
++    /// `name_slot`，没有「迟到的旧答案盖掉新答案」这种事要防。
+     fn request_name(&self, s: &mut Session) {
+-        // 先把兜底同步写进去：从这一刻起 `name_slot` 就是 `Some(_)`，
+-        // 它同时兼任「已经起过名了」的标志位。模型答得出就覆盖，
+-        // 答不出就把第一句留在这儿。`fallback_name` 可能给 `None`
+-        // （洗完/去空白之后什么都不剩），这种情况下 `name_slot` 就该
+-        // 留成 `None`，不能钉死一个看不见的空 tag——见它自己的文档。
++        // 先立门槛，**在做任何别的事之前**：不管兜底洗不洗得出东西、
++        // 不管有没有配后端，「这个会话已经问过一次名字」从这一刻起就是
++        // 定局，`tick()` 不会再为它调用这个函数第二次。放在最前面是为
++        // 了不留窗口——换成先写兜底、后立门槛，两步之间那一刻门槛还
++        // 没立起来。
++        s.name_attempted = true;
++
++        // 再把兜底同步写进去：模型答得出就覆盖，答不出就把第一句留在
++        // 这儿。`fallback_name` 可能给 `None`（洗完/去空白之后什么都
++        // 不剩），这种情况下 `name_slot` 就该留成 `None`，不能钉死一个
++        // 看不见的空 tag——见它自己的文档。
+         *recover(s.name_slot.lock()) = fallback_name(&s.first_input);
+ 
+         let Some(b) = recover(self.backend.lock()).clone() else {
+             return; // 没配后端：功能安静下线，兜底那句留着
+         };
+         let p = name_prompt(&s.first_input, &s.pty.screen_text());
+         let slot = s.name_slot.clone();
+         std::thread::spawn(move || {
+             // 15 秒，比 `explanation` 的 30 秒短：那个是用户正等着看解释，
+             // 这个是后台起名，没人等，等太久只是白占一个线程。
+@@ -1794,39 +1846,40 @@ mod tests {
+             assert!(
+                 !tag.chars().any(|c| c.is_control()),
+                 "模型答案里的控制字符没被洗掉：{tag:?}"
+             );
+             assert!(Instant::now() < deadline, "一直没起出名字，最后是 {tag:?}");
+             sleep(Duration::from_millis(50));
+         }
+     }
+ 
+     /// 只送空白（一个空格加回车）：洗完/去空白之后兜底是空的，`name_slot`
+-    /// 必须留 `None`，不能把一个看不见的空 tag 钉死。
++    /// 必须留 `None`，不能钉死一个看不见的空 tag——**但「问过没有」这件
++    /// 事本身必须只成立一次**，不能因为 `name_slot` 还是 `None` 就被
++    /// `tick()` 读成「还没问过」而反复重新触发。反复触发的代价是真实的：
++    /// 每一轮 Working → Idle 都会再打一次模型（跟 `request_explanation`
++    /// 的文档里要躲的是同一种坑——一个答不上来的会话能把额度烧光），
++    /// 而且会有两个后台起名线程同时在飞——后触发的那次 `request_name`
++    /// 会同步把 `name_slot` 写回 `None`，把前一个线程刚写进去的真名字
++    /// 覆盖掉，一次丢失更新（`Session::name_attempted` 的文档记的是
++    /// 同一件事）。
+     ///
+-    /// 光看 `tag` 停在 `""` 测不出这件事——`list()` 对 `None` 和
+-    /// `Some("")` 做的都是 `unwrap_or_default()`，两种状态在界面上长得
+-    /// 一模一样，钉死成 `Some("")` 的 bug 会被这种断言完全放过。真正
+-    /// 能测出区别的是**下一轮**：`name_slot` 是不是 `None` 决定了
+-    /// `tick()` 的起名门槛（`recover(s.name_slot.lock()).is_none()`）
+-    /// 会不会再打开一次。所以这条测试逼出第二轮 Working → Idle，这次
+-    /// 换一个答得出名字的后端，只有 `name_slot` 真的还是 `None`，
+-    /// 这一轮才可能起出名字来。
+-    #[test]
+-    fn whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt() {
++    /// 所以这条测试反过来验证：第一轮空白兜底问过之后，就算换一个真的
++    /// 答得出名字的后端、再逼出一次 Working → Idle，也不该再起出
++    /// 名字——`name_attempted` 得挡住第二次 `request_name`。
++    #[test]
++    fn whitespace_only_input_is_asked_about_exactly_once_not_forever() {
+         let repo = init_repo();
+         let m = SessionManager::new();
+-        // `fake_agent`（cat，只声明 idle_pattern）比 `finishing_agent` 更
+-        // 适合这条测试：`finishing_agent` 的脚本打完一次 READY 就
+-        // `sleep 30` 不再吭声，逼不出第二次 Working → Idle。`cat` 回显
+-        // 什么、屏幕上就有什么，能按需要反复把 "READY" 打上屏幕，
+-        // 从而反复触发状态判定。
++        // `fake_agent`（cat，只声明 idle_pattern）能按需要反复把 "READY"
++        // 打上屏幕，从而反复触发状态判定——`finishing_agent` 的脚本打完
++        // 一次 READY 就 `sleep 30` 不再吭声，逼不出第二次 Working → Idle。
+         m.register_profile(fake_agent());
+         m.set_backend(Some(Arc::new(DeadBackend)));
+         let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
+ 
+         // 第一句话只有空白——封存的 first_input 就是 " "。
+         m.send_input(id, " ").unwrap();
+         m.send_input(id, "").unwrap();
+ 
+         // 手动把 "READY" 打上屏幕，触发第一次 Working → Idle。
+         m.send_input(id, "READY").unwrap();
+@@ -1846,50 +1899,48 @@ mod tests {
+         // （见它自己的文档），所以状态一到 Idle 就已经有答案：`tag`
+         // 应该还是看不见的空串。
+         assert_eq!(
+             m.list().iter().find(|s| s.id == id).unwrap().tag,
+             "",
+             "空白兜底不该产出一个看不见但非空的 tag"
+         );
+ 
+         // 换一个答得出名字的后端，再逼一次 Working → Idle：`send_input`
+         // 的空串分支会无条件把状态同步置回 Working（不管屏幕内容），
+-        // "READY" 还留在屏幕上，下一次 tick 就会再判一次 Idle。
++        // "READY" 还留在屏幕上，下一次 tick 就会再判一次 Idle。如果
++        // `name_attempted` 没有真正挡住重复触发，这个后端会在几轮之内
++        // 把 tag 改写成「真实名字」。
+         m.set_backend(Some(Arc::new(FixedBackend("真实名字".into()))));
+         m.send_input(id, "").unwrap();
+ 
+-        let deadline = Instant::now() + Duration::from_secs(5);
+-        loop {
++        for _ in 0..10 {
+             m.tick();
+-            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
+-            if tag == "真实名字" {
+-                break;
+-            }
+-            assert!(
+-                Instant::now() < deadline,
+-                "空白那一轮不该把 name_slot 钉死，第二轮该能起出真名字，\
+-                 最后是 {tag:?}"
++            assert_eq!(
++                m.list().iter().find(|s| s.id == id).unwrap().tag,
++                "",
++                "name_attempted 该挡住第二次 request_name，这个会话不该再起出名字"
+             );
+-            sleep(Duration::from_millis(50));
++            sleep(Duration::from_millis(30));
+         }
+     }
+ 
+     /// **钉死**：从 `Failed` 缓过来变成 `Idle` 不算「干完一轮活」，不该拿它
+     /// 起名。这个场景里 `was == SessionState::Working` 和
+     /// `!s.first_input.is_empty()` 两道判断**都**能单独拦住误触发（这里
+     /// 从没送过输入，first_input 全程是空的，跟
+     /// `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
+     /// 那个坑同源）——两道判断在这个测试里冗余覆盖，这条测的是另一件事：
+-    /// `name_slot` 那道「只起一次」的门槛在误触发场景下反而是帮凶——如果
+-    /// Failed → Idle 被当成起名时机，它会拿这时候还空着的 `first_input`
+-    /// 把 `name_slot` 提前钉死，等真正干完一轮活、有真实内容可用的时候，
+-    /// `name_slot` 已经非 `None` 了，再也翻不了身。
++    /// `name_attempted` 那道「只起一次」的门槛在误触发场景下反而是帮凶——
++    /// 如果 Failed → Idle 被当成起名时机，它会拿这时候还空着的
++    /// `first_input` 把 `name_attempted` 提前置成 `true`，等真正干完
++    /// 一轮活、有真实内容可用的时候，`request_name` 已经再也不会被
++    /// 调用第二次了。
+     #[test]
+     fn recovering_from_a_failure_does_not_count_as_finishing_a_round() {
+         // 名字跟着 prompt 里有没有真实的第一句话走，而不是跟着「第几次被
+         // 问到」走：不管 request_name 是被误触发一次还是正常触发一次，
+         // 只要 prompt 里没有真实输入，答案就该是「提前」那句，不该是
+         // 「真实」那句——这样才量得出「到底是哪一次触发把名字定下来的」，
+         // 不受线程调度先后顺序影响。
+         struct ByPrompt;
+         impl crate::llm::Backend for ByPrompt {
+             fn complete(&self, p: &crate::llm::Prompt) -> Result<String, crate::llm::LlmError> {
+@@ -1971,22 +2022,22 @@ mod tests {
+ 
+     /// **钉死** `was == SessionState::Working` 单独扛住的那一半：
+     /// `recovering_from_a_failure_does_not_count_as_finishing_a_round`
+     /// 测的是 `first_input` 全程为空的场景——那条测试其实是被两道判断
+     /// 同时拦住的（`!s.first_input.is_empty()` 那道判断也在拦，见它的
+     /// 文档注释），单独去掉 `was == Working` 拦不住它。这条要隔离的是
+     /// `!s.first_input.is_empty()` 已经放行之后剩下的那一半：用户已经
+     /// 说过话（`first_input` 非空），agent 却报错又恢复——五个内置
+     /// profile 有 `error_pattern`（只有 codex.toml 没有），用户说完话
+     /// 之后 agent 报错、错误文案又从屏幕上滚走，`classify()` 会把这读成
+-    /// Idle。这不是「干完一轮活」，不该拿它起名，起了就会烧掉一辈子
+-    /// 只有一次的 `name_slot`，真正干完活也翻不了身。
++    /// Idle。这不是「干完一轮活」，不该拿它起名，起了就会把一辈子只有
++    /// 一次的 `name_attempted` 提前烧掉，真正干完活也翻不了身。
+     ///
+     /// 区分「误触发」和「真起名」不能靠 `first_input`——两次触发时它都
+     /// 非空、内容还一样，天生分不出谁是谁。只能靠 prompt 里屏幕尾巴那
+     /// 一段：`cat` 要等脚本走完 BOOM → 清屏 → READY 才会真正开始读、
+     /// 回显用户排在队列里的那句话，所以恢复那一刻的屏幕尾巴里还没有它，
+     /// 真正干完一轮活之后的屏幕尾巴里才有。
+     #[test]
+     fn recovering_from_a_failure_after_real_input_still_does_not_count() {
+         struct ByScreenTail;
+         impl crate::llm::Backend for ByScreenTail {
+diff --git a/src/ui/board.rs b/src/ui/board.rs
+index 18372d7..16249b7 100644
+--- a/src/ui/board.rs
++++ b/src/ui/board.rs
+@@ -268,20 +268,62 @@ mod tests {
+         let a = buf.area;
+         (0..a.height)
+             .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+             .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+             .collect::<String>()
+             .chars()
+             .filter(|c| !c.is_whitespace())
+             .collect()
+     }
+ 
++    /// **核心回归测试，钉在渲染出的 buffer 这一层**（`fix-1-brief.md`
++    /// 明确要的层级——见 `fix-1-report.md` 里对第一轮 review 的回应）。
++    ///
++    /// `session::tests` 里同名意图的测试断言的是 `SessionInfo.tag`，那是
++    /// 渲染的**输入**，不是渲染的**结果**：`tag` 是 `#[serde(default)]`
++    /// 的 JSON 字段，跨守护进程↔界面的 socket 走（见 `SessionInfo::tag`
++    /// 自己的文档），一个连着**旧守护进程**的新界面——这是本仓库里
++    /// 记录在案、会反复发生的组合——会原样拿到旧守护进程从来没洗过的
++    /// `tag`。`session.rs` 那道 `sanitize` 过滤完全长在守护进程一侧，
++    /// 界面这边没有第二道防线；这条测试才是真正验证「就算界面拿到一个
++    /// 脏 tag，控制字符最终也画不到屏幕上」的地方。
++    ///
++    /// 看板列表项走的是 `Span::raw` → `List`/`ListItem` → `Line` →
++    /// `Span::render_ref`（`board.rs:211`），跟 `Buffer::set_stringn`/
++    /// `Paragraph` 不是同一条路，后两者会过滤控制字符，前者不会
++    /// （细节见 `fix-1-brief.md`）。`screen_text` 只过滤空白字符，
++    /// 控制字符如果真的穿透渲染，会原样出现在它的输出里。
++    ///
++    /// **界面侧的防线在 `widgets::truncate` 里**，不在这个测试文件——
++    /// `board.rs:211` 那句 `truncate(session_label(s), 15)` 会先经过
++    /// `truncate`，控制字符在那一层就被丢弃了（细节和为什么选那一层，
++    /// 见 `truncate` 自己的文档、`fix-1-report.md` 的 Important 2）。
++    #[test]
++    fn a_tag_with_control_bytes_never_reaches_the_rendered_buffer() {
++        let (mut app, dir) = App::test_app();
++        let proj = real_dir(&dir, "proj");
++        let mut s = sess(1, &proj);
++        // 上箭头的转义序列 + 一个字面的退格字节，模拟 fix-1-brief 里
++        // 描述的、一个没洗过 tag 的旧守护进程会发过来的东西。
++        s.tag = "\x1b[Afix\x7f".into();
++        app.set_sessions(vec![s]);
++
++        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
++        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++
++        let c = screen_text(&term);
++        assert!(
++            !c.chars().any(|ch| ch.is_control()),
++            "控制字符穿透渲染，落进了 buffer：{c:?}"
++        );
++    }
++
+     /// 用户报的症状一：底栏写着「当前项目：dc-terminal」，看板却列着
+     /// dc_desktop 的会话。答案不再是「把别的项目藏起来」，而是**分组**：
+     /// 两个项目都在屏幕上，各自的会话待在自己的组头底下，谁属于谁一眼可见。
+     #[test]
+     fn the_board_groups_every_session_under_its_own_project() {
+         let (mut app, dir) = App::test_app();
+         // 组头上的 agent 统计只在目录真的还在时才画（不在就换成
+         // 「目录不在了」），所以这两个项目必须是磁盘上真实存在的目录。
+         let one = real_dir(&dir, "dc-terminal");
+         let two = real_dir(&dir, "dc_desktop");
+diff --git a/src/ui/widgets.rs b/src/ui/widgets.rs
+index c7de406..f928da9 100644
+--- a/src/ui/widgets.rs
++++ b/src/ui/widgets.rs
+@@ -127,24 +127,54 @@ pub(crate) fn screen_to_lines(screen: &[Vec<ScreenSpan>]) -> Vec<Line<'static>>
+ pub(crate) fn char_width(ch: char) -> usize {
+     // 控制字符没有宽度（`width()` 返回 None），当零列算：它们本来就不占格子。
+     unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+ }
+ 
+ pub(crate) fn display_width(s: &str) -> usize {
+     s.chars().map(char_width).sum()
+ }
+ 
+ /// 按显示宽度截断，超出的用 … 收尾。看板一行放不下就裁，不能让它换行把表格冲乱。
++///
++/// **顺带把控制字符滤掉，这是渲染层唯一的一道防线。**`char_width` 对
++/// 控制字符返回 0（见它自己的文档），如果不在这里主动丢弃，它们会带着
++/// 零宽度混进 `out`：既不占用截断预算，又原样穿过这个函数，交给
++/// `ratatui` 的 `Span::render_ref` 原样画出来——那条路不像
++/// `Buffer::set_stringn`/`Paragraph` 那样过滤控制字符（细节见
++/// `fix-1-brief.md`）。`\x1b[A` 这种转义序列一旦这样漏到终端上，就是
++/// 每一帧都往看板里发一次真实的光标控制命令。
++///
++/// 选在这里补、不是在 `session_label` 补：这个函数是**看板列表项、
++/// 九宫格标题、附着视图块标题**共用的唯一收窄口（`board.rs`/`grid.rs`/
++/// `attach.rs` 的相关调用点都会经过这里），补在这一处就同时覆盖了四条
++/// 渲染路径；`session_label` 只覆盖 tag 这一个字段，且它现在返回的是
++/// 零拷贝的 `&str`，要在那边过滤就得先把签名改成拿所有权的 `String`，
++/// 牵连所有调用点。
++///
++/// **只丢 `is_control()`，不做转义序列的整体识别**（不像守护进程侧
++/// `session::sanitize` 那样把 `ESC '[' ... 终止字节` 整段吃掉）：这里
++/// 要保的安全性质只有「控制字节不能原样落进终端」，`\x1b[A` 里的 `[`
++/// 和 `A` 单独看是普通可打印字符，把 `ESC` 丢了之后，剩下的 `[A` 对
++/// 终端来说就是两个字，不再是一条活的控制序列——守护进程侧要多做一步
++/// 是因为它还要保证「记录下来的文本等于用户真正想打的话」，这里没有
++/// 这层语义负担，不用照抄那一整套状态机。
++///
++/// **不会影响宽度/CJK 计算**：`char_width` 已经把控制字符算成 0 列，
++/// 这里只是不再把它们 `push` 进 `out`，`w` 的累加值一分不差——跳过的
++/// 字符本来就没有为 `w` 贡献过什么。
+ pub(crate) fn truncate(s: &str, max: usize) -> String {
+     let mut w = 0;
+     let mut out = String::new();
+     for ch in s.chars() {
++        if ch.is_control() {
++            continue;
++        }
+         let cw = char_width(ch);
+         if w + cw > max {
+             out.push('…');
+             return out;
+         }
+         w += cw;
+         out.push(ch);
+     }
+     out
+ }
+@@ -394,20 +424,61 @@ mod tests {
+         // `truncate` 补的那个 `…` 会让结果比 max 多出一列（既有行为），
+         // 中段留着 2 列间隔正好吃得下
+         assert_eq!(
+             project_label("a-very-long-project", "~/work", 10),
+             "a-very-lon…"
+         );
+         // 中文项目名一个字两列，按显示宽度截，不能按字符数
+         assert_eq!(project_label("一二三四五六", "~/w", 5), "一二…");
+     }
+ 
++    /// **核心回归测试**：控制字符/转义序列不能穿过 `truncate` 落进渲染
++    /// 出的字符串——这是渲染层唯一的一道防线（细节见 `truncate` 自己的
++    /// 文档、`fix-1-brief.md`、`fix-1-report.md` 的 Important 2）。
++    /// 上箭头（`\x1b[A`）和退格（`\x7f`）是 fix-1-brief 按键表里
++    /// 真实存在的转发字节，直接照抄。
++    #[test]
++    fn truncate_strips_control_bytes_before_they_can_reach_the_render_path() {
++        assert_eq!(truncate("\x1b[Afix\x7f", 20), "[Afix");
++        assert_eq!(truncate("\x1b\x01hi", 20), "hi");
++    }
++
++    /// 控制字符不占宽度预算（`char_width` 早就把它们算成 0 列），丢弃
++    /// 它们不该让后面正常的字被多裁或者少裁一个——`w` 的累加值必须跟
++    /// 「控制字符从没出现过」时完全一样。
++    #[test]
++    fn truncate_dropping_control_bytes_does_not_shift_the_width_budget() {
++        assert_eq!(truncate("ab", 2), "ab");
++        assert_eq!(
++            truncate("a\x1bb", 2),
++            "ab",
++            "控制字符不该占用这 2 列里的任何一列"
++        );
++        assert_eq!(truncate("abc", 2), "ab…");
++        assert_eq!(
++            truncate("a\x1bbc", 2),
++            "ab…",
++            "丢弃控制字符之后，正常字符该不该被裁的判断不能变"
++        );
++    }
++
++    /// 中文/CJK 宽度计算不受影响：控制字符和两列宽的字符混在一起时，
++    /// 截断点仍然按显示宽度算，不是按字符数。
++    #[test]
++    fn truncate_control_byte_stripping_does_not_disturb_cjk_width_accounting() {
++        // 4 列刚好放得下两个中文字，后面没有更多字符，不该被裁。
++        assert_eq!(truncate("一\x1b二", 4), "一二");
++        // 加上第三个字就超出 4 列，即使 4 列本身正好被前两个字占满，
++        // 这一条钉的是「控制字符没有偷偷占掉本该属于第三个字的空间」。
++        assert_eq!(truncate("一\x1b二三", 4), "一二…");
++    }
++
+     /// 路径中间不许挖空。`~/work/dc/x` 放不下时给出 `dc/x`，绝不能是
+     /// `~/dc/x`——后者是**另一条真实存在的路径**，而用户没有任何线索
+     /// 知道那是拼出来的。
+     #[test]
+     fn project_label_never_elides_the_middle_of_a_path() {
+         let s = project_label("x", "~/work/dc", 8);
+         assert_eq!(s, "dc/x");
+         assert!(!s.starts_with("~/"), "开头那段贴不下就整段不贴：{s}");
+     }
+ 

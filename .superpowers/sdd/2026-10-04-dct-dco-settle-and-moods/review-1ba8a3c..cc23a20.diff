@@ -1,0 +1,335 @@
+# Review package: 1ba8a3c..HEAD
+
+## Commits
+cc23a20 feat(game): swipe_settle asks dco to wait for the screen to settle and report whether it changed, falling back cleanly on older dco
+
+## Files changed
+ crates/dct-game/src/dco.rs       |  41 +++++++++++++++-
+ crates/dct-game/src/dco_tests.rs | 101 ++++++++++++++++++++++++++++++++++++++-
+ crates/dct-game/src/play.rs      |  30 ++++++++++++
+ 3 files changed, 169 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/dco.rs b/crates/dct-game/src/dco.rs
+index 0480924..4ba4ddd 100644
+--- a/crates/dct-game/src/dco.rs
++++ b/crates/dct-game/src/dco.rs
+@@ -1,32 +1,33 @@
+ //! 连本机 dco：unix socket 上的 MCP（一行一条 JSON-RPC）。握手跟 dco 自己的 `dco call` 一样：
+ //! 先写 `{"dco_token": "<~/.dco/token>"}`，读到 `{"ok":true}`，再 initialize → notifications/initialized → tools/call。
+ use crate::board::GridRead;
+-use crate::play::{Dco, DcoError, Profile, Seen};
++use crate::play::{Dco, DcoError, Profile, Seen, SwipeOutcome, SwipeSettle, SETTLE_QUIET_MS, SETTLE_TIMEOUT_MS};
+ use crate::screen::Element;
+ use serde_json::{json, Value};
+ use std::io::{BufRead, BufReader, Write};
+ use std::os::unix::net::UnixStream;
+ use std::path::Path;
+ use std::time::Duration;
+ 
+ /// dco 一次回话最多等多久。
+ pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
+ 
+ pub struct DcoClient {
+     r: BufReader<UnixStream>,
+     w: UnixStream,
+     next_id: u64,
+     /// 这台 dco 没有 show_status（太旧）或者回得太慢：这条连接上不再发，免得每一步白等。
+     no_show_status: bool,
+     /// 同理：认字（OCR）回得太慢或这台 dco 太旧，就不再读，免得每一步白等 10 秒。
+     no_see_text: bool,
++    no_swipe_settle: bool,
+     /// 一次请求等回复的总时长；跳过别的回复也算在里面。
+     timeout: Duration,
+ }
+ 
+ fn err(code: &str, message: impl Into<String>) -> DcoError {
+     DcoError { code: code.into(), message: message.into() }
+ }
+ 
+ /// 读写出错：超时单独说，别的都当作 dco 断开了。
+ fn io_err(e: &std::io::Error) -> DcoError {
+@@ -52,21 +53,21 @@ impl DcoClient {
+             .ok_or_else(|| err("dco_down", "dco 没在运行，先打开 dco 再试"))?;
+         let socket = endpoint["socket"].as_str().ok_or_else(|| err("dco_down", "dco 没在运行，先打开 dco 再试"))?;
+         let token = std::fs::read_to_string(dir.join("token")).map_err(|_| err("dco_down", "读不到 dco 的钥匙文件，dco 还没启动过？"))?;
+         let stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
+             std::io::ErrorKind::PermissionDenied => err("dco_blocked", "这里不让连 dco"),
+             _ => err("dco_down", "dco 没在运行，先打开 dco 再试"),
+         })?;
+         stream.set_read_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
+         stream.set_write_timeout(Some(timeout)).map_err(|e| err("dco_down", e.to_string()))?;
+         let w = stream.try_clone().map_err(|e| err("dco_down", e.to_string()))?;
+-        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, timeout };
++        let mut c = DcoClient { r: BufReader::new(stream), w, next_id: 1, no_show_status: false, no_see_text: false, no_swipe_settle: false, timeout };
+         c.send(&json!({ "dco_token": token.trim() }))?;
+         let ack = c.read_line()?;
+         if ack.get("ok") != Some(&Value::Bool(true)) {
+             return Err(err("dco_refused", "dco 拒绝了连接"));
+         }
+         let init = c.request("initialize", json!({
+             "protocolVersion": "2025-06-18", "capabilities": {},
+             "clientInfo": { "name": "dct", "version": env!("CARGO_PKG_VERSION") }
+         }))?;
+         let _ = init;
+@@ -146,20 +147,56 @@ impl Dco for DcoClient {
+     }
+ 
+     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError> {
+         self.call("swipe", json!({
+             "window": p.window,
+             "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
+         }))
+         .map(|_| ())
+     }
+ 
++    fn swipe_settle(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> SwipeOutcome {
++        if self.no_swipe_settle {
++            return match self.swipe(p, from, to) {
++                Err(e) => SwipeOutcome::NotSwiped(e),
++                Ok(()) => SwipeOutcome::SwipedNoSettle(err("unsupported", "这个 dco 不会等屏幕稳定")),
++            };
++        }
++        let [x, y, w, h] = p.region;
++        let body = match self.call("swipe", json!({
++            "window": p.window,
++            "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
++            "settle": { "quiet_ms": SETTLE_QUIET_MS, "timeout_ms": SETTLE_TIMEOUT_MS, "region": { "x": x, "y": y, "w": w, "h": h } },
++        })) {
++            Ok(b) => b,
++            Err(e) => return SwipeOutcome::NotSwiped(e),
++        };
++        // 到这里划动已经发生；下面任何一种“没拿到报告”都不许再划。
++        let s = &body["settle"];
++        if !s.is_object() {
++            // 旧 dco 不认 settle 参数，只划了。以后别再带。
++            self.no_swipe_settle = true;
++            return SwipeOutcome::SwipedNoSettle(err("unsupported", "这个 dco 不会等屏幕稳定"));
++        }
++        if s["error"].is_object() {
++            let e = &s["error"];
++            return SwipeOutcome::SwipedNoSettle(err(e["code"].as_str().unwrap_or("dco_error"), e["message"].as_str().unwrap_or("等屏幕稳定时出错")));
++        }
++        SwipeOutcome::Settled(SwipeSettle {
++            changed: s["changed"].as_bool().unwrap_or(false),
++            change: s["change"].as_f64().unwrap_or(0.0),
++            settled: s["settled"].as_bool().unwrap_or(false),
++            timed_out: s["timed_out"].as_bool().unwrap_or(false),
++            settled_ms: s["settled_ms"].as_u64(),
++        })
++    }
++
+     fn see_text(&mut self, p: &Profile) -> Result<Seen, DcoError> {
+         if self.no_see_text {
+             return Err(err("unsupported", "这个 dco 不会认画面上的字"));
+         }
+         let body = match self.call("see", json!({ "window": p.window, "source": "ocr" })) {
+             Ok(b) => b,
+             Err(e) => {
+                 if e.code == "dco_too_old" || e.code == "dco_timeout" {
+                     self.no_see_text = true;
+                 }
+diff --git a/crates/dct-game/src/dco_tests.rs b/crates/dct-game/src/dco_tests.rs
+index 70c34fd..5d691ce 100644
+--- a/crates/dct-game/src/dco_tests.rs
++++ b/crates/dct-game/src/dco_tests.rs
+@@ -1,12 +1,12 @@
+ use crate::dco::DcoClient;
+-use crate::play::{Dco, Profile};
++use crate::play::{Dco, DcoError, Profile, SwipeOutcome, SwipeSettle};
+ use serde_json::{json, Value};
+ use std::io::{BufRead, BufReader, Write};
+ use std::os::unix::net::UnixListener;
+ 
+ /// 假 dco：按 dco 真实的握手和回复形状说话。`handler(tool, args)` 返回 (JSON, 是不是错误)。
+ fn fake(dir: &std::path::Path, token: &str, handler: impl Fn(&str, &Value) -> (Value, bool) + Send + 'static) -> std::thread::JoinHandle<Vec<String>> {
+     let sock = dir.join("dco.sock");
+     std::fs::write(dir.join("endpoint.json"), json!({"socket": sock}).to_string()).unwrap();
+     std::fs::write(dir.join("token"), token).unwrap();
+     let l = UnixListener::bind(&sock).unwrap();
+@@ -428,10 +428,109 @@ fn a_late_reply_to_a_timed_out_call_is_not_taken_for_the_next_calls_reply() {
+         "read_grid" => (json!({"rows":2,"cols":2,"cells":[[0,0],[1,1]],"odd":[[false,false],[false,false]],
+                 "classes":[{"id":0,"rgb":[1,2,3],"count":2},{"id":1,"rgb":[4,5,6],"count":2}],"elapsed_ms":1}), false),
+         other => panic!("没想到会调 {other}"),
+     });
+     let mut c = DcoClient::connect_with_timeout(dir.path(), std::time::Duration::from_millis(200)).unwrap();
+     assert_eq!(c.call("slow", json!({})).unwrap_err().code, "dco_timeout");
+     // 慢回复在这次调用等的时候才到，必须被跳过
+     let g = c.read_grid(&profile()).unwrap();
+     assert_eq!((g.rows, g.cols, g.classes.len()), (2, 2, 2));
+ }
++
++fn settle_fake(dir: &std::path::Path, replies: Vec<(Value, bool)>) -> (std::thread::JoinHandle<Vec<String>>, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
++    let args = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
++    let a2 = args.clone();
++    let replies = std::sync::Mutex::new(replies.into_iter());
++    let h = fake(dir, TOKEN, move |tool, a| {
++        assert_eq!(tool, "swipe");
++        a2.lock().unwrap().push(a.clone());
++        replies.lock().unwrap().next().unwrap()
++    });
++    (h, args)
++}
++
++fn ed(code: &str, message: &str) -> DcoError {
++    DcoError { code: code.into(), message: message.into() }
++}
++
++#[test]
++fn swipe_settle_reports_what_dco_saw_and_sends_the_region() {
++    let dir = tempfile::tempdir().unwrap();
++    let ok = json!({"swiped":true,"settle":{"changed":true,"change":0.4,"settled":true,"timed_out":false,"settled_ms":420,"region":{"x":0.2,"y":0.3,"w":0.5,"h":0.4}}});
++    let (h, args) = settle_fake(dir.path(), vec![(ok, false)]);
++    let mut c = DcoClient::connect(dir.path()).unwrap();
++    let r = c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5));
++    assert_eq!(r, SwipeOutcome::Settled(SwipeSettle { changed: true, change: 0.4, settled: true, timed_out: false, settled_ms: Some(420) }));
++    drop(c);
++    h.join().unwrap();
++    let a = args.lock().unwrap();
++    assert_eq!(a[0]["settle"]["quiet_ms"], 300);
++    assert_eq!(a[0]["settle"]["timeout_ms"], 8000);
++    assert_eq!(a[0]["settle"]["region"], json!({"x":0.2,"y":0.3,"w":0.5,"h":0.4}));
++}
++
++#[test]
++fn swipe_settle_bounce_back_is_a_settled_no_change() {
++    let dir = tempfile::tempdir().unwrap();
++    let r = json!({"swiped":true,"settle":{"changed":false,"change":0.0,"settled":true,"timed_out":false,"settled_ms":310}});
++    let (h, _) = settle_fake(dir.path(), vec![(r, false)]);
++    let mut c = DcoClient::connect(dir.path()).unwrap();
++    match c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)) {
++        SwipeOutcome::Settled(s) => assert!(!s.changed && s.settled),
++        o => panic!("{o:?}"),
++    }
++    drop(c);
++    h.join().unwrap();
++}
++
++#[test]
++fn swipe_settle_old_dco_swiped_without_settle_and_is_not_asked_again() {
++    let dir = tempfile::tempdir().unwrap();
++    let (h, args) = settle_fake(dir.path(), vec![(json!({"swiped":true}), false), (json!({"swiped":true}), false)]);
++    let mut c = DcoClient::connect(dir.path()).unwrap();
++    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "unsupported"));
++    assert!(matches!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(e) if e.code == "unsupported"));
++    drop(c);
++    h.join().unwrap();
++    let a = args.lock().unwrap();
++    assert_eq!(a.len(), 2);
++    assert!(a[0].get("settle").is_some());
++    assert!(a[1].get("settle").is_none());
++}
++
++#[test]
++fn swipe_settle_wait_error_keeps_asking_next_time() {
++    let dir = tempfile::tempdir().unwrap();
++    let bad = json!({"swiped":true,"settle":{"error":{"code":"stale","message":"窗口关了"}}});
++    let (h, args) = settle_fake(dir.path(), vec![(bad, false), (json!({"swiped":true}), false)]);
++    let mut c = DcoClient::connect(dir.path()).unwrap();
++    assert_eq!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::SwipedNoSettle(ed("stale", "窗口关了")));
++    c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5));
++    drop(c);
++    h.join().unwrap();
++    let a = args.lock().unwrap();
++    assert!(a[0].get("settle").is_some() && a[1].get("settle").is_some());
++}
++
++#[test]
++fn swipe_settle_swipe_failure_is_not_swiped() {
++    let dir = tempfile::tempdir().unwrap();
++    let (h, _) = settle_fake(dir.path(), vec![(json!({"error":{"code":"halted","message":"急停"}}), true)]);
++    let mut c = DcoClient::connect(dir.path()).unwrap();
++    assert_eq!(c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)), SwipeOutcome::NotSwiped(ed("halted", "急停")));
++    drop(c);
++    h.join().unwrap();
++}
++
++#[test]
++fn swipe_settle_timeout_is_returned_for_the_caller_to_judge() {
++    let dir = tempfile::tempdir().unwrap();
++    let r = json!({"swiped":true,"settle":{"changed":true,"change":0.2,"settled":false,"timed_out":true}});
++    let (h, _) = settle_fake(dir.path(), vec![(r, false)]);
++    let mut c = DcoClient::connect(dir.path()).unwrap();
++    assert_eq!(
++        c.swipe_settle(&profile(), (0.3, 0.4), (0.4, 0.5)),
++        SwipeOutcome::Settled(SwipeSettle { changed: true, change: 0.2, settled: false, timed_out: true, settled_ms: None })
++    );
++    drop(c);
++    h.join().unwrap();
++}
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index 1e21bec..65debed 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -32,20 +32,42 @@ pub struct DcoError {
+ }
+ 
+ /// 一次 `see`（OCR）：画面上读到的字和它们的编号。`snapshot_id` 要原样交给 `tap`。
+ #[derive(Clone, Debug)]
+ pub struct Seen {
+     pub snapshot_id: String,
+     pub observation_id: Option<String>,
+     pub elements: Vec<Element>,
+ }
+ 
++/// 划完之后让 dco 等屏幕稳定：连续安静这么久算稳定、最多等这么久（毫秒）。
++pub const SETTLE_QUIET_MS: u32 = 300;
++pub const SETTLE_TIMEOUT_MS: u32 = 8000;
++
++/// dco 替我们等屏幕稳定之后的报告。
++#[derive(Clone, Debug, PartialEq)]
++pub struct SwipeSettle {
++    pub changed: bool,
++    pub change: f64,
++    pub settled: bool,
++    pub timed_out: bool,
++    pub settled_ms: Option<u64>,
++}
++
++/// `swipe_settle` 的结果。要分清「划动没发生」和「划了但没拿到稳定报告」：后一种绝不能再划一次。
++#[derive(Clone, Debug, PartialEq)]
++pub enum SwipeOutcome {
++    NotSwiped(DcoError),
++    SwipedNoSettle(DcoError),
++    Settled(SwipeSettle),
++}
++
+ fn unsupported() -> DcoError {
+     DcoError { code: "unsupported".into(), message: "这个 dco 不会认画面上的字".into() }
+ }
+ 
+ /// 画面上整条文字就是一个数字的元素（顶部的目标数、步数……），按出现顺序。
+ /// 「1716/♥5」这种夹着别的字的不要。哪个数是目标，这里不猜；只记下来。
+ pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
+     seen.elements
+         .iter()
+         .filter_map(|e| {
+@@ -81,20 +103,28 @@ pub(crate) fn goal_dropped(before: &[u64], after: &[u64], goal: usize) -> Option
+ }
+ 
+ fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {
+     dco.see_text(p).ok().map(|s| numbers(&s))
+ }
+ 
+ pub trait Dco {
+     fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
+     /// 坐标是窗口比例（0～1）。
+     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError>;
++    /// 划一下，并让 dco 等屏幕稳定后报告有没有变。默认实现只会划（划动确实发生了），
++    /// 然后说「没有稳定报告」，调用方据此回退轮询、不会再划。
++    fn swipe_settle(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> SwipeOutcome {
++        match self.swipe(p, from, to) {
++            Err(e) => SwipeOutcome::NotSwiped(e),
++            Ok(()) => SwipeOutcome::SwipedNoSettle(unsupported()),
++        }
++    }
+     /// 读画面上的字。只有“自动开始下一局”要用；默认不支持，所以只玩一关的假 dco 不用实现。
+     fn see_text(&mut self, _p: &Profile) -> Result<Seen, DcoError> {
+         Err(unsupported())
+     }
+     /// 点 `see_text` 读到的某个元素。dco 自己按那个元素上的字定档，带价格的会拒绝。
+     fn tap(&mut self, _snapshot_id: &str, _element_id: &str) -> Result<(), DcoError> {
+         Err(unsupported())
+     }
+     /// 告诉 dco 屏幕上的小章鱼现在在“想”还是“看”。只改它的样子，所以故意不返回错误：
+     /// 这里出什么事都不许影响玩。默认什么都不做，只玩一关的假 dco 不用实现。

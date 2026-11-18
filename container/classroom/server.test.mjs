@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import net from 'node:net';
+import {createHash} from 'node:crypto';
 import {Store} from './store.mjs';
 import {Classroom} from './server.mjs';
 
@@ -571,4 +573,488 @@ test('自愈：老版本写的记录没有房间号，认领当前房间而不�
     await app.healPublic();
     assert.deepEqual(store.data.students.find(s => s.id === ming.id).livePublic, {title: '小明的直播', id: 'room01'}, '应该认领当前房间，不是清掉');
   } finally { await app.close(); relay.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('云端创作接口：事件流边到边转、不截断、断开即销毁上游；大 JSON 放行；未登录与未知路径被拒；管理员不放行', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-classroom-authoring-'));
+  const seen = {headers: null, closed: null, release: null};
+  const gate = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    if (url.pathname === '/_dct/authoring/v1/events') {
+      seen.headers = req.headers;
+      const mode = url.searchParams.get('mode');
+      res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache', 'content-length-hint': 'ignored'});
+      if (mode === 'staged') {
+        res.write('id: 1\ndata: one\n\n');
+        seen.release = () => { res.write('id: 2\ndata: two\n\n'); res.end('id: 3\ndata: three\n\n'); };
+      } else if (mode === 'big') {
+        const chunk = Buffer.alloc(1024 * 1024, 'x'); let n = 0;
+        const pump = () => { while (n < 10) { n++; if (!res.write(`data: ${chunk.toString()}\n\n`)) return res.once('drain', pump); } res.end(); };
+        pump();
+      } else {
+        res.write(': ping\n\n');
+        req.on('close', () => seen.closed?.());
+      }
+    } else if (url.pathname === '/_dct/authoring/v1/projects/x/bundle') {
+      const body = Buffer.from(JSON.stringify({data: 'y'.repeat(12 * 1024 ** 2)}));
+      res.writeHead(200, {'content-type': 'application/json', 'content-length': body.length}); res.end(body);
+    } else if (url.pathname === '/_dct/authoring/v1/projects/sse') {
+      // 不是事件流路由却回 text/event-stream：只能当 JSON 转，照样受 16 MiB 上限
+      res.writeHead(200, {'content-type': 'text/event-stream'});
+      if (url.searchParams.get('big')) { const chunk = Buffer.alloc(1024 * 1024, 'x'); let n = 0; const pump = () => { while (n < 17) { n++; if (!res.write(chunk)) return res.once('drain', pump); } res.end(); }; pump(); }
+      else res.end('data: x\n\n');
+    } else if (url.pathname === '/_dct/authoring/v1/projects/busy') {
+      res.writeHead(409, {'content-type': 'application/json'}); res.end(JSON.stringify({code: 'busy'}));
+    } else { res.writeHead(200, {'content-type': 'application/json'}); res.end('{}'); }
+  });
+  await new Promise(r => gate.listen(0, '127.0.0.1', r));
+  const gatePort = gate.address().port;
+  const store = new Store(dir, {password: 'test-admin'});
+  const [alice] = store.add(['Alice']);
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), start: async () => {}, backend: async () => ({port: gatePort, apiPort: 1, token: 'GATE'}), rpc: async () => ({})};
+  const terminalFile = path.join(dir, 'trusted.html'); fs.writeFileSync(terminalFile, '<html><head></head></html>');
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false, terminalFile});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const base = `/w/${alice.id}/_dct/authoring/v1`;
+  try {
+    const login = await fetch(`${origin}/w/${alice.id}/login`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: alice.token})});
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    const adminLogin = await fetch(`${origin}/admin/api/login`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: 'test-admin'})});
+    const admin = adminLogin.headers.get('set-cookie').split(';')[0];
+
+    assert.equal((await fetch(origin + base + '/health')).status, 401);
+    assert.equal((await fetch(origin + `/w/${alice.id}/_dct/authoring/other`, {headers: {cookie}})).status, 404);
+    assert.equal((await fetch(origin + base + '/secret', {headers: {cookie}})).status, 404);
+    const health = await fetch(origin + base + '/health', {headers: {cookie}});
+    assert.equal(health.status, 200); assert.match(health.headers.get('content-type'), /^application\/json/);
+    const busy = await fetch(origin + base + '/projects/busy', {headers: {cookie}});
+    assert.equal(busy.status, 409); assert.deepEqual(await busy.json(), {code: 'busy'});
+
+    // 12 MB JSON 成功（超过普通 8 MB 上限）
+    const bundle = await fetch(origin + base + '/projects/x/bundle', {headers: {cookie}});
+    assert.equal(bundle.status, 200);
+    assert.equal((await bundle.text()).length > 12 * 1024 ** 2, true);
+
+    // 请求正文超 12 MiB 被拒
+    const tooBig = await fetch(origin + base + '/projects', {method: 'POST', headers: {cookie, 'Content-Type': 'application/json'}, body: Buffer.alloc(13 * 1024 ** 2, 'a')});
+    assert.equal(tooBig.status, 413);
+
+    // 只有 /events 走事件流透传；别的路由回 text/event-stream 也当 JSON、受上限
+    const fake = await fetch(origin + base + '/projects/sse', {headers: {cookie}});
+    assert.equal(fake.status, 200);
+    assert.match(fake.headers.get('content-type'), /^application\/json/);
+    await fake.text();
+    const fakeBig = await fetch(origin + base + '/projects/sse?big=1', {headers: {cookie}});
+    let got = 0;
+    try { for await (const c of fakeBig.body) got += c.length; } catch {}
+    assert.ok(got <= 16 * 1024 ** 2, `capped at 16 MiB, got ${got}`);
+
+    // 分段：第一条在后端写完之前就到达
+    const staged = await fetch(origin + base + '/events?project=p&mode=staged', {headers: {cookie, accept: 'text/event-stream', 'last-event-id': '41'}});
+    assert.equal(staged.status, 200);
+    assert.match(staged.headers.get('content-type'), /^text\/event-stream/);
+    assert.equal(staged.headers.get('x-accel-buffering'), 'no');
+    assert.equal(staged.headers.get('content-length'), null);
+    assert.equal(seen.headers['last-event-id'], '41'); assert.equal(seen.headers.accept, 'text/event-stream');
+    const reader = staged.body.getReader(), dec = new TextDecoder(); let text = '';
+    while (!text.includes('data: one')) { const {value, done} = await reader.read(); assert.ok(!done, 'stream ended before first event'); text += dec.decode(value); }
+    assert.ok(!text.includes('data: two'));
+    seen.release();
+    for (;;) { const {value, done} = await reader.read(); if (done) break; text += dec.decode(value); }
+    assert.ok(text.indexOf('data: one') < text.indexOf('data: two') && text.indexOf('data: two') < text.indexOf('data: three'));
+
+    // 超过 8 MB 的事件流不截断
+    const big = await fetch(origin + base + '/events?project=p&mode=big', {headers: {cookie}});
+    assert.equal(big.status, 200);
+    assert.ok((await big.arrayBuffer()).byteLength > 10 * 1024 ** 2);
+
+    // 学生断开 → 后端看到连接关闭
+    const closed = new Promise(r => { seen.closed = r; });
+    const ctl = new AbortController();
+    const live = await fetch(origin + base + '/events?project=p&mode=idle', {headers: {cookie}, signal: ctl.signal});
+    await live.body.getReader().read();
+    ctl.abort();
+    await closed;
+
+    // 管理员查看/协助不放行
+    await fetch(`${origin}/admin/api/students/${alice.id}/assist`, {method: 'POST', headers: {'Content-Type': 'application/json', cookie: admin}, body: '{}'});
+    assert.equal((await fetch(`${origin}/admin/workspaces/${alice.id}/view/_dct/authoring/v1/health`, {headers: {cookie: admin}})).status, 404);
+  } finally { await app.close(); await new Promise(r => gate.closeAllConnections?.() || r()); await new Promise(r => gate.close(r)); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('device session: one login, 180 day sliding session, still revocable', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-device-test-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [alice, bob] = store.add(['Alice', 'Bob']);
+  const driver = {maxRunning: 2, status: async () => ({status: 'running'}), start: async () => {}, backend: async () => { throw new Error('no backend'); }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false});
+  let active = true;
+  app.sso.permissions = async () => { if (!active) { const e = new Error('账号权限已失效'); e.status = 401; throw e; } return {role: 'student', students: [], allowed: new Set()}; };
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const DAY = 86400000, call = (url, body, cookie, extra = {}) => fetch(origin + url, {method: 'POST', headers: {'Content-Type': 'application/json', ...(cookie ? {Cookie: cookie} : {}), ...extra}, body: JSON.stringify(body)});
+  const ssoLogin = w => { const res = {headers: {}, setHeader(k, v) { this.headers[k] = v; }}; app.login(res, 'student', w, {issuer: 'classroom', tenant: 't', subject: w.id}); return res.headers['Set-Cookie']; };
+  const tokenOf = c => c.match(/dcw_student=([a-f0-9]+)/)[1];
+  const sessionOf = c => app.sessions.get(createHash('sha256').update(tokenOf(c)).digest('hex'));
+  const dev = id => `/w/${id}/_device/session`, probe = (id, cookie) => fetch(origin + `/w/${id}/_dct/presence`, {headers: {Cookie: cookie}});
+  try {
+    const old = ssoLogin(alice), oldCookie = old.split(';')[0];
+    assert.ok(Math.abs(sessionOf(old).expires - (Date.now() + 8 * 3600000)) < 5000);
+    assert.ok(!sessionOf(old).device);
+    // 1. upgrade
+    const r = await call(dev(alice.id), {client: 'dc-android'}, oldCookie);
+    assert.equal(r.status, 200);
+    const sc = r.headers.get('set-cookie'), body = await r.json();
+    assert.match(sc, /Max-Age=15552000/); assert.match(sc, /Path=\/w\/[a-f0-9]+\//); assert.match(sc, /HttpOnly/); assert.match(sc, /SameSite=Strict/);
+    const newCookie = sc.split(';')[0];
+    assert.notEqual(newCookie, oldCookie);
+    assert.ok(!JSON.stringify(body).includes(tokenOf(sc)));
+    assert.equal(body.ok, true); assert.ok(Math.abs(body.expiresAt - (Date.now() + 180 * DAY)) < 5000);
+    const s = sessionOf(sc); assert.equal(s.device, true); assert.ok(s.external); assert.ok(Math.abs(s.expires - (Date.now() + 180 * DAY)) < 5000);
+    assert.equal((await probe(alice.id, oldCookie)).status, 401);
+    assert.equal((await probe(alice.id, newCookie)).status, 200);
+    // 2. already device: same token, expires renewed
+    s.expires = Date.now() + 100 * DAY;
+    const r2 = await call(dev(alice.id), {client: 'dc-android'}, newCookie);
+    assert.equal(r2.status, 200); assert.equal(r2.headers.get('set-cookie').split(';')[0], newCookie); assert.match(r2.headers.get('set-cookie'), /Max-Age=15552000/);
+    assert.ok(Math.abs(s.expires - (Date.now() + 180 * DAY)) < 5000);
+    // 3. rejects
+    assert.equal((await call(dev(alice.id), {client: 'dc-android'})).status, 401);
+    const bobCookie = ssoLogin(bob).split(';')[0];
+    assert.equal((await call(dev(alice.id), {client: 'dc-android'}, bobCookie)).status, 401);
+    assert.equal((await call(dev(alice.id), {client: 'other'}, newCookie)).status, 400);
+    assert.equal((await call(dev(alice.id), {client: 'dc-android'}, newCookie, {Origin: 'https://evil.example'})).status, 403);
+    // 4. sliding renewal on ordinary request
+    s.expires = Date.now() + 10 * DAY;
+    assert.equal((await probe(alice.id, newCookie)).status, 200);
+    assert.ok(Math.abs(s.expires - (Date.now() + 180 * DAY)) < 5000);
+    // persistence throttled to once a day
+    let saves = 0; const save = store.save.bind(store); store.save = () => { saves++; save(); };
+    app.persistedAt.set(s.key, Date.now()); s.expires = Date.now() + 10 * DAY; await probe(alice.id, newCookie); await probe(alice.id, newCookie);
+    assert.equal(saves, 0);
+    app.persistedAt.set(s.key, Date.now() - 2 * DAY); s.expires = Date.now() + 10 * DAY; await probe(alice.id, newCookie); await probe(alice.id, newCookie);
+    assert.equal(saves, 1);
+    assert.ok(store.data.sessions.find(x => x.key === s.key).expires > Date.now() + 179 * DAY);
+    store.save = save;
+    // 5. revocation
+    active = false;
+    assert.equal((await probe(alice.id, newCookie)).status, 401);
+    active = true;
+    assert.equal((await probe(alice.id, newCookie)).status, 200);
+    app.revoke(alice);
+    assert.equal((await probe(alice.id, newCookie)).status, 401);
+    const c3 = (await (await call(dev(bob.id), {client: 'dc-android'}, bobCookie)).headers).get('set-cookie').split(';')[0];
+    bob.disabled = true;
+    assert.equal((await probe(bob.id, c3)).status, 403);
+    bob.disabled = false; bob.generation++;
+    assert.equal((await probe(bob.id, c3)).status, 401);
+  } finally { await app.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('device session: per-workspace rate limit, SSO only, eviction keeps device sessions, persistedAt pruned', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-device2-test-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const ws = store.add(Array.from({length: 25}, (_, i) => 'S' + i));
+  const app = new Classroom({store, driver: {maxRunning: 2, status: async () => ({status: 'running'})}, origin: 'http://localhost', secure: false});
+  app.sso.permissions = async () => ({role: 'student', students: [], allowed: new Set()});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const call = (id, cookie) => fetch(`${origin}/w/${id}/_device/session`, {method: 'POST', headers: {'Content-Type': 'application/json', Cookie: cookie}, body: JSON.stringify({client: 'dc-android'})});
+  const login = (w, external) => { const res = {headers: {}, setHeader(k, v) { this.headers[k] = v; }}; app.login(res, 'student', w, external); return res.headers['Set-Cookie'].split(';')[0]; };
+  try {
+    for (const w of ws) assert.equal((await call(w.id, login(w, {issuer: 'classroom', tenant: 't', subject: w.id}))).status, 200);
+    const local = await call(ws[0].id, login(ws[0]));
+    assert.equal(local.status, 403); assert.equal((await local.json()).error, '请用学校账号登录后再试');
+    // eviction: non-device first, device last
+    const devKeys = [...app.sessions.values()].filter(x => x.device).map(x => x.key);
+    assert.equal(devKeys.length, 25);
+    for (let i = 0; i < 10000; i++) app.sessions.set('n' + i, {key: 'n' + i, role: 'student', student: 'x', generation: 1, expires: Date.now() + 1e9});
+    app.persistSessions();
+    assert.equal(app.sessions.size, 10000);
+    for (const k of devKeys) assert.ok(app.sessions.has(k));
+    assert.ok(!app.sessions.has('n0'));
+    // persistedAt pruned with deleted sessions
+    app.revoke(ws[0]);
+    for (const k of app.persistedAt.keys()) assert.ok(app.sessions.has(k));
+  } finally { await app.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+// ---- 平板视频与空闲：工作区停着的明确回答、空闲自动停、按格式转写 ----
+async function idleFixture({status = 'running', shared = false} = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-idle-test-'));
+  const state = {health: {activeTurns: 0, lastActivityAt: 0}, healthStatus: 200, healthSeen: 0, gate: null};
+  const backend = http.createServer((req, res) => {
+    if (req.url.startsWith('/_dct/authoring/v1/health')) {
+      state.healthSeen++; state.gate = req.headers.cookie;
+      res.writeHead(state.healthStatus, {'Content-Type': 'application/json'});
+      return res.end(JSON.stringify(state.health));
+    }
+    res.setHeader('Content-Type', 'application/json'); res.end('{}');
+  });
+  // 终端 websocket：只回 101，够让课堂服务把连接接上。
+  backend.on('upgrade', (req, socket) => { socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'); socket.on('error', () => {}); socket.on('end', () => socket.end()); });
+  await new Promise(r => backend.listen(0, '127.0.0.1', r));
+  const port = backend.address().port;
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  if (shared) ming.shared = true;
+  const driver = {maxRunning: 2, status: async () => ({status: driver.state}), state: status, stops: 0, starts: 0,
+    start: async () => { driver.starts++; }, stop: async () => { driver.stops++; },
+    // 容器里 dct 守护进程的会话和直播。默认：一个闲着的 claude，没在播。
+    sessions: [{id: 1, profile: 'claude', state: 'Idle'}], live: null, rpcFail: false,
+    rpc: async (_, request) => {
+      if (driver.rpcFail) throw new Error('无法读取运行会话，请稍后重试');
+      if (request === 'List') return {Sessions: driver.sessions};
+      if (request === 'LiveStatus') return {Live: driver.live};
+      return {};
+    },
+    backend: async () => { if (driver.state !== 'running') throw Object.assign(new Error('工作区尚未启动'), {code: 'workspace_stopped'}); return {port, apiPort: port, token: 'GATE'}; }};
+  const app = new Classroom({store, driver, origin: 'http://localhost', secure: false});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${app.server.address().port}`;
+  const login = await fetch(`${origin}/w/${ming.id}/login`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: ming.token})});
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  const call = (p, method = 'GET', extra = {}) => fetch(`${origin}/w/${ming.id}${p}`, {method, headers: {Cookie: cookie, 'Content-Type': 'application/json', ...extra}, body: method === 'POST' ? '{}' : undefined});
+  const close = async () => { await app.close(); backend.close(); fs.rmSync(dir, {recursive: true, force: true}); };
+  return {app, driver, store, ming, state, call, cookie, close, origin};
+}
+const MIN = 60000;
+
+test('工作区停着：经代理访问一律 409 workspace_stopped，其他 409 不变', async () => {
+  const f = await idleFixture({status: 'stopped'});
+  try {
+    const r = await f.call('/_dct/authoring/v1/health');
+    assert.equal(r.status, 409);
+    assert.deepEqual(await r.json(), {error: '工作区在休息', code: 'workspace_stopped'});
+    // 名额已满之类的 /start 失败，body 不带 code。
+    f.driver.start = async () => { throw new Error('当前运行名额已满，请联系老师结束其他工作区后再试'); };
+    const full = await f.call('/start', 'POST');
+    assert.equal(full.status, 409);
+    assert.deepEqual(await full.json(), {error: '当前运行名额已满，请联系老师结束其他工作区后再试'});
+  } finally { await f.close(); }
+});
+
+test('reapIdle：空闲 20 分钟停，不吊销会话，记审计', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    assert.deepEqual(await f.app.reapIdle(t0), [], '刚见到的工作区把活动时间记为现在');
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    assert.deepEqual(await f.app.reapIdle(t0 + 30 * MIN), [f.ming.id]);
+    assert.equal(f.driver.stops, 1);
+    assert.equal(f.state.gate, 'dct_gate=GATE');
+    assert.equal(f.store.data.audit[0].action, '空闲自动停止');
+    // 会话还在：同一个 cookie 还能叫醒。
+    const again = await f.call('/start', 'POST');
+    assert.equal(again.status, 200); assert.equal(f.driver.starts, 1);
+  } finally { await f.close(); }
+});
+
+test('reapIdle：拿不准就不停', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now(), later = t0 + 30 * MIN;
+    await f.app.reapIdle(t0);
+    const idle = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    const notStopped = async why => { assert.deepEqual(await f.app.reapIdle(later), [], why); assert.equal(f.driver.stops, 0, why); };
+    f.state.health = {...idle, activeTurns: 1}; await notStopped('进行中的一轮');
+    f.state.health = {...idle, lastActivityAt: later - 5 * MIN}; await notStopped('云端 5 分钟前还有活动');
+    f.state.health = idle; f.state.healthStatus = 500; await notStopped('health 500');
+    f.state.healthStatus = 200;
+    f.state.health = {activeTurns: 0}; await notStopped('缺 lastActivityAt');
+    f.state.health = {lastActivityAt: t0 - 30 * MIN}; await notStopped('缺 activeTurns');
+    f.state.health = idle;
+    // 终端连接
+    const conn = {student: f.ming.id, session: {role: 'student', key: 'k'}, socket: {destroy() {}}};
+    f.app.connections.add(conn); await notStopped('有终端连接'); f.app.connections.delete(conn);
+    // 协助租约
+    f.app.assistance.set(f.ming.id, {owner: 'x', expires: later + MIN}); await notStopped('有协助'); f.app.assistance.delete(f.ming.id);
+    // 共享的旧容器
+    f.ming.shared = true; await notStopped('共享容器'); f.ming.shared = false;
+    // 能停的基线确认：以上都撤掉就停。
+    assert.deepEqual(await f.app.reapIdle(later), [f.ming.id]);
+  } finally { await f.close(); }
+});
+
+test('reapIdle：10 分钟前发过一句话就不停；events 和 health 的 GET 不算活动', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    // 只有 events 和 health 的 GET：仍然是空闲。
+    await f.call('/_dct/authoring/v1/events'); await f.call('/_dct/authoring/v1/health');
+    assert.deepEqual(await f.app.reapIdle(t0 - 10 * MIN), [f.ming.id], '那两种 GET 不刷新活动时间');
+    f.driver.stops = 0;
+    // 一次 POST messages 算活动。
+    const post = await f.call('/_dct/authoring/v1/projects/p1/messages', 'POST', {Origin: 'http://localhost'});
+    assert.equal(post.status, 200);
+    assert.deepEqual(await f.app.reapIdle(Date.now() + 10 * MIN), []);
+    assert.equal(f.driver.stops, 0);
+  } finally { await f.close(); }
+});
+
+test('reapIdle：读 health 期间有新请求就不停；同时只跑一次', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    const orig = f.app.activity.get(f.ming.id);
+    assert.ok(orig, '活动时间已记录');
+    // 在 health 返回前塞一次活动。
+    const prev = f.app.readHealth;
+    f.app.readHealth = async (...a) => { const h = await prev.apply(f.app, a); f.app.activity.set(f.ming.id, Date.now()); return h; };
+    const first = f.app.reapIdle(t0 + 30 * MIN);
+    const second = await f.app.reapIdle(t0 + 30 * MIN);
+    assert.deepEqual(second, [], '上一次还没跑完就跳过');
+    assert.deepEqual(await first, []);
+    assert.equal(f.driver.stops, 0);
+  } finally { await f.close(); }
+});
+
+test('转写：按录音格式给上游文件名，其他格式 415', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-stt-name-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const [ming] = store.add(['小明']);
+  const names = [];
+  const gateway = http.createServer(async (req, res) => {
+    const chunks = []; for await (const c of req) chunks.push(c);
+    names.push(Buffer.concat(chunks).toString('latin1').match(/filename="([^"]*)"/)?.[1]);
+    res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({text: '好'}));
+  });
+  await new Promise(r => gateway.listen(0, '127.0.0.1', r));
+  const app = new Classroom({store, driver: {status: async () => ({status: 'running'})}, origin: 'http://localhost', secure: false, stt: {url: `http://127.0.0.1:${gateway.address().port}`, key: 'K'}});
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${app.server.address().port}/w/${ming.id}`;
+  try {
+    const login = await fetch(base + '/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: ming.token})});
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    const speak = type => fetch(base + '/_dct/transcribe', {method: 'POST', headers: {'Content-Type': type, Cookie: cookie}, body: Buffer.alloc(64, 1)});
+    for (const type of ['audio/mp4', 'audio/webm;codecs=opus', 'audio/ogg']) assert.equal((await speak(type)).status, 200, type);
+    assert.deepEqual(names, ['speech.m4a', 'speech.webm', 'speech.ogg']);
+    const bad = await speak('video/x-flv');
+    assert.equal(bad.status, 415);
+    assert.deepEqual(await bad.json(), {error: '这种录音格式用不了'});
+    assert.equal(names.length, 3, '不支持的格式不转给上游');
+  } finally { await app.close(); gateway.close(); fs.rmSync(dir, {recursive: true, force: true}); }
+});
+
+test('reapIdle 正在停的时候：请求得到 workspace_stopped，/start 等停完再正常启动', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    let release; const gate = new Promise(r => { release = r; });
+    let entered; const inStop = new Promise(r => { entered = r; });
+    f.driver.stop = async () => { f.driver.stops++; entered(); await gate; f.driver.state = 'stopped'; };
+    const reaping = f.app.reapIdle(t0 + 30 * MIN);
+    await inStop;
+    for (const p of ['/_dct/authoring/v1/projects/p/messages']) {
+      const r = await f.call(p, 'POST', {Origin: 'http://localhost'});
+      assert.equal(r.status, 409, p);
+      assert.deepEqual(await r.json(), {error: '工作区在休息', code: 'workspace_stopped'});
+    }
+    let started = false;
+    const start = f.call('/start', 'POST').then(r => { started = true; return r; });
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(started, false, '/start 在停完之前不会返回');
+    release();
+    assert.deepEqual(await reaping, [f.ming.id]);
+    assert.equal((await start).status, 200);
+    assert.equal(f.driver.starts, 1);
+    assert.equal(f.app.stopping.size, 0);
+  } finally { await f.close(); }
+});
+
+test('reapIdle：终端里的 agent 在干活/在问、问不出会话、在直播、公开直播，都不停', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now(), later = t0 + 30 * MIN;
+    await f.app.reapIdle(t0);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    const notStopped = async why => { assert.deepEqual(await f.app.reapIdle(later), [], why); assert.equal(f.driver.stops, 0, why); };
+    const idle = f.driver.sessions;
+    f.driver.sessions = [...idle, {id: 2, profile: 'claude', state: 'Working'}]; await notStopped('终端里的 claude 在干活');
+    f.driver.sessions = [{id: 2, profile: 'codex', state: 'Asking'}]; await notStopped('终端里的 agent 在等回答');
+    f.driver.sessions = idle;
+    f.driver.rpcFail = true; await notStopped('问不出会话'); f.driver.rpcFail = false;
+    f.driver.sessions = undefined; await notStopped('会话列表格式不对'); f.driver.sessions = idle;
+    f.driver.live = {id: 'room1', url: 'https://live.example/live/room1', viewers: 3}; await notStopped('正在直播'); f.driver.live = null;
+    f.ming.livePublic = {title: '我的作品', id: 'room1'}; await notStopped('公开直播'); delete f.ming.livePublic;
+    // 基线：全都闲着，停一次。
+    assert.deepEqual(await f.app.reapIdle(later), [f.ming.id]);
+    assert.equal(f.driver.stops, 1);
+  } finally { await f.close(); }
+});
+
+test('reapIdle：关掉终端页算一次活动', async () => {
+  const f = await idleFixture();
+  try {
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    const {port} = f.app.server.address();
+    const socket = net.connect(port, '127.0.0.1');
+    const opened = new Promise((resolve, reject) => { let got = ''; socket.on('data', d => { got += d; if (got.includes('\r\n\r\n')) resolve(got); }); socket.on('error', reject); });
+    socket.write(`GET /w/${f.ming.id}/ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nCookie: ${f.cookie}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n`);
+    assert.match(await opened, /^HTTP\/1.1 101/);
+    assert.equal(f.app.connections.size, 1);
+    const closedAt = Date.now();
+    socket.destroy();
+    for (let i = 0; i < 50 && f.app.connections.size; i++) await new Promise(r => setTimeout(r, 10));
+    assert.equal(f.app.connections.size, 0);
+    assert.ok(f.app.activity.get(f.ming.id) >= closedAt, '关掉终端刷新活动时间');
+    assert.deepEqual(await f.app.reapIdle(Date.now() + 10 * MIN), [], '刚关掉终端不停');
+    assert.equal(f.driver.stops, 0);
+  } finally { await f.close(); }
+});
+
+test('空闲分钟数：小于 5 按 5，不是数字按 20', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dcw-idle-min-'));
+  const store = new Store(dir, {password: 'test-admin'});
+  const make = idleMinutes => new Classroom({store, driver: {status: async () => ({status: 'running'})}, origin: 'http://localhost', secure: false, idleMinutes});
+  const prev = process.env.CLASSROOM_IDLE_MINUTES;
+  const apps = [];
+  try {
+    for (const [given, want] of [[1, 5], [0, 5], [-3, 5], ['2', 5], [4.9, 5], [5, 5], [30, 30], ['abc', 20], [NaN, 20], ['', 20], [' ', 20]]) {
+      const app = make(given); apps.push(app);
+      assert.equal(app.idleMs, want * MIN, String(given));
+    }
+    process.env.CLASSROOM_IDLE_MINUTES = '2';
+    const env2 = make(undefined); apps.push(env2); assert.equal(env2.idleMs, 5 * MIN, 'env 2');
+    process.env.CLASSROOM_IDLE_MINUTES = 'soon';
+    const envBad = make(undefined); apps.push(envBad); assert.equal(envBad.idleMs, 20 * MIN, 'env 不是数字');
+  } finally {
+    if (prev === undefined) delete process.env.CLASSROOM_IDLE_MINUTES; else process.env.CLASSROOM_IDLE_MINUTES = prev;
+    for (const app of apps) await app.close();
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+test('reapIdle 正在停的时候：语音转写照样由课堂服务接住，发话仍然 workspace_stopped', async () => {
+  const gateway = http.createServer(async (req, res) => { for await (const _ of req); res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({text: '画一只猫'})); });
+  await new Promise(r => gateway.listen(0, '127.0.0.1', r));
+  const f = await idleFixture();
+  try {
+    f.app.stt = {...f.app.stt, url: `http://127.0.0.1:${gateway.address().port}`, key: 'K'};
+    const t0 = Date.now();
+    await f.app.reapIdle(t0 - 40 * MIN);
+    f.state.health = {activeTurns: 0, lastActivityAt: t0 - 30 * MIN};
+    let release; const gate = new Promise(r => { release = r; });
+    let entered; const inStop = new Promise(r => { entered = r; });
+    f.driver.stop = async () => { f.driver.stops++; entered(); await gate; f.driver.state = 'stopped'; };
+    const reaping = f.app.reapIdle(t0 + 30 * MIN);
+    await inStop;
+    const said = await fetch(`${f.origin}/w/${f.ming.id}/_dct/transcribe`, {method: 'POST', headers: {Cookie: f.cookie, 'Content-Type': 'audio/mp4'}, body: Buffer.alloc(64, 1)});
+    assert.equal(said.status, 200);
+    assert.deepEqual(await said.json(), {text: '画一只猫'});
+    const msg = await f.call('/_dct/authoring/v1/projects/p/messages', 'POST', {Origin: 'http://localhost'});
+    assert.equal(msg.status, 409);
+    assert.deepEqual(await msg.json(), {error: '工作区在休息', code: 'workspace_stopped'});
+    release();
+    assert.deepEqual(await reaping, [f.ming.id]);
+  } finally { await f.close(); gateway.close(); }
 });

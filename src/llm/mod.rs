@@ -17,6 +17,10 @@ pub struct Prompt {
     pub system: String,
     pub user: String,
     pub max_tokens: u32,
+    /// 可选的一张 PNG（base64）。只有 HTTP 的两种线格式会带上；命令行后端忽略它。
+    pub image_png_base64: Option<String>,
+    /// 那张图的 MIME 类型；`None` 就是 `image/png`。
+    pub image_mime: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,8 +32,35 @@ pub enum LlmError {
     Malformed,
 }
 
+/// 一次调用用掉的 token 数（输入、输出）。读不到就是 `None`，不是 0。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+}
+
 pub trait Backend: Send + Sync {
     fn complete(&self, p: &Prompt) -> Result<String, LlmError>;
+
+    /// 带用量的调用。默认不带用量（命令行后端读不到）；HTTP 后端重写它。
+    fn complete_counted(&self, p: &Prompt) -> Result<(String, Option<Usage>), LlmError> {
+        self.complete(p).map(|s| (s, None))
+    }
+}
+
+pub fn complete_counted_with_timeout(
+    b: Arc<dyn Backend>,
+    p: Prompt,
+    d: Duration,
+) -> Result<(String, Option<Usage>), LlmError> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(b.complete_counted(&p));
+    });
+    match rx.recv_timeout(d) {
+        Ok(r) => r,
+        Err(_) => Err(LlmError::Timeout),
+    }
 }
 
 /// 在工作线程上跑，最多等 `d`。
@@ -78,6 +109,7 @@ mod tests {
             system: "s".into(),
             user: "u".into(),
             max_tokens: 64,
+            image_png_base64: None, image_mime: None,
         }
     }
 
@@ -111,5 +143,32 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "调用方没有及时放手"
         );
+    }
+
+    #[test]
+    fn complete_counted_default_has_no_usage_and_the_same_text() {
+        let b = Fixed(Ok("hi".into()));
+        let p = Prompt {
+            system: String::new(),
+            user: String::new(),
+            max_tokens: 1,
+            image_png_base64: None, image_mime: None,
+        };
+        assert_eq!(b.complete_counted(&p), Ok(("hi".to_string(), None)));
+    }
+
+    #[test]
+    fn complete_counted_with_timeout_times_out_like_the_plain_one() {
+        let r = complete_counted_with_timeout(
+            Arc::new(Slow(Duration::from_millis(300))),
+            Prompt {
+                system: String::new(),
+                user: String::new(),
+                max_tokens: 1,
+                image_png_base64: None, image_mime: None,
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(r, Err(LlmError::Timeout));
     }
 }

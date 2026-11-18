@@ -431,6 +431,36 @@ impl PtySession {
         Ok(())
     }
 
+    /// 这个终端此刻是不是「按一个键收一个键」的样子（agent 已经接管了键盘）。
+    ///
+    /// agent 刚起来、还没把终端切到它自己的模式之前，终端还是「一行一行收」的：
+    /// 这时打进去的回车会被换成换行，字攒在终端里等 agent 来读——读到时
+    /// 回车已经变了样（codex 把它当成「换行」而不是「发送」），或者干脆被
+    /// agent 启动时清掉。所以 dct 替用户打字之前要先看这一眼。
+    ///
+    /// Unix 上看终端的 ICANON 位（主端查到的就是从端的设置，macOS、Linux 都
+    /// 实测过，见下面的测试）。问不到（没有 fd、调用失败）和 Windows（ConPTY
+    /// 没有这回事）一律答「是」：只剩时间那条规矩兜着，不会因此永远不打。
+    pub fn accepts_keys(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let Some(fd) = self._master.as_raw_fd() else {
+                return true;
+            };
+            // SAFETY: `termios` 是纯数据结构，全零是合法初值；`fd` 来自我们
+            // 自己持有的主端，活得比这次调用长。
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+                return true;
+            }
+            t.c_lflag & libc::ICANON == 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
     pub fn process_id(&self) -> Option<u32> {
         self.child
             .lock()
@@ -908,6 +938,33 @@ mod tests {
     use super::*;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
+
+    /// 主端上查到的 ICANON 跟着从端走：agent 把终端切成 raw 之后才算
+    /// 「接得住按键」，一直停在行模式的进程不算。macOS 上实测过。
+    #[test]
+    #[cfg(unix)]
+    fn accepts_keys_follows_the_programs_terminal_mode() {
+        let env = std::collections::BTreeMap::new();
+        let cwd = std::env::temp_dir();
+        let line = PtySession::spawn(&["sleep".to_string(), "5".to_string()], &env, &cwd, 24, 80)
+            .unwrap();
+        let raw = PtySession::spawn(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "stty raw -echo; echo READY; sleep 5".to_string(),
+            ],
+            &env,
+            &cwd,
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_for(&raw, "READY"));
+        sleep(Duration::from_millis(100));
+        assert!(!line.accepts_keys(), "还在行模式的终端不该算接得住按键");
+        assert!(raw.accepts_keys(), "切成 raw 之后应该算接得住按键");
+    }
 
     fn wait_for(p: &PtySession, needle: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1574,11 +1631,13 @@ mod tests {
         assert_eq!(st.max, 0, "备用屏上没有历史，这跟真实终端一致");
     }
 
-    /// 程序设了滚动区（DECSTBM）之后，vt100 不往 scrollback 里塞任何东西
-    /// （grid.rs:551）。这不是我们能改的，但界面要能认出「这里翻不了」
-    /// 而不是让用户对着一个没反应的滚轮猜。
+    /// 滚动区从第一行开始时，滚出屏顶的行照样进历史——真实终端（xterm、
+    /// iTerm2、Alacritty）都这么做，codex 的内联模式就靠这个把历史推到画面
+    /// 上方。上游 vt100 在任何滚动区下都把这些行扔掉，dct 里于是翻不到 codex
+    /// 的输出；`vendor/vt100` 的补丁改的就是这一条。Windows 上 ConPTY 本来就
+    /// 把滚动区解释掉了，两个平台在这里给同一个答案。
     #[test]
-    fn a_scroll_region_swallows_the_history() {
+    fn a_scroll_region_from_the_top_row_keeps_the_history() {
         let dir = tempfile::tempdir().unwrap();
         let p = PtySession::spawn(
             &crate::sys::testing::sh_c(
@@ -1592,24 +1651,38 @@ mod tests {
         )
         .unwrap();
         assert!(wait_for(&p, "rgn-60"));
+        assert!(
+            p.scroll_state().max > 0,
+            "滚动区从第一行开始，滚出去的行应该留在历史里"
+        );
+    }
 
-        // 这一条两个平台的答案不一样，而且**不一样是对的**。
-        //
-        // Unix 上我们读到的是程序写出来的原始字节流，DECSTBM 原样到达
-        // vt100，于是它照规矩不往 scrollback 里放东西——历史就是没有。
-        //
-        // Windows 上中间隔着 ConPTY：滚动区是 conhost 自己解释掉的，它按
-        // 那个区域算好版面，再把结果重新渲染成一串普通的输出发给我们。
-        // 我们这头的 vt100 从头到尾没见过 DECSTBM，看到的只是一行行普通
-        // 文字，于是历史照常攒下来。
-        //
-        // 对用户来说 Windows 这边反而更好（真的翻得动）。会因此在 Windows
-        // 上失灵的是「这个程序自己管画面，翻不了」那句提示的**这一个**触发
-        // 条件；另一个条件——备用屏——是照常穿透 ConPTY 的，见
-        // `an_alternate_screen_app_has_no_history_to_scroll`，那条在两个平台
-        // 上都绿。
+    /// 滚动区不从第一行开始（顶上有一块固定的标题栏）时，滚走的行只是区域
+    /// 内部的挪动，不是「滚出屏幕」——真实终端也不把它们放进历史。
+    ///
+    /// Unix 上我们读到的是原始字节流，DECSTBM 原样到达 vt100，于是没有历史。
+    /// Windows 上中间隔着 ConPTY：滚动区是 conhost 自己解释掉的，它把结果
+    /// 重新渲染成一行行普通输出发给我们，于是历史照常攒下来。会因此在
+    /// Windows 上失灵的只是「这个程序自己管画面，翻不了」那句提示的这一个
+    /// 触发条件；另一个条件——备用屏——照常穿透 ConPTY，见
+    /// `an_alternate_screen_app_has_no_history_to_scroll`。
+    #[test]
+    fn a_scroll_region_below_a_fixed_header_swallows_the_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = PtySession::spawn(
+            &crate::sys::testing::sh_c(
+                "printf '\\033[3;20r'; i=1; while [ $i -le 60 ]; do echo rgn-$i; \
+                 i=$((i+1)); done; sleep 30",
+            ),
+            &Default::default(),
+            dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(wait_for(&p, "rgn-60"));
         #[cfg(unix)]
-        assert_eq!(p.scroll_state().max, 0, "设了滚动区就不该有历史");
+        assert_eq!(p.scroll_state().max, 0, "滚动区不在顶上，不该有历史");
         #[cfg(windows)]
         assert!(
             p.scroll_state().max > 0,

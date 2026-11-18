@@ -75,6 +75,10 @@ fn test_shell_profile() -> Profile {
         label: Default::default(),
         note: Default::default(),
         resume_args: Default::default(),
+        session_id_args: Default::default(),
+        resume_id_args: Default::default(),
+        conversation_file: Default::default(),
+        conversation_file_key: Default::default(),
         pairable: false,
         backend_only: false,
     }

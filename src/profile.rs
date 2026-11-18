@@ -82,6 +82,9 @@ pub struct LoginSpec {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeadlessSpec {
     pub command: Vec<String>,
+    /// 只在这次调用带图片时才追加的参数（claude：放开 Read 工具去读图片文件）。
+    #[serde(default)]
+    pub image_args: Vec<String>,
 }
 
 /// HTTP 端点说的是哪种话。
@@ -170,6 +173,51 @@ pub struct Profile {
     /// 那一份对话，所以一组里只有最近活跃的那一个才会真的带上这些参数。
     #[serde(default)]
     pub resume_args: Vec<String>,
+    /// 开会话时交给 agent 的「用这个对话 id」参数，`{id}` 由 dct 换成它
+    /// 生成的 UUID。**只给实测过的 profile 写**，理由同 `resume_args`。
+    /// 声明了它，dct 才记得住这个会话是哪一段对话，重启后才能各接各的——
+    /// 不再靠 `--continue` 按目录去猜（同目录多个会话时只接得回一个）。
+    #[serde(default)]
+    pub session_id_args: Vec<String>,
+    /// 重启后按 id 接回那段对话的参数，`{id}` 同上。
+    #[serde(default)]
+    pub resume_id_args: Vec<String>,
+    /// agent 自己为每个在跑的进程写的那份小文件，里面记着它此刻的对话 id。
+    /// 开头的 `~/` 是家目录，`{pid}` 换成 agent 的进程号（claude 是
+    /// `~/.claude/sessions/{pid}.json`）。dct 每次写 `last-sessions.toml`
+    /// 时去读一下，记住 agent 此刻真正在用的那段对话：走 `--continue` 接回的
+    /// 会话由此也有了 id，在 agent 里换了对话（`/clear`、`/resume`）也跟得上。
+    ///
+    /// 这类文件多半不是公开约定，读不到、对不上就照旧用手上的 id，见
+    /// `conversation_id::read_from_file`。**只给实测过的 profile 写**。
+    #[serde(default)]
+    pub conversation_file: String,
+    /// 上面那份文件里装对话 id 的 JSON 键（claude 是 `sessionId`）。
+    /// 跟 `conversation_file` 两个都写了才读，见 `learns_conversation_from_file`。
+    #[serde(default)]
+    pub conversation_file_key: String,
+}
+
+/// 把参数里的 `{id}` 换成真正的 id。
+pub fn fill_id(args: &[String], id: &str) -> Vec<String> {
+    args.iter().map(|a| a.replace("{id}", id)).collect()
+}
+
+impl Profile {
+    /// 两个都声明了才算「能按 id 接回」：只会指定不会接回，或者反过来，
+    /// 都接不回同一段对话。
+    pub fn resumes_by_id(&self) -> bool {
+        !self.session_id_args.is_empty() && !self.resume_id_args.is_empty()
+    }
+
+    /// 要不要去 agent 自己的文件里读对话 id：`conversation_file` 和
+    /// `conversation_file_key` 都写了，而且能按 id 接回——接不回的话读回来
+    /// 也没处用。
+    pub fn learns_conversation_from_file(&self) -> bool {
+        self.resumes_by_id()
+            && !self.conversation_file.is_empty()
+            && !self.conversation_file_key.is_empty()
+    }
 }
 
 const DC: &str = include_str!("../profiles/dc.toml");
@@ -1112,6 +1160,69 @@ mod tests {
             .is_match("(12s • esc to interrupt)"));
     }
 
+    /// codex v0.163.0 真截屏（2026-10-15，默认全屏和 `--no-alt-screen` 两种）：
+    /// 干活时的几种样子都要认成忙，空闲时（含启动 logo、输入框里有字）都不能。
+    #[test]
+    fn codex_busy_pattern_matches_real_v0_163_screens() {
+        let re = Profile::builtin("codex")
+            .unwrap()
+            .busy_regex()
+            .unwrap()
+            .unwrap();
+        let busy = [
+            (
+                "default-busy",
+                include_str!("../tests/fixtures/codex-0.163/default-busy.txt"),
+            ),
+            (
+                "default-busy-spinner-only",
+                include_str!("../tests/fixtures/codex-0.163/default-busy-spinner-only.txt"),
+            ),
+            (
+                "default-busy-typed",
+                include_str!("../tests/fixtures/codex-0.163/default-busy-typed.txt"),
+            ),
+            (
+                "inline-busy",
+                include_str!("../tests/fixtures/codex-0.163/inline-busy.txt"),
+            ),
+            (
+                "inline-busy-typed",
+                include_str!("../tests/fixtures/codex-0.163/inline-busy-typed.txt"),
+            ),
+        ];
+        let idle = [
+            (
+                "default-idle-start",
+                include_str!("../tests/fixtures/codex-0.163/default-idle-start.txt"),
+            ),
+            (
+                "default-idle-done",
+                include_str!("../tests/fixtures/codex-0.163/default-idle-done.txt"),
+            ),
+            (
+                "default-idle-typed",
+                include_str!("../tests/fixtures/codex-0.163/default-idle-typed.txt"),
+            ),
+            (
+                "inline-idle-done",
+                include_str!("../tests/fixtures/codex-0.163/inline-idle-done.txt"),
+            ),
+            (
+                "inline-idle-typed",
+                include_str!("../tests/fixtures/codex-0.163/inline-idle-typed.txt"),
+            ),
+        ];
+        for (name, screen) in busy {
+            assert!(re.is_match(screen), "{name} 该认成忙");
+        }
+        for (name, screen) in idle {
+            assert!(!re.is_match(screen), "{name} 该认成空闲");
+        }
+        // 只剩「tab to queue message」那一行（esc 那行被顶掉的那一下）也算忙。
+        assert!(re.is_match("› half typed\n\n  tab to queue message"));
+    }
+
     /// **每个我们知道绕过参数的 agent，profile 里必须真的带着它。**
     ///
     /// 这不是风格问题。dct 敢让 agent 关掉所有权限确认，靠的是每轮之前那张
@@ -1139,6 +1250,19 @@ mod tests {
                 p.command
             );
         }
+    }
+
+    /// codex v0.162.1 起默认走备用屏，自己管翻页，历史不交给 dct——dct 里
+    /// 整页滚动就此失灵（2026-10-15 用户报的）。`--no-alt-screen` 让它回到
+    /// 内联模式，这条测试防止哪天「清理参数」又把它删掉。
+    #[test]
+    fn codex_runs_inline_so_dct_keeps_its_history() {
+        let p = Profile::builtin("codex").unwrap();
+        assert!(
+            p.command.iter().any(|a| a == "--no-alt-screen"),
+            "codex 必须带 --no-alt-screen，否则 dct 翻不到它的历史：{:?}",
+            p.command
+        );
     }
 
     /// opencode 是同一条规矩的另一个形状：它的权限**不在命令行参数上**，
@@ -1537,6 +1661,78 @@ mod tests {
                 "{name}: 恢复方式没实测过，不该编 resume_args"
             );
         }
+    }
+
+    #[test]
+    fn fill_id_replaces_placeholder_only() {
+        let args = vec![
+            "--session-id".to_string(),
+            "{id}".to_string(),
+            "x{id}y".to_string(),
+        ];
+        assert_eq!(fill_id(&args, "abc"), vec!["--session-id", "abc", "xabcy"]);
+    }
+
+    #[test]
+    fn claude_based_profiles_resume_by_id() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api", "qwen", "dc"] {
+            let p = Profile::builtin(name).unwrap();
+            assert_eq!(p.session_id_args, vec!["--session-id", "{id}"], "{name}");
+            assert_eq!(p.resume_id_args, vec!["--resume", "{id}"], "{name}");
+            assert!(p.resumes_by_id(), "{name}");
+        }
+    }
+
+    #[test]
+    fn unverified_profiles_do_not_resume_by_id() {
+        // codex、opencode 开会话时没法指定 id；qwen、dc 已实测，在上面的正向测试里。
+        for name in ["codex", "opencode", "shell"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(
+                p.session_id_args.is_empty() && p.resume_id_args.is_empty(),
+                "{name}"
+            );
+            assert!(!p.resumes_by_id(), "{name}");
+        }
+    }
+
+    /// 跑 claude 二进制、又能按 id 接回的 profile 都去读 claude 自己的
+    /// `~/.claude/sessions/<pid>.json`；跑 qwen 的（qwen、dc）不读——那是别家的文件。
+    #[test]
+    fn claude_binary_profiles_learn_the_conversation_from_its_file() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            assert_eq!(p.command[0], "claude", "{name}");
+            assert_eq!(p.conversation_file, "~/.claude/sessions/{pid}.json", "{name}");
+            assert_eq!(p.conversation_file_key, "sessionId", "{name}");
+            assert!(p.learns_conversation_from_file(), "{name}");
+        }
+        for name in ["dc", "qwen", "codex", "opencode", "shell"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(!p.learns_conversation_from_file(), "{name}");
+        }
+    }
+
+    /// 两个字段缺一个都不算；不能按 id 接回的也不算——读回来也没处用。
+    #[test]
+    fn learning_from_the_file_needs_both_fields_and_resume_by_id() {
+        let base = "name = \"x\"\ncommand = [\"x\"]\n";
+        let ids = "session_id_args = [\"--s\", \"{id}\"]\nresume_id_args = [\"--r\", \"{id}\"]\n";
+        let file = "conversation_file = \"/t/{pid}.json\"\n";
+        let key = "conversation_file_key = \"sessionId\"\n";
+        let p = |s: String| Profile::from_toml(&s).unwrap();
+        assert!(p(format!("{base}{ids}{file}{key}")).learns_conversation_from_file());
+        assert!(!p(format!("{base}{ids}{file}")).learns_conversation_from_file());
+        assert!(!p(format!("{base}{ids}{key}")).learns_conversation_from_file());
+        assert!(!p(format!("{base}{file}{key}")).learns_conversation_from_file());
+        let bare = p(base.to_string());
+        assert!(bare.conversation_file.is_empty() && bare.conversation_file_key.is_empty());
+    }
+
+    #[test]
+    fn profile_without_new_fields_still_parses() {
+        let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\n").unwrap();
+        assert!(p.session_id_args.is_empty() && p.resume_id_args.is_empty());
     }
 
     /// `pairable` 的默认值必须是 `false`：用户自己写的 profile 没提这个

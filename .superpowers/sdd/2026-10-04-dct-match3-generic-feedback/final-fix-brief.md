@@ -1,0 +1,20 @@
+# Final-review fix wave (one dispatch, all findings)
+
+Repo /Users/lei/work/dc/dc-terminal, branch feat/match3-feedback, head a4c2013. Spec: docs/superpowers/specs/2026-10-04-dct-match3-generic-feedback-design.md. Rulings are binding.
+
+## F1 — stale reply (crates/dct-game/src/dco.rs)
+`request()` (~lines 88-92) reads the next line and never checks the reply `id`. After a timed-out call (e.g. OCR `see` > 10 s) the late reply arrives and the next call (e.g. `read_grid`) parses it as its own → "棋盘回复读不懂" → Stop::Dco. Fix: in `request()`, read lines until one whose JSON-RPC `id` equals the id just sent (skip other ids, incl. notifications without id; keep the existing overall timeout semantics so a lost reply still times out). Test in dco_tests.rs: a fake dco that answers request 1 only AFTER the client already timed out and moved on to request 2 — the client must return request 2's own reply. Mutation: removing the id check turns it red.
+
+## F2 — ask once per stall (crates/dct-game/src/play.rs)
+Once `no_progress >= STALL_STEPS` the model is asked on every step. Required: when an ask was triggered ONLY by the stall (not by ask_always or had_failed_here), reset `no_progress = 0` right after that ask (whether the advisor answered or not). Test: with goal_index Some and a flat goal number over 14 steps and an advisor, the model is asked exactly twice (steps 7 and 13) — adjust to the actual first-flag step the existing stall tests pin — and `stalled` is flagged only on those records. Mutation: removing the reset turns it red.
+
+## F3 — locks must not strand the run (play.rs)
+When `cands` is non-empty but every candidate is blocked (pick == None) only because of `locked` cells (some candidate is not an exactly-refused swap on this board), fall back: pick the first candidate that is not exactly refused (`failed` for this board), ignoring `locked`. If every candidate is exactly refused → Stuck as before. MAX_REFUSED_IN_A_ROW still bounds the run. Also the `offered` list for the model keeps excluding locked cells as now. Test: board where the only legal swaps all touch a locked pair but are different swaps → after one refusal the run still tries another swap (swipes.len() ≥ 2) instead of stopping after 1; stops with Stuck only when all are exactly refused. Mutation: removing the fallback turns it red. Existing tests that relied on "all-locked → immediate Stuck" (e.g. the 3x4 board `A` tests): update the assertions to the new behaviour without weakening what they prove; list them in the report.
+
+## F4 — wording/comments
+- play.rs ~line 99 doc comment on `locked`: say locks are cleared when a move succeeds (not "when the board changes").
+- src/game/skill.md ~line 50: the sentence about asking the model must be conditional on `--ask-model`; explain that `--goal-number N` counts the plain numbers read from the screen in the order they appear (first one = 1) and that dct's log (`progress`) shows what it read; remove the redundant clause. Plain Chinese, no jargon.
+- src/main.rs help lines ~33-34 for `dct game play`: list `--ask-model`, `--ask-every-step`, `--goal`, `--goal-number`, `--auto-next`, `--tries` consistently with USAGE in src/game/cli.rs (look at both and make main.rs match).
+
+## Rules
+Commit messages English, NO Co-Authored-By/AI line; do not push. PATH must include $HOME/.cargo/bin; use `cargo +1.99.0 ...` with CARGO_TARGET_DIR=/private/tmp/claude-502/-Users-lei-work-dc-dc-terminal/d52f1f4f-cb49-40cc-ba88-c37403102743/scratchpad/target-199. TDD for each item; `cargo +1.99.0 test --workspace --locked` (known flaky: daemon::web_tests::enabling_starts_a_listener_and_disabling_stops_it, session::tests::recovering_from_a_failure_after_real_input_still_does_not_count — rerun) and `cargo +1.99.0 clippy --workspace --all-targets --locked -- -D warnings` before committing. No subagents. Write the report (changes, RED/GREEN, mutation results, commands + output, any existing tests you had to update) to /Users/lei/work/dc/dc-terminal/.superpowers/sdd/2026-10-04-dct-match3-generic-feedback/final-fix-report.md.

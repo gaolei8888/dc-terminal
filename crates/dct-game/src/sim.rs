@@ -96,8 +96,8 @@ fn swapped(b: &Board, m: Move) -> Board {
     n
 }
 
-/// 只有两格都是糖才能换；换完要么连成线，要么两颗都是特殊糖。不合法返回 `None`。
-pub fn try_move(b: &Board, m: Move) -> Option<Outcome> {
+/// 只有两格都是糖才能换；换完要么连成线，要么（调用方允许时）两颗都是特殊糖。不合法返回 `None`。
+pub fn try_move(b: &Board, m: Move, allow_special_swap: bool) -> Option<Outcome> {
     let both_candy = matches!(b.get(m.a.0, m.a.1), Cell::Candy { .. }) && matches!(b.get(m.b.0, m.b.1), Cell::Candy { .. });
     if !both_candy {
         return None;
@@ -106,7 +106,7 @@ pub fn try_move(b: &Board, m: Move) -> Option<Outcome> {
     let mut board = swapped(b, m);
     let first = find_runs(&board);
     if first.is_empty() {
-        return special_swap.then_some(Outcome { special_swap: true, lowest_row: m.a.0.max(m.b.0), ..Outcome::default() });
+        return (special_swap && allow_special_swap).then_some(Outcome { special_swap: true, lowest_row: m.a.0.max(m.b.0), ..Outcome::default() });
     }
     let mut out = Outcome { special_swap, ..Outcome::default() };
     let mut runs = first;
@@ -175,11 +175,24 @@ pub fn try_move(b: &Board, m: Move) -> Option<Outcome> {
 }
 
 /// 每一列里没消掉的格子落到底，上面补进来的是空（补进来的新糖是什么，谁也不知道）。
-fn gravity(b: &mut Board) {
+/// 「不是糖」的格子（缺口、蜂蜜块）不动，也挡住下落：糖只在同一列里两个这样的格子之间的一段内往下掉。
+pub(crate) fn gravity(b: &mut Board) {
     for c in 0..b.cols {
-        let kept: Vec<Cell> = (0..b.rows).rev().map(|r| b.get(r, c)).filter(|x| *x != Cell::Empty).collect();
-        for (i, r) in (0..b.rows).rev().enumerate() {
-            b.set(r, c, kept.get(i).copied().unwrap_or(Cell::Empty));
+        let mut bottom = b.rows; // 当前这一段的下边界（不含）
+        while bottom > 0 {
+            if b.get(bottom - 1, c) == Cell::Fixed {
+                bottom -= 1;
+                continue;
+            }
+            let mut top = bottom; // 这一段是 [top, bottom)
+            while top > 0 && b.get(top - 1, c) != Cell::Fixed {
+                top -= 1;
+            }
+            let kept: Vec<Cell> = (top..bottom).rev().map(|r| b.get(r, c)).filter(|x| *x != Cell::Empty).collect();
+            for (i, r) in (top..bottom).rev().enumerate() {
+                b.set(r, c, kept.get(i).copied().unwrap_or(Cell::Empty));
+            }
+            bottom = top;
         }
     }
 }

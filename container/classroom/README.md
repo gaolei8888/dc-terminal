@@ -76,3 +76,17 @@ Docker socket。`dcw-classroom.service` 是 dataclue.cn 使用的配置。
 
 发布作品到 ai.tzspace.cn 尚未接入。后续由统一发布服务处理身份、预览、
 版本和发布凭据，agent 可共用发布规则；不向每个 agent 分发站点管理员凭据。
+
+配置 `CLASSROOM_IDLE_MINUTES=<分钟>`（默认 20，不是数字按 20，小于 5 按 5）：学生工作区空闲这么久会被自动停掉（只停
+`dcw-student-*`，不停共享旧容器；每 60 秒检查一次）。以下任一情况都不停：有终端连接、
+老师在协助、这段时间内有过请求（不含创作事件流和 health 的 GET；关掉终端页也算一次活动）、云端 health 报告还有进行中
+的一轮或最近有活动、读不到 health（旧镜像）、容器里 dct 有会话在 Working/Asking 或问不出会话、
+正在直播或公开直播。停的那十几秒里 `/_dct/transcribe` 照常转写（它不进容器）。停止方式同学生“保存并结束”：不吊销会话，平板
+下次用 `/start` 叫醒；工作区停着时，访问 `/w/<id>/_dct/...` 返回
+`409 {"error":"工作区在休息","code":"workspace_stopped"}`。教室服务刚启动时，运行中的工作区
+的活动时间记为“现在”。
+
+语音转写（`/_dct/transcribe`，密钥只在教室服务里）：`CLASSROOM_STT_URL`、`CLASSROOM_STT_KEY`、
+`CLASSROOM_STT_MODEL`（默认 whisper-1）、`CLASSROOM_STT_LANGUAGE`（默认 zh）。systemd 里放在
+`EnvironmentFile=-/etc/dcw-classroom/stt.env`（权限 0600）。接受 `audio/webm`、`audio/mp4`
+（转给上游时文件名 `speech.m4a`）、`audio/ogg`，其他格式返回 415。

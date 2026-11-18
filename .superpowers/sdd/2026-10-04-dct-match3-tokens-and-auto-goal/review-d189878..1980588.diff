@@ -1,0 +1,277 @@
+# Review package: d189878..HEAD
+
+## Commits
+1980588 feat(llm): complete_counted returns token usage from OpenAI and Anthropic style responses; unreadable usage never loses the answer
+
+## Files changed
+ src/llm/http.rs | 91 +++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ src/llm/mod.rs  | 52 +++++++++++++++++++++++++++++++++
+ 2 files changed, 140 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/src/llm/http.rs b/src/llm/http.rs
+index 93e5714..f4699dd 100644
+--- a/src/llm/http.rs
++++ b/src/llm/http.rs
+@@ -1,17 +1,17 @@
+ //! 直连 OpenAI / Anthropic 兼容端点。
+ //!
+ //! 传输层注入，与 `verify.rs` 的 `verify_with` 是同一套路：401 / 网络故障 /
+ //! 输出畸形全都能不打网络地测。
+ 
+ use super::creds::Credential;
+-use super::{Backend, LlmError, Prompt};
++use super::{Backend, LlmError, Prompt, Usage};
+ use crate::profile::Wire;
+ use serde_json::json;
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ /// url + 凭据 + 请求体 → (状态码, 响应体)
+ pub type Sender =
+     dyn Fn(&str, &Credential, &serde_json::Value) -> Result<(u16, String), String> + Send + Sync;
+ 
+ /// 与 `verify::PROBE_TIMEOUT` 同一个理由：**`.timeout()` 和
+@@ -74,20 +74,36 @@ pub fn extract_text(wire: Wire, body: &str) -> Option<String> {
+ }
+ 
+ pub struct HttpBackend {
+     url: String,
+     wire: Wire,
+     model: String,
+     cred: Credential,
+     sender: Arc<Sender>,
+ }
+ 
++/// 读用量：OpenAI 型 `usage.prompt_tokens / completion_tokens`，Anthropic 型 `usage.input_tokens / output_tokens`。
++/// 两个字段都必须是非负整数（JSON 里的 u64）才算读到；缺一个、是字符串、是负数、超出范围都是 `None`——
++/// 读不到用量绝不能丢掉一个好答案，所以这里只返回 `None`，从不报错。
++pub fn extract_usage(wire: Wire, body: &str) -> Option<Usage> {
++    let v: serde_json::Value = serde_json::from_str(body).ok()?;
++    let u = v.get("usage")?;
++    let (a, b) = match wire {
++        Wire::Openai => ("prompt_tokens", "completion_tokens"),
++        Wire::Anthropic => ("input_tokens", "output_tokens"),
++    };
++    Some(Usage {
++        input: u.get(a)?.as_u64()?,
++        output: u.get(b)?.as_u64()?,
++    })
++}
++
+ impl HttpBackend {
+     pub fn new(url: String, wire: Wire, model: String, cred: Credential) -> HttpBackend {
+         HttpBackend {
+             url,
+             wire,
+             model,
+             cred,
+             sender: Arc::new(send_real),
+         }
+     }
+@@ -104,31 +120,36 @@ impl HttpBackend {
+             wire,
+             model,
+             cred,
+             sender,
+         }
+     }
+ }
+ 
+ impl Backend for HttpBackend {
+     fn complete(&self, p: &Prompt) -> Result<String, LlmError> {
++        self.complete_counted(p).map(|(s, _)| s)
++    }
++
++    fn complete_counted(&self, p: &Prompt) -> Result<(String, Option<Usage>), LlmError> {
+         let body = body_for(self.wire, &self.model, p);
+         let (status, text) = (self.sender)(&self.url, &self.cred, &body).map_err(|e| {
+             eprintln!("LLM HTTP 调用失败：{e}");
+             LlmError::Unavailable
+         })?;
+         if !(200..300).contains(&status) {
+             eprintln!("LLM HTTP 返回 {status}");
+             return Err(LlmError::Unavailable);
+         }
+-        // 读不懂 = 没把握。绝不猜一个答案出来。
+-        extract_text(self.wire, &text).ok_or(LlmError::Malformed)
++        // 读不懂 = 没把握。绝不猜一个答案出来；用量读不到不影响答案。
++        let answer = extract_text(self.wire, &text).ok_or(LlmError::Malformed)?;
++        Ok((answer, extract_usage(self.wire, &text)))
+     }
+ }
+ 
+ /// 直连用的 `ureq::Agent`。单独拆出来是为了让 `.timeout_connect()` 这类
+ /// 配置能在不发真实请求的前提下被测试用 `Debug` 输出核实到——同
+ /// `verify.rs` 的 `build_probe_agent`：`send_real` 本身不能被测试调用
+ /// （会打真网络），但构建 `Agent` 这一步不涉及任何 I/O。
+ fn build_http_agent() -> ureq::Agent {
+     crate::sys::tls::agent_builder()
+         .timeout(HTTP_TIMEOUT)
+@@ -380,11 +401,75 @@ mod tests {
+         );
+         b.complete(&p()).unwrap();
+         let (url, cred, body) = seen.lock().unwrap().clone();
+         assert_eq!(url, "https://x/v1/messages");
+         // `Credential` 的 `Debug` 是刻意打码的——比较用 `==`（`Credential`
+         // 派生了 `PartialEq`），断言失败信息里绝不能把明文格式化出来。
+         assert_eq!(cred, Credential::Key("sk-abc".into()));
+         assert_eq!(body["system"], "s");
+         assert!(body["messages"][0].get("system").is_none());
+     }
++
++    #[test]
++    fn usage_is_read_from_openai_and_anthropic_shapes() {
++        let o = r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":120,"completion_tokens":5,"total_tokens":125}}"#;
++        assert_eq!(
++            extract_usage(Wire::Openai, o),
++            Some(Usage {
++                input: 120,
++                output: 5
++            })
++        );
++        let a = r#"{"content":[{"type":"text","text":"2"}],"usage":{"input_tokens":77,"output_tokens":3}}"#;
++        assert_eq!(
++            extract_usage(Wire::Anthropic, a),
++            Some(Usage {
++                input: 77,
++                output: 3
++            })
++        );
++    }
++
++    #[test]
++    fn usage_is_none_when_missing_or_malformed_but_the_answer_still_comes_back() {
++        for body in [
++            r#"{"choices":[{"message":{"content":"2"}}]}"#,
++            r#"{"choices":[{"message":{"content":"2"}}],"usage":null}"#,
++            r#"{"choices":[{"message":{"content":"2"}}],"usage":"many"}"#,
++            r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":"12","completion_tokens":5}}"#,
++            r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":-3,"completion_tokens":5}}"#,
++            r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":12}}"#,
++            r#"{"choices":[{"message":{"content":"2"}}],"usage":{"prompt_tokens":99999999999999999999999,"completion_tokens":1}}"#,
++        ] {
++            assert_eq!(extract_usage(Wire::Openai, body), None, "{body}");
++            assert_eq!(
++                extract_text(Wire::Openai, body).as_deref(),
++                Some("2"),
++                "{body}"
++            );
++        }
++    }
++
++    #[test]
++    fn http_backend_complete_counted_returns_text_and_usage() {
++        let b = HttpBackend::with_sender(
++            "http://x".into(),
++            Wire::Openai,
++            "m".into(),
++            Credential::Bearer("k".into()),
++            Arc::new(|_, _, _| {
++                Ok((200, r#"{"choices":[{"message":{"content":"3"}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#.to_string()))
++            }),
++        );
++        assert_eq!(
++            b.complete_counted(&p()),
++            Ok((
++                "3".to_string(),
++                Some(Usage {
++                    input: 10,
++                    output: 2
++                })
++            ))
++        );
++        assert_eq!(b.complete(&p()), Ok("3".to_string()));
++    }
+ }
+diff --git a/src/llm/mod.rs b/src/llm/mod.rs
+index 08ec80f..c2afc94 100644
+--- a/src/llm/mod.rs
++++ b/src/llm/mod.rs
+@@ -21,22 +21,49 @@ pub struct Prompt {
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum LlmError {
+     /// 连不上、没配、凭据拿不到。功能安静下线。
+     Unavailable,
+     Timeout,
+     /// 回来了但读不懂。**当作「没把握」处理**，绝不猜。
+     Malformed,
+ }
+ 
++/// 一次调用用掉的 token 数（输入、输出）。读不到就是 `None`，不是 0。
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Usage {
++    pub input: u64,
++    pub output: u64,
++}
++
+ pub trait Backend: Send + Sync {
+     fn complete(&self, p: &Prompt) -> Result<String, LlmError>;
++
++    /// 带用量的调用。默认不带用量（命令行后端读不到）；HTTP 后端重写它。
++    fn complete_counted(&self, p: &Prompt) -> Result<(String, Option<Usage>), LlmError> {
++        self.complete(p).map(|s| (s, None))
++    }
++}
++
++pub fn complete_counted_with_timeout(
++    b: Arc<dyn Backend>,
++    p: Prompt,
++    d: Duration,
++) -> Result<(String, Option<Usage>), LlmError> {
++    let (tx, rx) = mpsc::channel();
++    std::thread::spawn(move || {
++        let _ = tx.send(b.complete_counted(&p));
++    });
++    match rx.recv_timeout(d) {
++        Ok(r) => r,
++        Err(_) => Err(LlmError::Timeout),
++    }
+ }
+ 
+ /// 在工作线程上跑，最多等 `d`。
+ ///
+ /// 超时后那个线程会继续跑到自己结束（Rust 杀不掉线程）——可以接受：
+ /// 它只是在等一个 HTTP 响应或一个子进程，完事往没人听的 channel 送一次就退。
+ /// **关键是调用方已经不等它了**，而这正是「绝不冻住界面」要保的东西。
+ pub fn complete_with_timeout(
+     b: Arc<dyn Backend>,
+     p: Prompt,
+@@ -105,11 +132,36 @@ mod tests {
+     fn a_slow_backend_gives_up_instead_of_blocking_forever() {
+         let b: Arc<dyn Backend> = Arc::new(Slow(Duration::from_secs(30)));
+         let started = std::time::Instant::now();
+         let r = complete_with_timeout(b, p(), Duration::from_millis(150));
+         assert_eq!(r, Err(LlmError::Timeout));
+         assert!(
+             started.elapsed() < Duration::from_secs(2),
+             "调用方没有及时放手"
+         );
+     }
++
++    #[test]
++    fn complete_counted_default_has_no_usage_and_the_same_text() {
++        let b = Fixed(Ok("hi".into()));
++        let p = Prompt {
++            system: String::new(),
++            user: String::new(),
++            max_tokens: 1,
++        };
++        assert_eq!(b.complete_counted(&p), Ok(("hi".to_string(), None)));
++    }
++
++    #[test]
++    fn complete_counted_with_timeout_times_out_like_the_plain_one() {
++        let r = complete_counted_with_timeout(
++            Arc::new(Slow(Duration::from_millis(300))),
++            Prompt {
++                system: String::new(),
++                user: String::new(),
++                max_tokens: 1,
++            },
++            Duration::from_millis(50),
++        );
++        assert_eq!(r, Err(LlmError::Timeout));
++    }
+ }

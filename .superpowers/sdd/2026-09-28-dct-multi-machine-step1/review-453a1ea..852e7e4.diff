@@ -1,0 +1,2698 @@
+# Review package: 453a1ea..852e7e4
+
+## Commits
+852e7e4 feat(mesh): machine keys on disk and the daemon's first real relay connection
+8239173 Merge branch 'docs/brain-status-and-pause'
+4d74475 docs(brain): status JSON, auto pause and emergency-stop contract for the menu bar
+
+## Files changed
+ .../specs/2026-09-27-dct-brain-design.md           |  65 +++
+ src/config.rs                                      |  31 +
+ src/daemon.rs                                      | 233 ++++++++
+ src/journal.rs                                     |   6 +
+ src/link.rs                                        | 426 ++++++++++++--
+ src/mesh/login.rs                                  | 180 ++++++
+ src/mesh/mod.rs                                    | 634 ++++++++++++++++++++-
+ src/mesh/net.rs                                    | 233 ++++++++
+ src/mesh/store.rs                                  | 385 +++++++++++++
+ 9 files changed, 2146 insertions(+), 47 deletions(-)
+
+## Diff
+diff --git a/docs/superpowers/specs/2026-09-27-dct-brain-design.md b/docs/superpowers/specs/2026-09-27-dct-brain-design.md
+index 2636aa6..0013dd1 100644
+--- a/docs/superpowers/specs/2026-09-27-dct-brain-design.md
++++ b/docs/superpowers/specs/2026-09-27-dct-brain-design.md
+@@ -124,20 +124,75 @@ dct：核对签名 → 把票连同签名交给 dco → dco 再验一次 → 执
+ | 同一平台的不同账号，两次操作之间至少隔 | 15 分钟 |
+ | 每个账号每天的对外动作上限 | 发帖 3 次、回复 30 条、改资料 2 次 |
+ | 一个会话连续做多少个动作后休息 | 30 个动作，休息 5 分钟以上 |
+ | 安静时段（不做对外动作） | 夜里 1 点到 7 点 |
+ | 同一流程连续失败 | 3 次就停下，提醒用户 |
+ 
+ - 默认值放在 dct 配置里；用户可以在 dcv 的 me 库里写规则**收得更紧**（例如「每个平台每天最多操作 3 个账号」），dct 排程时读取并遵守。
+ - **提前批准，到点执行**：明早 9 点发的视频，今晚就能批。票上写「最早 9:00、最晚 11:00」，dco 早于 9 点不做，过了 11 点作废。卡片的 30 分钟指的是「等用户批准」的时限，跟票上的执行时间窗是两回事。
+ - **运行统计放在 dct**：哪些流程老失败、哪个平台可能改版了，用来提醒「TikTok 发布流程可能要重新学」。不写进 dcv。
+ 
++**暂停、急停，和给菜单栏读的状态**（用户定，2026-09-28）
++
++小白的入口改成**菜单栏小程序 + 本机网页**（dc_desktop 目前没有上线计划）。菜单栏小程序和安装包放在新仓库 dc-local，由 dco 那边做；它只读三方公开的状态、转发按钮，自己不做判断。本机网页由谁托管（dcv 的网页、dct 的卡片、dc-local），三方以后一起定。dct 的会话列表、日志这类开发者的东西不进菜单，留在 TUI。
++
++dct 给外部的接口是**命令行 + JSON**，不让外部直接讲守护进程的 socket 协议——那是内部协议，带版本握手，dct 一升级外部程序就会坏。命令自己去连守护进程。
++
++- `dct status --json`：
++  ```json
++  {
++    "schema_version": 1,
++    "daemon": "up",
++    "paused": false,
++    "paused_by": null,
++    "sessions": {"busy": 1, "idle": 2, "total": 3},
++    "queue": [{"id": "…", "title": "发《…》到 TikTok", "account": "@gaoleiai",
++               "earliest": "2026-09-29T09:00:00+08:00", "latest": "2026-09-29T11:00:00+08:00"}],
++    "next_at": "2026-09-29T09:00:00+08:00",
++    "cards_pending": 2,
++    "cards_expiring_soon": 1,
++    "attention": [
++      {"level": "red", "kind": "dct.account_held", "text": "TikTok @gaoleiai 出现验证码，已暂停到明早 9:00",
++       "until": "2026-09-29T09:00:00+08:00", "open": "schedule"}
++    ]
++  }
++  ```
++  - `attention` 是「要用户注意的事」，dct 已经判断好、按用户语言写好，菜单只管取 `level` 最高的显示和弹通知，不认识每种 `kind` 也能用。`kind` 带来源前缀（`dct.` / `dco.`），`level` 只有 `red` / `yellow`；菜单合并三方时 red 优先、同级取最新。第一批 `kind`：
++    - `dct.keys_unavailable`（红）：签票钥匙没设置、Touch ID 用不了、锁屏时自动钥匙签不了——这时自动任务会全部失败；
++    - `dct.account_held`（红/黄）：某账号被风控暂停，来自 dco 报回的 `risk_control`；
++    - `dct.procedure_failing`（黄）：同一流程连续失败 3 次已停，「可能要重新教」；
++    - `dct.quota_blocked`（黄）：防封号额度用完，导致有任务排不进去（平时的剩余额度只在安排页显示，不进菜单）。
++  - 正常的状态不进 `attention`：钥匙好好的就什么都不显示。
++  - `cards_expiring_soon`：10 分钟内过期的卡片数，菜单并进「等你确认」那一行。
++  - 守护进程没起来时照样退出码 0，只输出 `{"schema_version": 1, "daemon": "down"}`，不吐报错（旧守护进程的情况同样处理，不能像 `ps/stop/kill/prune` 那样吐原始错误）。
++  - `paused_by` 取 `null` / `"user"` / `"dco_halt"`，菜单上据此显示「你暂停的」还是「急停带停的」。
++  - 字段只加不改；要改含义就升 `schema_version`。
++  - 调用方每 5–10 秒查一次就够。要推送时再加 `--watch`（一行一个 JSON），第一版不做。
++- `dct auto pause` / `dct auto resume`：幂等，重复按不报错；输出同 `dct status --json` 的新状态。
++
++**暂停时 dct 做什么**
++- **不再签新票**，自动签的 `self` 票、`physical` 票也不签。
++- **队列挂起**，不派发。
++- **已经签出去的票，dco 在急停或暂停期间一律拒绝执行**（dco 那边实现）。
++- **恢复后不补做**：票上的执行时间窗照常走，过了「最晚」的票作废，重新排；不会一口气补发，那样会撞上面的次数上限。
++- **不动 agent 会话**：claude / codex 这些 PTY 会话照常跑，暂停只管自动任务。
++- **暂停状态写到磁盘**，守护进程重启后还是暂停——往安全的一边偏。
++
++**和 dco 急停怎么联动**
++- dco 急停**不依赖 dct**，dct 不在线也照样停。
++- dco 急停时，dct 读到后**自动进入暂停**（`paused_by: "dco_halt"`）。
++- **恢复两边各自解除**：dct 恢复不会顺带解除 dco 的急停，dco 恢复也不会自动解除 dct 的暂停——免得一次误操作解开两道锁。
++- 菜单上的「急停」一次按到底：dc-local 先调 dco 急停，再调 `dct auto pause`。
++- dco 的工具名和状态格式（halt / resume / status.activity / run_status）等 dco 急停做完后补进来。
++
++这几条命令跟排程、卡片一起实现；在那之前 `dct status --json` 只能给出守护进程和会话这几项。
++
+ ## 5. 从纠正里学
+ 
+ | 来源 | 记成什么 | 什么时候生效 |
+ |---|---|---|
+ | 用户在卡片上改过的内容 | 偏好草稿（例如「标题不要用感叹号」） | 用户确认后 |
+ | 用户拒绝时说的原因 | 规则草稿 | 用户确认后 |
+ | dco 在执行结果里报告学到的按钮叫法、图标名 | 流程的补充草稿 | 用户确认后，下次取流程时一起交给 dco |
+ | dco 求助时模型选中的元素（本机缓存里标「未确认」） | dco 本机缓存 | 用户确认后才启用；确认前每次照样求助（用户选的） |
+ 
+ | 流程走不通、模型修好的新版 | 新版流程草稿 | 用户确认后才替换正式版 |
+@@ -152,20 +207,30 @@ dct：核对签名 → 把票连同签名交给 dco → dco 再验一次 → 执
+ 
+ ## 6. dct 这一侧怎么连 dco
+ 
+ - **发现**：读 `~/.dco/endpoint.json`，看板上显示在线的「触手」（Mac ✅ iPhone 镜像 ✅ 安卓手机 ✅ ESP32 摄像头 ❌）。
+ - **配对手机上的 dco**：扫码，互换公钥；同时把用户的 Mac 指纹钥匙、手机 passkey 的公钥交给 dco，供它自己验签。
+ - **调用**：MCP `run_procedure` / `answer_run`（dco 已实现）。dct 对接口的要求：
+   - 参数里带执行票（`self` 档是自动票），dco 验签后才执行；结果回报本次用的 `steps_sha256`。
+   - 每次运行有编号，能取消，有超时。
+   - 能查状态：运行中、需要帮助、被挡住、完成。dco 还没有主动推送，先由 dct 轮询。
+   - `read_value` 的结果除了换算后的数，还带画面原文和位置，dct 发现异常时拿原文复核。
++- **dco 已定要做的**（用户 2026-09-28 确认，dco 路线第 ①② 步）：
++  - 状态带 `schema_version` 和 `attention` 列表，格式同第 4 节 dct 的那份；
++  - 验票被拒给原因码：`expired / not_yet / bad_sig / replay / steps_mismatch / tier_mismatch / halted / busy`，dct 据此翻成人话、决定重签还是作废；
++  - 用过的 nonce 写磁盘；一张签名覆盖一批票时只核对自己那张；已在跑流程时回 `busy`，不排队（排队归 dct）；
++  - 结果回报 `steps_sha256`，以及实际做了几个对外动作、在哪个平台哪个账号——dct 的额度按这个算，不按签了几张票算；
++  - 失败原因分类，每条带截图：`element_not_found / page_changed / login_required / risk_control / permission_missing / network / timeout / halted / ticket_rejected / unknown`。`risk_control` 让 dct 把该账号退避（第 4 节 `dct.account_held`）；
++  - 换钉住的公钥必须用用户钥匙（Touch ID / 手机 passkey）签，dct 的自动钥匙签的不认；
++  - 中转有鉴权之前，只接本机的 dct；
++  - `~/.dco/endpoint.json` 补：设备名、平台、触手、协议版本、公钥、是否急停；
++  - 预演模式（跑到最后一个对外动作前停住，截图并读回实际填写的内容，同一个 run 里等最后一张票）跟 dct 的动作卡片一起做；页面保留多久、超时怎么办，到时再定。
+ - **agent 不直接连 dco**：`dct mcp` 把 dco 的能力列成工具，agent 调用时 dct 在中间定档、签票，agent 手里永远没有钥匙。
+ 
+ ## 7. 示范一遍，系统学会（用户提出，2026-09-27）
+ 
+ 用户亲手做一遍，系统写出流程草稿，用户确认后就会了。这是第 5 节「从纠正里学」的另一个入口：纠正是「做错了改」，示范是「从头教」。
+ 
+ **分工**
+ - **dco**：录下这次示范——操作记录（每一步点了哪个元素、元素上的字、输入了什么）、关键截图、屏幕录像。录像和记录**只存在本机**，不进 dcv。
+ - **dct**：把示范交给判断模块里的视觉模型，写成按意图的流程草稿；草稿用 `dcv add` 写进 dcv（来源先标 `import:agent`，dcv 2.1 起标 `import:demo`），流程里只记一个示范编号（dcv 2.1 提供这个字段）；然后放到看板上，**跟录像左右并排**给用户确认。
+ - **dcv**：校验草稿、存草稿、确认后存正式版。
+diff --git a/src/config.rs b/src/config.rs
+index 0ed4dd8..91fb639 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -78,32 +78,53 @@ impl Default for LlmConfig {
+ /// 一个不剩时也是全都显示**——理由见 `profile::trim_menu`。
+ #[derive(Debug, Clone, Default, Deserialize)]
+ pub struct MenuConfig {
+     /// profile 名，**按写下的顺序**显示。写一个不存在的名字不报错也不显示，
+     /// 因为这份文件是发机器的人自己写的，而收到机器的学生对着一条
+     /// 「profile 名写错了」的警告什么也做不了。
+     #[serde(default)]
+     pub agents: Vec<String>,
+ }
+ 
++/// `[mesh]`：多电脑那一路。
++#[derive(Debug, Clone, Default, Deserialize)]
++pub struct MeshConfig {
++    /// 中转地址；没写就是 `mesh::DEFAULT_RELAY`。
++    #[serde(default)]
++    pub relay: Option<String>,
++}
++
++impl MeshConfig {
++    pub fn relay(&self) -> String {
++        self.relay
++            .as_deref()
++            .map(str::trim)
++            .filter(|s| !s.is_empty())
++            .unwrap_or(crate::mesh::DEFAULT_RELAY)
++            .to_string()
++    }
++}
++
+ #[derive(Debug, Clone, Default, Deserialize)]
+ pub struct Config {
+     /// `None` = 用户没写 `[llm]` 这一段，出错解释功能整个关着。**默认值
+     /// 就是 `None`**（`Option` 自己的 `Default`，这里不额外提供
+     /// `#[serde(default = "...")]` 之类的东西去猜一个「开」的初值）——见
+     /// 模块头注释，这是隐私边界，不是随手选的类型。
+     #[serde(default)]
+     pub llm: Option<LlmConfig>,
+     /// `[menu]` 跟 `[llm]` 不一样，**不是 `Option`**：它不碰任何隐私边界，
+     /// 「没写」和「写了但空着」要的是同一件事——菜单原样显示。
+     #[serde(default)]
+     pub menu: MenuConfig,
++    #[serde(default)]
++    pub mesh: MeshConfig,
+ }
+ 
+ impl Config {
+     pub fn from_toml(s: &str) -> anyhow::Result<Config> {
+         Ok(toml::from_str(s)?)
+     }
+ 
+     /// 读不到、解析不了，一律是默认值——也就是 `llm: None`，功能关着。
+     /// 见模块头注释：配置坏了不该让 dct 起不来，更不该坏一下就把「发终端
+     /// 内容给第三方」这种功能悄悄打开。
+@@ -145,20 +166,30 @@ pub fn config_path_for_profiles_dir(profiles_dir: &Path) -> PathBuf {
+     match profiles_dir.parent() {
+         Some(d) => d.join("config.toml"),
+         None => PathBuf::from("config.toml"),
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn the_relay_defaults_and_can_be_overridden() {
++        assert_eq!(Config::default().mesh.relay(), crate::mesh::DEFAULT_RELAY);
++        let c = Config::from_toml("[mesh]\nrelay = \"http://127.0.0.1:8787\"\n").unwrap();
++        assert_eq!(c.mesh.relay(), "http://127.0.0.1:8787");
++        let blank = Config::from_toml("[mesh]\nrelay = \"  \"\n").unwrap();
++        assert_eq!(blank.mesh.relay(), crate::mesh::DEFAULT_RELAY);
++        assert!(c.llm.is_none(), "写了 [mesh] 不该顺手打开 [llm]");
++    }
++
+     #[test]
+     fn parses_a_full_llm_section() {
+         let c = Config::from_toml(
+             r#"
+             [llm]
+             provider = "kimi"
+             model = "kimi-k2"
+             base_url = "https://example.test/v1"
+             transport = "http"
+             "#,
+diff --git a/src/daemon.rs b/src/daemon.rs
+index c05ca86..59bd3cf 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -194,20 +194,25 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
+     // `initial_phone_status`/`start_phone_bridge` 一样，什么都不做。
+     // `Request::PhoneSetToken` 成功时会重新调用一次 `set_event_sink`
+     // 把它补上（用户从 `Off` 第一次填令牌走的正是这条路径），
+     // `Request::PhoneDisable` 会调用 `clear_event_sink` 收回——两处
+     // 都在 `handle()` 里，见那两个分支的注释。
+     if recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some() {
+         mgr.set_event_sink(event_tx.clone());
+     }
+     crate::bridge::spawn_event_consumer(event_rx, bridge.clone());
+ 
++    // 多电脑：secrets 里有中转令牌才起。起在自己的线程上（`link::spawn`），
++    // 续期也在那条线程上——**不在下面那个 200ms 的 tick 里做任何网络 IO**。
++    // 绑在这个变量上活到进程结束；Task 6/7 从这里拿 `mesh` 和 `net`。
++    let _mesh = start_mesh(socket, &secrets, &profiles_dir, mgr.journal.path());
++
+     let tick_mgr = mgr.clone();
+     std::thread::spawn(move || loop {
+         std::thread::sleep(Duration::from_millis(200));
+         tick_mgr.tick();
+     });
+ 
+     // 局域网手机端那个 HTTP 服务。**默认不开**——它是这台机器上唯一一个
+     // 对局域网敞口的东西，开不开是用户在设置页里的一次明确动作，
+     // 不是装了 dct 就有的默认行为。
+     let web: Arc<Mutex<Option<crate::web::Server>>> = Arc::new(Mutex::new(None));
+@@ -242,20 +247,121 @@ pub fn run_with_manager(socket: &Path, mgr: Arc<SessionManager>) -> Result<()> {
+         let lv = live.clone();
+         std::thread::spawn(move || {
+             if let Err(e) = serve(conn, m, s, sec, pd, ph, br, et, wb, pr, lv) {
+                 eprintln!("连接处理失败: {e}");
+             }
+         });
+     }
+     Ok(())
+ }
+ 
++/// 守护进程里多电脑那一路还活着的东西。
++// `mesh`/`net` 这一步还没人读：登录、加入、留言（Task 6/7）才用得上。
++#[allow(dead_code)]
++pub(crate) struct MeshRuntime {
++    pub mesh: Arc<Mutex<crate::mesh::Mesh>>,
++    pub net: Arc<dyn crate::mesh::net::Net>,
++    pub link: crate::link::LinkHandle,
++}
++
++/// 续期失败之后多久再试。续期在令牌剩一天时就开始，一小时一次足够在过期
++/// 前试上二十几回，又不至于在网关挂掉时每 30 秒敲它一下。
++const RELAY_RENEW_RETRY: Duration = Duration::from_secs(60 * 60);
++
++/// secrets 里有中转令牌，就读出（第一次就生成）这台电脑的钥匙和名单，起一条
++/// 连中转的线程。没有令牌就什么都不做——还没 `dct login` 过。
++///
++/// 中转地址来自 `config.toml` 的 `[mesh] relay`，默认 `mesh::DEFAULT_RELAY`。
++/// 那个地址上线前连不上：`Link::run` 按退避一直重试，不报错、不刷屏。
++fn start_mesh(
++    socket: &Path,
++    secrets: &Arc<Mutex<SecretStore>>,
++    profiles_dir: &Path,
++    journal_path: Option<PathBuf>,
++) -> Option<MeshRuntime> {
++    use crate::mesh::login::{self, Renewal, DC_PROFILE, RELAY_TOKEN_KEY};
++
++    let token = recover(secrets.lock()).get(RELAY_TOKEN_KEY)?.to_string();
++
++    let journal = Arc::new(crate::journal::Journal::new());
++    if let Some(p) = journal_path {
++        journal.set_path(p);
++    }
++    let store = crate::mesh::store::Store::at(crate::mesh::store::dir_for_socket(socket));
++    let mesh = match crate::mesh::Mesh::load(store) {
++        Ok(m) => m.with_journal(journal.clone()),
++        Err(e) => {
++            journal.mesh(&format!("not_started err={e}"));
++            return None;
++        }
++    };
++    let endpoint = mesh.endpoint().to_string();
++    let Ok(endpoint_id) = dct_link::EndpointId::new(endpoint.clone()) else {
++        // `endpoint_for` 算出来的恒合法；走到这里说明那边的格式变了。
++        journal.mesh("not_started err=bad_endpoint");
++        return None;
++    };
++
++    let relay = crate::config::Config::load(&crate::config::config_path_for_socket(socket))
++        .mesh
++        .relay();
++    let cfg = crate::link::LinkConfig::new(relay, endpoint_id, token);
++
++    let mesh = Arc::new(Mutex::new(mesh));
++    let net: Arc<dyn crate::mesh::net::Net> = Arc::new(crate::mesh::net::LinkNet::new(cfg.clone()));
++
++    let renew = {
++        let secrets = secrets.clone();
++        let token = cfg.token.clone();
++        let origin = pair_origin(profiles_dir, DC_PROFILE);
++        let journal = journal.clone();
++        let last_failure: Mutex<Option<std::time::Instant>> = Mutex::new(None);
++        Arc::new(move || {
++            let mut last = recover(last_failure.lock());
++            if last.is_some_and(|t| t.elapsed() < RELAY_RENEW_RETRY) {
++                return;
++            }
++            let now = std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .map(|d| d.as_secs())
++                .unwrap_or(0);
++            match login::renew_if_due(
++                &secrets,
++                &token,
++                origin.as_deref(),
++                &endpoint,
++                now,
++                &login::http_transport,
++            ) {
++                Renewal::NotDue => {}
++                Renewal::Renewed => {
++                    *last = None;
++                    journal.mesh("relay_token_renewed");
++                }
++                // 记一条就接着用旧令牌：它可能还有将近一天。
++                Renewal::Failed(e) => {
++                    *last = Some(std::time::Instant::now());
++                    journal.mesh(&format!("relay_token_renewal_failed {e}"));
++                }
++            }
++        }) as crate::link::BeforePoll
++    };
++
++    let link = crate::link::Link::with_handler(cfg, crate::mesh::route(mesh.clone(), None))
++        .before_poll(renew);
++    Some(MeshRuntime {
++        mesh,
++        net,
++        link: crate::link::spawn(link),
++    })
++}
++
+ /// 守护进程刚起来（或者刚被 `run_with_manager` 构造出来）时，手机通知该
+ /// 处在哪个状态——只看密钥仓里有没有令牌，理由见调用点的注释。
+ fn initial_phone_status(secrets: &SecretStore) -> PhoneStatus {
+     match secrets.get(PHONE_TOKEN_KEY) {
+         Some(_) => PhoneStatus {
+             state: PhoneState::WaitingForPairing,
+             bot: None,
+             owner: None,
+         },
+         None => PhoneStatus {
+@@ -3545,10 +3651,137 @@ mod web_tests {
+         web_disable(Some(&web));
+         fx.enable(Some(&web));
+         let second = recover(fx.secrets.lock())
+             .get(crate::secrets::WEB_TOKEN_KEY)
+             .unwrap()
+             .to_string();
+         assert_eq!(first, second, "关了再开换了令牌，扫过码的手机全掉线");
+         web_disable(Some(&web));
+     }
+ }
++
++#[cfg(test)]
++mod mesh_tests {
++    use super::*;
++    use crate::mesh::login::{RELAY_TOKEN_EXP_KEY, RELAY_TOKEN_KEY};
++    use std::io::Read as _;
++    use std::time::Instant;
++
++    /// 一个只会回「这一轮没东西」的假中转，记下每次轮询带来的 `AuthFrame`。
++    fn fake_relay() -> (String, Arc<Mutex<Vec<dct_link::AuthFrame>>>) {
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let addr = listener.local_addr().unwrap();
++        let seen = Arc::new(Mutex::new(Vec::new()));
++        let s = seen.clone();
++        std::thread::spawn(move || {
++            for conn in listener.incoming() {
++                let Ok(mut conn) = conn else { break };
++                let mut reader = BufReader::new(conn.try_clone().unwrap());
++                let mut line = String::new();
++                if reader.read_line(&mut line).is_err() {
++                    continue;
++                }
++                let mut len = 0usize;
++                loop {
++                    let mut h = String::new();
++                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
++                        break;
++                    }
++                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
++                        len = v.trim().parse().unwrap_or(0);
++                    }
++                }
++                let mut body = vec![0u8; len];
++                let _ = reader.read_exact(&mut body);
++                if line.contains(dct_link::PATH_POLL) {
++                    if let Ok(a) = serde_json::from_slice(&body) {
++                        s.lock().unwrap().push(a);
++                    }
++                }
++                let payload = r#"{"envelope":null}"#;
++                let _ = write!(
++                    conn,
++                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
++                    payload.len()
++                );
++            }
++        });
++        (format!("http://{addr}"), seen)
++    }
++
++    fn home() -> (tempfile::TempDir, PathBuf, Arc<Mutex<SecretStore>>) {
++        let t = tempfile::tempdir().unwrap();
++        let socket = t.path().join("daemon.sock");
++        let secrets = Arc::new(Mutex::new(SecretStore::load(&secrets_path_for_socket(
++            &socket,
++        ))));
++        (t, socket, secrets)
++    }
++
++    #[test]
++    fn no_relay_token_means_no_mesh_and_nothing_on_disk() {
++        let (t, socket, secrets) = home();
++        assert!(start_mesh(&socket, &secrets, &t.path().join("profiles"), None).is_none());
++        assert!(
++            !crate::mesh::store::dir_for_socket(&socket).exists(),
++            "没登录过就不该生成钥匙"
++        );
++    }
++
++    /// 有令牌就真的连上中转：从 `config.toml` 读地址，拿本机钥匙算出来的
++    /// 端点和 secrets 里的令牌去轮询。
++    #[test]
++    fn a_relay_token_starts_a_real_connection_with_this_machines_endpoint() {
++        let (t, socket, secrets) = home();
++        let (relay, seen) = fake_relay();
++        std::fs::write(
++            crate::config::config_path_for_socket(&socket),
++            format!("[mesh]\nrelay = \"{relay}\"\n"),
++        )
++        .unwrap();
++        {
++            let mut s = secrets.lock().unwrap();
++            s.set(RELAY_TOKEN_KEY, "relay-tok").unwrap();
++            // 还剩很久：这条测试里续期不该去打网关。
++            s.set(RELAY_TOKEN_EXP_KEY, &u64::MAX.to_string()).unwrap();
++        }
++
++        let rt = start_mesh(&socket, &secrets, &t.path().join("profiles"), None).expect("该起来");
++        let endpoint = rt.mesh.lock().unwrap().endpoint().to_string();
++        assert!(endpoint.starts_with("c-"));
++        let dir = crate::mesh::store::dir_for_socket(&socket);
++        assert!(dir.join("sign.key").exists() && dir.join("kx.key").exists());
++
++        let deadline = Instant::now() + Duration::from_secs(10);
++        let auth = loop {
++            if let Some(a) = seen.lock().unwrap().first().cloned() {
++                break a;
++            }
++            assert!(Instant::now() < deadline, "没等到轮询");
++            std::thread::sleep(Duration::from_millis(20));
++        };
++        rt.link.stop();
++        assert_eq!(auth.endpoint.as_str(), endpoint);
++        assert_eq!(auth.token, "relay-tok");
++        assert_eq!(auth.kind, dct_link::EndpointKind::Computer);
++    }
++
++    /// 重启之后还是同一台电脑：端点由落盘的钥匙决定。
++    #[test]
++    fn a_restarted_daemon_keeps_its_endpoint() {
++        let (t, socket, secrets) = home();
++        std::fs::write(
++            crate::config::config_path_for_socket(&socket),
++            "[mesh]\nrelay = \"http://127.0.0.1:9\"\n",
++        )
++        .unwrap();
++        secrets.lock().unwrap().set(RELAY_TOKEN_KEY, "t").unwrap();
++        let a = start_mesh(&socket, &secrets, &t.path().join("profiles"), None).unwrap();
++        let b = start_mesh(&socket, &secrets, &t.path().join("profiles"), None).unwrap();
++        a.link.stop();
++        b.link.stop();
++        assert_eq!(
++            a.mesh.lock().unwrap().endpoint(),
++            b.mesh.lock().unwrap().endpoint()
++        );
++    }
++}
+diff --git a/src/journal.rs b/src/journal.rs
+index f771a3e..464f23a 100644
+--- a/src/journal.rs
++++ b/src/journal.rs
+@@ -116,20 +116,26 @@ impl Journal {
+             pid_word(pid)
+         ));
+     }
+ 
+     /// 手机来的一条消息落地之后记一笔。见 `Delivery` 的文档——**只记结果，
+     /// 不记消息原文**，`bridge.rs::deliver` 是唯一的调用方。
+     pub fn delivered(&self, d: Delivery) {
+         self.write(&format!("inbound  {d}"));
+     }
+ 
++    /// 多电脑那一路的一件事：丢掉了一个验不过的信封、令牌续期失败……**只记
++    /// 发生了什么和谁发来的，不记内容**——同 `delivered` 的规矩。
++    pub fn mesh(&self, event: &str) {
++        self.write(&format!("mesh  {event}"));
++    }
++
+     fn write(&self, line: &str) {
+         let guard = self.path.lock().unwrap_or_else(|e| e.into_inner());
+         let Some(path) = guard.as_ref() else {
+             return;
+         };
+         // 超长就整份换掉，不做滚动归档——排查看的是近况，
+         // 而多留一份 `.log.1` 只是多一个没人读的文件。
+         let truncate = std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_BYTES);
+         let opened = std::fs::OpenOptions::new()
+             .create(true)
+diff --git a/src/link.rs b/src/link.rs
+index eda8e7a..758b139 100644
+--- a/src/link.rs
++++ b/src/link.rs
+@@ -18,51 +18,80 @@
+ //! 再加一个心跳定时器，是两套机制在做同一件事，而两套机制会各自超时、各自
+ //! 重连。见 `dct_link::POLL_TIMEOUT`。
+ //!
+ //! # 它跑在自己的线程上
+ //!
+ //! 绝不能把网络 IO 放进守护进程那个 200ms 的 tick——那条线程卡一下，所有会话
+ //! 的画面就一起卡一下。这是 `bridge.rs` 立的规矩，这里照办。
+ 
+ use std::panic::{catch_unwind, AssertUnwindSafe};
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
+ use dct_link::{
+-    AuthFrame, EndpointId, EndpointKind, Envelope, PollResponse, SendRequest, LINK_VERSION,
+-    PATH_POLL, PATH_SEND, POLL_TIMEOUT,
++    AuthFrame, EndpointId, EndpointKind, Envelope, ErrorBody, PeersResponse, PollResponse,
++    SendRequest, LINK_VERSION, PATH_ASK, PATH_PEERS, PATH_POLL, PATH_SEND, POLL_TIMEOUT,
+ };
+ 
+ use crate::proto::{ErrorCode, Request, Response};
+ 
+ /// 连中转要知道的一切。
+ #[derive(Clone, Debug)]
+ pub struct LinkConfig {
+     /// 中转的地址，比如 `http://127.0.0.1:8787`。结尾有没有斜杠都行。
+     pub base: String,
+     /// 我这台电脑在中转上叫什么。
+     pub endpoint: EndpointId,
+-    /// 配对时拿到的令牌（任务 6 才有真的；任务 5 之前中转不验）。
+-    pub token: String,
++    /// 中转令牌。**是一个共享的格子，不是一份拷贝**：令牌会续期，而同一张
++    /// 令牌同时被轮询线程（`Link`）和往外发东西的那一侧（`mesh::net::LinkNet`）
++    /// 用着。两边各拿一份 `String` 的话，续期只换得了其中一边，另一边拿着过期
++    /// 的令牌被中转拒掉，而它自己的日志里只有一句 `Unauthorized`。`clone()`
++    /// 一个 `LinkConfig` 得到的是同一个格子。
++    pub token: Token,
+     /// 连不上之后第一次重试等多久。
+     pub backoff_start: Duration,
+     /// 重试间隔的上限。
+     pub backoff_max: Duration,
+ }
+ 
++/// 见 `LinkConfig::token`。`Debug` 不打印内容：`LinkConfig` 会进日志和 panic
++/// 信息，令牌不该跟着去。
++#[derive(Clone, Default)]
++pub struct Token(Arc<Mutex<String>>);
++
++impl Token {
++    pub fn new(s: impl Into<String>) -> Token {
++        Token(Arc::new(Mutex::new(s.into())))
++    }
++
++    pub fn get(&self) -> String {
++        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
++    }
++
++    pub fn set(&self, s: impl Into<String>) {
++        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = s.into();
++    }
++}
++
++impl std::fmt::Debug for Token {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("Token(..)")
++    }
++}
++
+ impl LinkConfig {
+     pub fn new(base: impl Into<String>, endpoint: EndpointId, token: impl Into<String>) -> Self {
+         LinkConfig {
+             base: base.into(),
+             endpoint,
+-            token: token.into(),
++            token: Token::new(token),
+             backoff_start: Duration::from_millis(500),
+             backoff_max: Duration::from_secs(30),
+         }
+     }
+ 
+     /// 等中转开口最多等多久。
+     ///
+     /// **必须比中转的长轮询长**，而且这件事不能交给调用方去配：配短了的症状是
+     /// 每一次轮询都在中转开口之前被自己掐断，看起来像"网络有问题"，而两边的
+     /// 日志都显示自己没做错什么。所以这里是算出来的，不是填出来的。
+@@ -72,25 +101,121 @@ impl LinkConfig {
+ 
+     fn url(&self, path: &str) -> String {
+         format!("{}{}", self.base.trim_end_matches('/'), path)
+     }
+ 
+     fn auth(&self) -> AuthFrame {
+         AuthFrame {
+             version: LINK_VERSION,
+             kind: EndpointKind::Computer,
+             endpoint: self.endpoint.clone(),
+-            token: self.token.clone(),
++            token: self.token.get(),
+         }
+     }
+ }
+ 
++/// 这条线收发要用的 HTTP 客户端。读超时按 `LinkConfig::read_timeout` 算，
++/// 见那边的注释。`Link` 自己用它，`peers`/`send`/`ask` 的调用方也该用它。
++pub fn agent(cfg: &LinkConfig) -> ureq::Agent {
++    crate::sys::tls::agent_builder()
++        .timeout_connect(Duration::from_secs(10))
++        .timeout_read(cfg.read_timeout())
++        .timeout_write(Duration::from_secs(30))
++        .build()
++}
++
++/// 往中转发东西时能出的错。
++///
++/// 中转自己说的「不」（`dct_link::LinkError`，是码）跟「根本没说上话」分开：
++/// 前者是对方的判断，该按码翻译给用户；后者是网络，该让连接线程退避重试。
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum LinkError {
++    /// 中转答了，答的是这个码。
++    Relay(dct_link::LinkError),
++    /// 连不上、超时、或者答回来的东西看不懂。
++    Unreachable,
++    /// 收件地址不是合法的端点 id，这一条根本没发出去。
++    BadEndpoint,
++}
++
++impl std::fmt::Display for LinkError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            LinkError::Relay(e) => write!(f, "relay said: {e}"),
++            LinkError::Unreachable => f.write_str("relay unreachable"),
++            LinkError::BadEndpoint => f.write_str("bad endpoint id"),
++        }
++    }
++}
++
++impl std::error::Error for LinkError {}
++
++/// 中转答非 2xx 时，body 里的码才是真话（见 `dct_link::ErrorBody`）；答不出
++/// 码的一律当成没连上。
++fn classify(e: ureq::Error) -> LinkError {
++    match e {
++        ureq::Error::Status(_, resp) => resp
++            .into_json::<ErrorBody>()
++            .map(|b| LinkError::Relay(b.error))
++            .unwrap_or(LinkError::Unreachable),
++        ureq::Error::Transport(_) => LinkError::Unreachable,
++    }
++}
++
++/// 跟我同账号、此刻在线的其它端点。
++pub fn peers(cfg: &LinkConfig, agent: &ureq::Agent) -> Result<Vec<EndpointId>, LinkError> {
++    let resp = agent
++        .post(&cfg.url(PATH_PEERS))
++        .send_json(cfg.auth())
++        .map_err(classify)?;
++    let body: PeersResponse = resp.into_json().map_err(|_| LinkError::Unreachable)?;
++    Ok(body.online)
++}
++
++/// 投一个信封，不等答复。
++pub fn send(cfg: &LinkConfig, agent: &ureq::Agent, env: Envelope) -> Result<(), LinkError> {
++    agent
++        .post(&cfg.url(PATH_SEND))
++        .send_json(SendRequest {
++            auth: cfg.auth(),
++            envelope: env,
++        })
++        .map(|_| ())
++        .map_err(classify)
++}
++
++/// 投一个信封，挂着等对面配对的答复。
++pub fn ask(cfg: &LinkConfig, agent: &ureq::Agent, env: Envelope) -> Result<Envelope, LinkError> {
++    ask_within(cfg, agent, env, None)
++}
++
++/// 同 `ask`，但整条请求最多等 `timeout`（`None` = 用 agent 自己的读超时）。
++/// 超时算 `Unreachable`：我们这边没等到，说不清是谁的问题。
++pub fn ask_within(
++    cfg: &LinkConfig,
++    agent: &ureq::Agent,
++    env: Envelope,
++    timeout: Option<Duration>,
++) -> Result<Envelope, LinkError> {
++    let mut req = agent.post(&cfg.url(PATH_ASK));
++    if let Some(t) = timeout {
++        req = req.timeout(t);
++    }
++    let resp = req
++        .send_json(SendRequest {
++            auth: cfg.auth(),
++            envelope: env,
++        })
++        .map_err(classify)?;
++    resp.into_json().map_err(|_| LinkError::Unreachable)
++}
++
+ /// 连不上就越等越久，连上了就归零。
+ ///
+ /// 上限存在的理由是：中转可能只是重启一下，二十分钟后才重试等于让用户的手机
+ /// 白白多断二十分钟。上限之内一直重试的代价只是几条失败的请求。
+ #[derive(Debug)]
+ struct Backoff {
+     start: Duration,
+     max: Duration,
+     next: Duration,
+ }
+@@ -112,46 +237,88 @@ impl Backoff {
+     }
+ 
+     fn reset(&mut self) {
+         self.next = self.start;
+     }
+ }
+ 
+ /// 分派一条请求。就是 `daemon.rs` 里那个 `handle`，包成闭包传进来。
+ pub type Dispatch = Arc<dyn Fn(Request) -> Response + Send + Sync>;
+ 
++/// 一个信封进来，回什么 payload 出去；`None` = 什么都不回。
++///
++/// 比 `Dispatch` 低一层：它看得见整个信封（尤其是 `from`），所以能按来的是
++/// 电脑还是手机分流（见 `daemon.rs` 里 mesh 那一段），也能**选择沉默**——
++/// 验不过的电脑信封一个字都不回，免得给伪造者当探针。
++pub type Handler = Arc<dyn Fn(&Envelope) -> Option<Vec<u8>> + Send + Sync>;
++
++/// 每次轮询之前调一下，在连接线程上。给令牌续期这类「偶尔要打一次网络、
++/// 但绝不能进 tick」的活用。
++pub type BeforePoll = Arc<dyn Fn() + Send + Sync>;
++
++/// 把一个 proto 分派包成 `Handler`：解码 `Request` → 分派 → 编码 `Response`。
++/// 这就是 `Link::new` 原来的全部行为。
++pub fn proto_handler(dispatch: Dispatch) -> Handler {
++    Arc::new(move |env: &Envelope| {
++        let resp = match serde_json::from_slice::<Request>(&env.payload) {
++            Ok(req) => dispatch(req),
++            // 跟 socket 那条路一模一样的处理（见 `daemon.rs` 的读循环）：
++            // 解不出来的请求回一句 `BadRequest`，不是断线。
++            Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
++        };
++        Some(serde_json::to_vec(&resp).unwrap_or_else(|e| {
++            serde_json::to_vec(&Response::Error(ErrorCode::Internal(format!(
++                "答复序列化失败：{e}"
++            ))))
++            .unwrap_or_default()
++        }))
++    })
++}
++
+ pub struct Link {
+     cfg: LinkConfig,
+     agent: ureq::Agent,
+-    dispatch: Dispatch,
++    handler: Handler,
++    before_poll: Option<BeforePoll>,
+     stop: Arc<AtomicBool>,
+ }
+ 
+ impl Link {
+     pub fn new(cfg: LinkConfig, dispatch: Dispatch) -> Self {
+-        let agent = crate::sys::tls::agent_builder()
+-            .timeout_connect(Duration::from_secs(10))
+-            .timeout_read(cfg.read_timeout())
+-            .timeout_write(Duration::from_secs(30))
+-            .build();
++        Link::with_handler(cfg, proto_handler(dispatch))
++    }
++
++    pub fn with_handler(cfg: LinkConfig, handler: Handler) -> Self {
++        let agent = agent(&cfg);
+         Link {
+             cfg,
+             agent,
+-            dispatch,
++            handler,
++            before_poll: None,
+             stop: Arc::new(AtomicBool::new(false)),
+         }
+     }
+ 
++    /// 见 `BeforePoll`。
++    pub fn before_poll(mut self, f: BeforePoll) -> Self {
++        self.before_poll = Some(f);
++        self
++    }
++
+     /// 一直跑，直到有人叫停。
+     pub fn run(&self) {
+         let mut backoff = Backoff::new(self.cfg.backoff_start, self.cfg.backoff_max);
+         while !self.stop.load(Ordering::Relaxed) {
++            if let Some(f) = &self.before_poll {
++                // 续期炸了不该把这条线一起带走：旧令牌还能用到它过期为止。
++                let _ = catch_unwind(AssertUnwindSafe(|| f()));
++            }
+             match self.poll_once() {
+                 Ok(Some(env)) => {
+                     backoff.reset();
+                     self.answer(&env);
+                 }
+                 // 空手而归是这条链路上最正常的一件事，不是错误：立刻再来一次。
+                 Ok(None) => backoff.reset(),
+                 Err(_) => {
+                     let wait = backoff.hit();
+                     self.nap(wait);
+@@ -164,61 +331,41 @@ impl Link {
+     fn poll_once(&self) -> Result<Option<Envelope>, ()> {
+         let resp = self
+             .agent
+             .post(&self.cfg.url(PATH_POLL))
+             .send_json(self.cfg.auth())
+             .map_err(|_| ())?;
+         let body: PollResponse = resp.into_json().map_err(|_| ())?;
+         Ok(body.envelope)
+     }
+ 
+-    /// 处理一个信封，把答复发回去。
++    /// 处理一个信封，把答复发回去（如果有的话）。
+     fn answer(&self, env: &Envelope) {
+-        let reply = self.reply_to(env);
+-        // 发不回去就算了：手机那边的请求会超时，它自己会再问一次。为一条答复
++        let Some(reply) = self.reply_to(env) else {
++            return;
++        };
++        // 发不回去就算了：对面的请求会超时，它自己会再问一次。为一条答复
+         // 反复重试，只会让后面积着的请求排更久。
+-        let _ = self.send(&reply);
++        let _ = send(&self.cfg, &self.agent, reply);
+     }
+ 
+     /// 一个信封进来，该回什么信封出去。**不碰网络**，所以可以直接测。
+-    fn reply_to(&self, env: &Envelope) -> Envelope {
+-        let resp = match serde_json::from_slice::<Request>(&env.payload) {
+-            Ok(req) => (self.dispatch)(req),
+-            // 跟 socket 那条路一模一样的处理（见 `daemon.rs` 的读循环）：
+-            // 解不出来的请求回一句 `BadRequest`，不是断线。
+-            Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
+-        };
+-        let payload = serde_json::to_vec(&resp).unwrap_or_else(|e| {
+-            serde_json::to_vec(&Response::Error(ErrorCode::Internal(format!(
+-                "答复序列化失败：{e}"
+-            ))))
+-            .unwrap_or_default()
+-        });
+-        Envelope {
++    fn reply_to(&self, env: &Envelope) -> Option<Envelope> {
++        let payload = (self.handler)(env)?;
++        Some(Envelope {
+             from: self.cfg.endpoint.clone(),
+             to: env.from.clone(),
+-            // **原样带回**：这是手机把答复和请求配起来的唯一依据。
++            // **原样带回**：这是对面把答复和请求配起来的唯一依据。
+             seq: env.seq,
+             payload,
+             recipients: vec![],
+-        }
+-    }
+-
+-    fn send(&self, env: &Envelope) -> Result<(), ()> {
+-        self.agent
+-            .post(&self.cfg.url(PATH_SEND))
+-            .send_json(SendRequest {
+-                auth: self.cfg.auth(),
+-                envelope: env.clone(),
+-            })
+-            .map(|_| ())
+-            .map_err(|_| ())
++        })
+     }
+ 
+     /// 睡一会儿，但叫停了就别接着睡。
+     fn nap(&self, total: Duration) {
+         let slice = Duration::from_millis(50);
+         let mut left = total;
+         while left > Duration::ZERO && !self.stop.load(Ordering::Relaxed) {
+             let this = slice.min(left);
+             std::thread::sleep(this);
+             left -= this;
+@@ -269,20 +416,28 @@ mod tests {
+ 
+     #[derive(Default)]
+     struct SrvState {
+         /// 下一次轮询要递下去的信封，先进先出。
+         outbox: Vec<Envelope>,
+         /// 收到的答复。
+         got: Vec<Envelope>,
+         /// 还要故意失败几次（任何路径）。
+         fail: usize,
+         polls: usize,
++        /// 每次轮询带来的令牌，按到达顺序。
++        poll_tokens: Vec<String>,
++        /// `/link/peers` 答什么。
++        peers: Vec<EndpointId>,
++        /// `/link/ask` 答什么：`Ok` = 把这个信封当答复，`Err` = 回这个码。
++        ask: Option<Result<Envelope, dct_link::LinkError>>,
++        /// `/link/ask` 收到的请求。
++        asked: Vec<SendRequest>,
+     }
+ 
+     impl FakeSrv {
+         fn start() -> FakeSrv {
+             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+             let addr = listener.local_addr().unwrap();
+             let state = Arc::new(Mutex::new(SrvState::default()));
+             let s = state.clone();
+             std::thread::spawn(move || {
+                 for conn in listener.incoming() {
+@@ -322,33 +477,50 @@ mod tests {
+ 
+         let mut st = state.lock().unwrap();
+         if st.fail > 0 {
+             st.fail -= 1;
+             // 连响应都不给，直接把连接摔上——这是中转挂掉时最像的样子。
+             return;
+         }
+ 
+         let (code, payload) = if path == PATH_POLL {
+             st.polls += 1;
++            let auth: AuthFrame = serde_json::from_slice(&body).unwrap();
++            st.poll_tokens.push(auth.token);
+             let env = if st.outbox.is_empty() {
+                 None
+             } else {
+                 Some(st.outbox.remove(0))
+             };
+             (
+                 200,
+                 serde_json::to_string(&PollResponse { envelope: env }).unwrap(),
+             )
+         } else if path == PATH_SEND {
+             let req: SendRequest = serde_json::from_slice(&body).unwrap();
+             st.got.push(req.envelope);
+             (204, String::new())
++        } else if path == PATH_PEERS {
++            (
++                200,
++                serde_json::to_string(&PeersResponse {
++                    online: st.peers.clone(),
++                })
++                .unwrap(),
++            )
++        } else if path == PATH_ASK {
++            st.asked.push(serde_json::from_slice(&body).unwrap());
++            match st.ask.clone() {
++                Some(Ok(env)) => (200, serde_json::to_string(&env).unwrap()),
++                Some(Err(e)) => (409, serde_json::to_string(&ErrorBody { error: e }).unwrap()),
++                None => (404, String::new()),
++            }
+         } else {
+             (404, String::new())
+         };
+         drop(st);
+ 
+         let out = format!(
+             "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+              Connection: close\r\n\r\n{payload}",
+             payload.len()
+         );
+@@ -496,17 +668,181 @@ mod tests {
+         let deadline = std::time::Instant::now() + Duration::from_secs(2);
+         while !t.is_finished() {
+             assert!(
+                 std::time::Instant::now() < deadline,
+                 "叫停之后线程该退出，不该等退避睡完"
+             );
+             std::thread::sleep(Duration::from_millis(20));
+         }
+     }
+ 
++    /// 通用的 `Handler` 那一层：回复的 `to` 是来信的 `from`，`seq` 原样带回——
++    /// 电脑之间的 `ask` 靠这两样配对，跟手机那一路是同一条规矩。
++    #[test]
++    fn with_handler_replies_with_the_same_seq_to_the_sender() {
++        let srv = FakeSrv::start();
++        srv.state.lock().unwrap().outbox.push(Envelope {
++            from: id("c-aaaa"),
++            to: id("laptop"),
++            seq: 7777,
++            payload: b"ping".to_vec(),
++            recipients: vec![],
++        });
++        let cfg = LinkConfig {
++            backoff_start: Duration::from_millis(20),
++            backoff_max: Duration::from_millis(60),
++            ..LinkConfig::new(srv.base(), id("laptop"), "t")
++        };
++        let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
++        let s = seen.clone();
++        let handle = spawn(Link::with_handler(
++            cfg,
++            Arc::new(move |env: &Envelope| {
++                s.lock().unwrap().push(env.payload.clone());
++                Some(b"pong".to_vec())
++            }),
++        ));
++        let reply = wait_for(|| srv.state.lock().unwrap().got.first().cloned());
++        handle.stop();
++        assert_eq!(seen.lock().unwrap().as_slice(), &[b"ping".to_vec()]);
++        assert_eq!(reply.to, id("c-aaaa"));
++        assert_eq!(reply.from, id("laptop"));
++        assert_eq!(reply.seq, 7777);
++        assert_eq!(reply.payload, b"pong");
++    }
++
++    /// handler 选择沉默时一个字节都不回——验不过的电脑信封就是走这条路。
++    #[test]
++    fn a_handler_that_returns_none_sends_nothing_back() {
++        let srv = FakeSrv::start();
++        {
++            let mut st = srv.state.lock().unwrap();
++            st.outbox.push(letter("c-aaaa", "laptop", &Request::List));
++        }
++        let cfg = LinkConfig {
++            backoff_start: Duration::from_millis(20),
++            backoff_max: Duration::from_millis(60),
++            ..LinkConfig::new(srv.base(), id("laptop"), "t")
++        };
++        let handle = spawn(Link::with_handler(cfg, Arc::new(|_: &Envelope| None)));
++        // 等到信封被取走、再多轮询几次，确保真的没有答复在路上。
++        wait_for(|| (srv.state.lock().unwrap().polls >= 3).then_some(()));
++        handle.stop();
++        assert!(srv.state.lock().unwrap().outbox.is_empty(), "信封该被取走");
++        assert!(srv.state.lock().unwrap().got.is_empty(), "不该回任何东西");
++    }
++
++    /// 令牌续期换的是共享的那一格：轮询线程下一次就带上新令牌，不用重起。
++    /// `before_poll` 也确实在连接线程上、每次轮询之前被调到。
++    #[test]
++    fn a_renewed_token_is_used_by_the_next_poll_and_before_poll_runs() {
++        let srv = FakeSrv::start();
++        let cfg = LinkConfig {
++            backoff_start: Duration::from_millis(20),
++            backoff_max: Duration::from_millis(60),
++            ..LinkConfig::new(srv.base(), id("laptop"), "old")
++        };
++        let token = cfg.token.clone();
++        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++        let c = calls.clone();
++        let link = Link::with_handler(cfg, Arc::new(|_: &Envelope| None)).before_poll(Arc::new(
++            move || {
++                if c.fetch_add(1, Ordering::SeqCst) == 1 {
++                    token.set("new");
++                }
++            },
++        ));
++        let handle = spawn(link);
++        wait_for(|| {
++            let st = srv.state.lock().unwrap();
++            st.poll_tokens.iter().any(|t| t == "new").then_some(())
++        });
++        handle.stop();
++        let st = srv.state.lock().unwrap();
++        assert_eq!(st.poll_tokens[0], "old");
++        assert!(calls.load(Ordering::SeqCst) >= 2);
++    }
++
++    #[test]
++    fn peers_returns_what_the_relay_lists() {
++        let srv = FakeSrv::start();
++        srv.state.lock().unwrap().peers = vec![id("c-bbbb"), id("c-cccc")];
++        let cfg = LinkConfig::new(srv.base(), id("c-aaaa"), "t");
++        let got = peers(&cfg, &agent(&cfg)).unwrap();
++        assert_eq!(got, vec![id("c-bbbb"), id("c-cccc")]);
++    }
++
++    #[test]
++    fn ask_returns_the_reply_envelope_and_carries_auth() {
++        let srv = FakeSrv::start();
++        let reply = Envelope {
++            from: id("c-bbbb"),
++            to: id("c-aaaa"),
++            seq: 5,
++            payload: b"answer".to_vec(),
++            recipients: vec![],
++        };
++        srv.state.lock().unwrap().ask = Some(Ok(reply.clone()));
++        let cfg = LinkConfig::new(srv.base(), id("c-aaaa"), "tok");
++        let q = Envelope {
++            from: id("c-aaaa"),
++            to: id("c-bbbb"),
++            seq: 5,
++            payload: b"question".to_vec(),
++            recipients: vec![],
++        };
++        assert_eq!(ask(&cfg, &agent(&cfg), q.clone()).unwrap(), reply);
++        let asked = srv.state.lock().unwrap().asked.clone();
++        assert_eq!(asked[0].envelope, q);
++        assert_eq!(asked[0].auth.token, "tok");
++        assert_eq!(asked[0].auth.endpoint, id("c-aaaa"));
++    }
++
++    /// 中转说「不」的时候，调用方拿到的是它说的那个码，不是笼统的「失败」。
++    #[test]
++    fn a_relay_refusal_comes_back_as_its_code() {
++        let srv = FakeSrv::start();
++        srv.state.lock().unwrap().ask = Some(Err(dct_link::LinkError::Offline));
++        let cfg = LinkConfig::new(srv.base(), id("c-aaaa"), "t");
++        let q = letter("c-aaaa", "c-bbbb", &Request::List);
++        assert_eq!(
++            ask(&cfg, &agent(&cfg), q),
++            Err(LinkError::Relay(dct_link::LinkError::Offline))
++        );
++    }
++
++    #[test]
++    fn a_relay_that_is_not_there_is_unreachable() {
++        // 绑一个口再放掉：这个地址上保证没人听。
++        let addr = TcpListener::bind("127.0.0.1:0")
++            .unwrap()
++            .local_addr()
++            .unwrap();
++        let cfg = LinkConfig::new(format!("http://{addr}"), id("c-aaaa"), "t");
++        let env = letter("c-aaaa", "c-bbbb", &Request::List);
++        assert_eq!(send(&cfg, &agent(&cfg), env), Err(LinkError::Unreachable));
++    }
++
++    #[test]
++    fn the_token_does_not_show_up_in_debug_output() {
++        let cfg = LinkConfig::new("http://x", id("laptop"), "sekrit-token");
++        assert!(!format!("{cfg:?}").contains("sekrit-token"));
++    }
++
++    fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> T {
++        let deadline = std::time::Instant::now() + Duration::from_secs(10);
++        loop {
++            if let Some(v) = f() {
++                return v;
++            }
++            assert!(std::time::Instant::now() < deadline, "等不到");
++            std::thread::sleep(Duration::from_millis(20));
++        }
++    }
++
+     /// 地址结尾多一个斜杠不该变成 `//link/poll`。
+     #[test]
+     fn a_trailing_slash_in_the_address_does_not_double_up() {
+         let cfg = LinkConfig::new("http://x:1/", id("laptop"), "t");
+         assert_eq!(cfg.url(PATH_POLL), "http://x:1/link/poll");
+     }
+ }
+diff --git a/src/mesh/login.rs b/src/mesh/login.rs
+index 617258f..88ca0c8 100644
+--- a/src/mesh/login.rs
++++ b/src/mesh/login.rs
+@@ -15,20 +15,23 @@
+ 
+ use serde::Deserialize;
+ 
+ /// `secrets.toml` 里存中转令牌的键，跟 `PHONE_TOKEN_KEY` / `WEB_TOKEN_KEY`
+ /// 一类，是一个 profile 不可能占用的名字，不会出现在密钥页（`c`）里。
+ pub const RELAY_TOKEN_KEY: &str = "__relay__";
+ 
+ /// 令牌的过期时间（unix 秒，十进制字符串），存在 `RELAY_TOKEN_KEY` 旁边。
+ pub const RELAY_TOKEN_EXP_KEY: &str = "__relay_exp__";
+ 
++/// 换令牌用的是哪个 profile 的 `api_key`：DC 配对拿到的那一把。
++pub const DC_PROFILE: &str = "dc";
++
+ /// 一天的秒数。`needs_renewal` 的阈值。
+ const ONE_DAY_SECS: u64 = 24 * 60 * 60;
+ 
+ #[derive(Deserialize)]
+ struct TokenResponse {
+     token: String,
+     exp: u64,
+ }
+ 
+ /// `send` 的形状：url、Bearer、JSON 请求体 → 状态码、响应体。只是给
+@@ -71,20 +74,102 @@ pub fn fetch_token(
+         other => Err(format!("网关出错了（{other}），请稍后再试")),
+     }
+ }
+ 
+ /// 令牌剩不到 1 天（86400 秒）就该续期。`exp <= now`（已经过期）也算数——
+ /// `saturating_sub` 把它归到「剩 0 秒」，同样小于一天。
+ pub fn needs_renewal(exp: u64, now: u64) -> bool {
+     exp.saturating_sub(now) < ONE_DAY_SECS
+ }
+ 
++/// 生产路径的 `Transport`：真打 `ureq`。**测试不走这里**（仓库规矩：测试
++/// 不碰网络），`fetch_token`/`renew_if_due` 的测试都注入假的。
++pub fn http_transport(url: &str, bearer: &str, body: &str) -> Result<(u16, String), String> {
++    let agent = crate::sys::tls::agent_builder()
++        .timeout(std::time::Duration::from_secs(15))
++        .build();
++    match agent
++        .post(url)
++        .set("Authorization", &format!("Bearer {bearer}"))
++        .set("Content-Type", "application/json")
++        .send_string(body)
++    {
++        Ok(r) => {
++            let code = r.status();
++            Ok((code, r.into_string().unwrap_or_default()))
++        }
++        Err(ureq::Error::Status(code, r)) => Ok((code, r.into_string().unwrap_or_default())),
++        Err(e) => Err(e.to_string()),
++    }
++}
++
++/// `renew_if_due` 做了什么。
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Renewal {
++    /// 还剩一天以上，什么都没做。
++    NotDue,
++    /// 换到了新令牌：内存里那一格和 secrets 都换了。
++    Renewed,
++    /// 该换没换成。**旧令牌原样留着**，能用到它过期为止。
++    Failed(String),
++}
++
++/// 令牌剩不到一天就跟网关换一张新的。在连接线程上调（它会打网络），
++/// **不在 tick 上**。
++///
++/// 过期时间读不到（没存、存坏了）当成已经过期：宁可多换一次，也不要拿着
++/// 一张不知道什么时候作废的令牌一直用到被中转拒掉。
++///
++/// 打网络的那一段**不攥着 secrets 的锁**：一次 HTTP 最长十几秒，那段时间里
++/// 界面问密钥页、配对落盘都要这把锁。
++pub fn renew_if_due(
++    secrets: &std::sync::Mutex<crate::secrets::SecretStore>,
++    token: &crate::link::Token,
++    origin: Option<&str>,
++    endpoint: &str,
++    now: u64,
++    send: Transport,
++) -> Renewal {
++    let api_key = {
++        let s = secrets.lock().unwrap_or_else(|e| e.into_inner());
++        let exp = s
++            .get(RELAY_TOKEN_EXP_KEY)
++            .and_then(|v| v.parse::<u64>().ok())
++            .unwrap_or(0);
++        if !needs_renewal(exp, now) {
++            return Renewal::NotDue;
++        }
++        match s.get(DC_PROFILE) {
++            Some(k) => k.to_string(),
++            None => return Renewal::Failed("没有 DC 账号的密钥，续不了中转令牌".into()),
++        }
++    };
++    let Some(origin) = origin else {
++        return Renewal::Failed("找不到 DC 网关的地址，续不了中转令牌".into());
++    };
++    let (new_token, exp) = match fetch_token(origin, &api_key, endpoint, send) {
++        Ok(v) => v,
++        Err(e) => return Renewal::Failed(e),
++    };
++    token.set(new_token.clone());
++    let mut s = secrets.lock().unwrap_or_else(|e| e.into_inner());
++    let saved = s
++        .set(RELAY_TOKEN_KEY, &new_token)
++        .and_then(|_| s.set(RELAY_TOKEN_EXP_KEY, &exp.to_string()));
++    match saved {
++        Ok(()) => Renewal::Renewed,
++        // 内存里已经换上了，这次进程里照样能用；下次启动会发现过期时间还是
++        // 旧的，再换一次。
++        Err(e) => Renewal::Failed(format!("新令牌存不下：{e}")),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use std::cell::RefCell;
+ 
+     /// 记录最后一次调用的 `(url, bearer, body)`，返回预设的 `(status, body)`。
+     struct FakeSend {
+         calls: RefCell<Vec<(String, String, String)>>,
+         reply: Result<(u16, String), String>,
+     }
+@@ -207,11 +292,106 @@ mod tests {
+ 
+     #[test]
+     fn needs_renewal_is_true_once_already_expired() {
+         assert!(needs_renewal(100, 200));
+     }
+ 
+     #[test]
+     fn needs_renewal_is_false_with_plenty_of_time_left() {
+         assert!(!needs_renewal(1_000_000, 0));
+     }
++
++    mod renewal {
++        use super::*;
++        use crate::link::Token;
++        use crate::secrets::SecretStore;
++        use std::sync::Mutex;
++
++        const NOW: u64 = 1_800_000_000;
++
++        fn secrets(
++            exp: Option<u64>,
++            dc_key: Option<&str>,
++        ) -> (tempfile::TempDir, Mutex<SecretStore>) {
++            let t = tempfile::tempdir().unwrap();
++            let mut s = SecretStore::load(&t.path().join("secrets.toml"));
++            s.set(RELAY_TOKEN_KEY, "old").unwrap();
++            if let Some(e) = exp {
++                s.set(RELAY_TOKEN_EXP_KEY, &e.to_string()).unwrap();
++            }
++            if let Some(k) = dc_key {
++                s.set(DC_PROFILE, k).unwrap();
++            }
++            (t, Mutex::new(s))
++        }
++
++        fn never(_: &str, _: &str, _: &str) -> Result<(u16, String), String> {
++            panic!("不该打网络")
++        }
++
++        #[test]
++        fn a_token_with_more_than_a_day_left_is_left_alone() {
++            let (_t, s) = secrets(Some(NOW + 2 * ONE_DAY_SECS), Some("sk"));
++            let tok = Token::new("old");
++            assert_eq!(
++                renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &never),
++                Renewal::NotDue
++            );
++            assert_eq!(tok.get(), "old");
++        }
++
++        #[test]
++        fn a_token_about_to_expire_is_renewed_in_memory_and_on_disk() {
++            let (t, s) = secrets(Some(NOW + 60), Some("sk-live"));
++            let tok = Token::new("old");
++            let fake =
++                FakeSend::returning(Ok((200, r#"{"token":"fresh","exp":1900000000}"#.into())));
++            let got = renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &fake.as_fn());
++            assert_eq!(got, Renewal::Renewed);
++            assert_eq!(tok.get(), "fresh");
++            let (url, bearer, body) = fake.last_call();
++            assert_eq!(url, "https://gw/admin/api/relay/token");
++            assert_eq!(bearer, "sk-live");
++            assert_eq!(body, r#"{"endpoint":"c-aa"}"#);
++            let disk = SecretStore::load(&t.path().join("secrets.toml"));
++            assert_eq!(disk.get(RELAY_TOKEN_KEY), Some("fresh"));
++            assert_eq!(disk.get(RELAY_TOKEN_EXP_KEY), Some("1900000000"));
++        }
++
++        #[test]
++        fn a_failed_renewal_keeps_the_old_token() {
++            let (t, s) = secrets(Some(NOW + 60), Some("sk"));
++            let tok = Token::new("old");
++            let fake = FakeSend::returning(Ok((401, String::new())));
++            let got = renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &fake.as_fn());
++            assert!(matches!(got, Renewal::Failed(_)), "{got:?}");
++            assert_eq!(tok.get(), "old");
++            let disk = SecretStore::load(&t.path().join("secrets.toml"));
++            assert_eq!(disk.get(RELAY_TOKEN_KEY), Some("old"));
++        }
++
++        #[test]
++        fn a_missing_expiry_counts_as_due() {
++            let (_t, s) = secrets(None, Some("sk"));
++            let tok = Token::new("old");
++            let fake = FakeSend::returning(Ok((200, r#"{"token":"fresh","exp":1}"#.into())));
++            let got = renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &fake.as_fn());
++            assert_eq!(got, Renewal::Renewed);
++        }
++
++        #[test]
++        fn no_dc_key_or_no_origin_fails_without_touching_the_network() {
++            let (_t, s) = secrets(Some(NOW), None);
++            let tok = Token::new("old");
++            assert!(matches!(
++                renew_if_due(&s, &tok, Some("https://gw"), "c-aa", NOW, &never),
++                Renewal::Failed(_)
++            ));
++            let (_t2, s2) = secrets(Some(NOW), Some("sk"));
++            assert!(matches!(
++                renew_if_due(&s2, &tok, None, "c-aa", NOW, &never),
++                Renewal::Failed(_)
++            ));
++            assert_eq!(tok.get(), "old");
++        }
++    }
+ }
+diff --git a/src/mesh/mod.rs b/src/mesh/mod.rs
+index 7dc2c33..b2a98ae 100644
+--- a/src/mesh/mod.rs
++++ b/src/mesh/mod.rs
+@@ -1,7 +1,637 @@
+ //! 多电脑：几台电脑上的智能体互相留言、派活。设计见
+ //! `docs/superpowers/specs/2026-09-28-dct-multi-machine-design.md`。
+ //!
+-//! 这一步只放 `login`（跟网关换中转令牌）。名单、钥匙落盘、收发信封等
+-//! 后续任务会陆续往这个模块里加。
++//! - `login`：跟网关换中转令牌、到期前续期；
++//! - `store`：钥匙、电脑名、组名单落盘；
++//! - `net`：往外发（`Net` trait，真的 `LinkNet` 和测试用的 `FakeHub`）；
++//! - 这里：`Mesh`，守护进程里这台电脑在组里的全部状态，以及电脑信封唯一的
++//!   入口 `Mesh::on_envelope`。
++use std::collections::{HashMap, HashSet, VecDeque};
++use std::sync::{Arc, Mutex};
++use std::time::Instant;
++
++use base64::{engine::general_purpose::STANDARD, Engine as _};
++use dct_link::Envelope;
++use dct_mesh::roster::{self, Member, SignedRoster};
++use dct_mesh::seal::{self, Kind, Message, Sealed};
++use dct_mesh::wire::{self, JoinRequest, Payload};
++use dct_mesh::{id, MachineKeys};
++
++use crate::journal::Journal;
++use crate::link::Handler;
+ 
+ pub mod login;
++pub mod net;
++pub mod store;
++
++/// 中转的默认地址。`~/.dct/config.toml` 里 `[mesh] relay = "…"` 可以改。
++///
++/// 上线之前这个地址还连不上：连接线程会按退避一直重试，不刷屏、不报错，
++/// 见 `link::Link::run`。
++pub const DEFAULT_RELAY: &str = "https://dataclue.cn/dct-relay";
++
++/// 电脑端点的前缀（`id::endpoint_for` 算出来的都长这样）。`Link` 收到的
++/// 信封按它分流：电脑走 `Mesh`，别的走 proto 那一路。
++pub const COMPUTER_PREFIX: &str = "c-";
++
++/// 一条留言的 `sent_at` 跟我这边的时钟差多少以内才收。
++///
++/// `seal::open` 不防重放（见它的文档），这一层防：按 `(from, id)` 去重，
++/// 再卡这个窗口。去重表是有界的，窗口保证一条被挤出表的旧 id 也回放不进来
++/// ——只要表在窗口时间里装得下所有收到过的 id。
++pub const SENT_AT_WINDOW_SECS: u64 = 10 * 60;
++
++/// 去重表记多少条。
++const SEEN_CAP: usize = 1024;
++
++/// 还没解析到具体会话的留言放在这个键下面。会话 id 从 1 数起，0 不会撞上。
++/// Task 7 按会话名解析、投递。
++pub const UNRESOLVED_SESSION: u32 = 0;
++
++/// 一条等着投进会话的留言。
++#[derive(Debug, Clone)]
++pub struct QueuedMsg {
++    pub msg: Message,
++    pub received_at: Instant,
++}
++
++/// 最近见过的 `(from, id)`，先进先出、有上限。
++#[derive(Default)]
++struct Seen {
++    order: VecDeque<(String, String)>,
++    set: HashSet<(String, String)>,
++}
++
++impl Seen {
++    /// 第一次见返回 `true` 并记下；见过返回 `false`。
++    fn first_time(&mut self, from: &str, id: &str) -> bool {
++        let key = (from.to_string(), id.to_string());
++        if self.set.contains(&key) {
++            return false;
++        }
++        if self.order.len() >= SEEN_CAP {
++            if let Some(old) = self.order.pop_front() {
++                self.set.remove(&old);
++            }
++        }
++        self.order.push_back(key.clone());
++        self.set.insert(key);
++        true
++    }
++}
++
++type Clock = Box<dyn Fn() -> u64 + Send>;
++type Rand = Box<dyn Fn() -> [u8; 32] + Send>;
++
++/// 守护进程里这台电脑在组里的状态。放在 `Arc<Mutex<..>>` 里共享。
++pub struct Mesh {
++    pub keys: MachineKeys,
++    pub me: Member,
++    pub roster: Option<SignedRoster>,
++    /// 等人批准的加入请求：请求、6 位核对码、收到的时间。Task 6 填。
++    pub pending_joins: Vec<(JoinRequest, String, Instant)>,
++    /// 按会话 id 排队的留言。Task 7 投递。
++    pub queues: HashMap<u32, VecDeque<QueuedMsg>>,
++    store: Option<store::Store>,
++    journal: Arc<Journal>,
++    seen: Seen,
++    clock: Clock,
++    rand: Rand,
++}
++
++impl Mesh {
++    /// `name` 是这台电脑想叫的名字；名单里已经有我，就以名单里那条记录为准
++    /// （`added_at` 之类的字段是签进名单里的，自己另编一份就对不上了）。
++    pub fn new(keys: MachineKeys, name: String, roster: Option<SignedRoster>) -> Mesh {
++        let endpoint = id::endpoint_for(&keys.sign_pub());
++        let me = roster
++            .as_ref()
++            .and_then(|r| r.roster.member(&endpoint).cloned())
++            .unwrap_or_else(|| Member {
++                name,
++                endpoint,
++                sign_pub: STANDARD.encode(keys.sign_pub()),
++                kx_pub: STANDARD.encode(keys.kx_pub()),
++                added_at: unix_now(),
++            });
++        Mesh {
++            keys,
++            me,
++            roster,
++            pending_joins: Vec::new(),
++            queues: HashMap::new(),
++            store: None,
++            journal: Arc::new(Journal::new()),
++            seen: Seen::default(),
++            clock: Box::new(unix_now),
++            rand: Box::new(os_rand),
++        }
++    }
++
++    /// 从磁盘读出（第一次就生成）钥匙、名字、名单。
++    pub fn load(store: store::Store) -> anyhow::Result<Mesh> {
++        let keys = store.load_or_create_keys(&os_rand)?;
++        let name = store.name()?;
++        let roster = store.roster()?;
++        Ok(Mesh::new(keys, name, roster).with_store(store))
++    }
++
++    /// 名单变了就存到这里。没有 store（测试）就只改内存。
++    pub fn with_store(mut self, s: store::Store) -> Mesh {
++        self.store = Some(s);
++        self
++    }
++
++    pub fn with_journal(mut self, j: Arc<Journal>) -> Mesh {
++        self.journal = j;
++        self
++    }
++
++    pub fn with_clock(mut self, c: impl Fn() -> u64 + Send + 'static) -> Mesh {
++        self.clock = Box::new(c);
++        self
++    }
++
++    pub fn with_rand(mut self, r: impl Fn() -> [u8; 32] + Send + 'static) -> Mesh {
++        self.rand = Box::new(r);
++        self
++    }
++
++    pub fn endpoint(&self) -> &str {
++        &self.me.endpoint
++    }
++
++    /// 电脑信封的唯一入口。返回值是要回给发件方的 payload；`None` = 不回。
++    ///
++    /// **任何验证失败都是沉默**：丢掉、记一行 journal、不回任何东西。回一句
++    /// 「签名不对」「你不在名单里」，就是在教伪造者下一次怎么改。
++    pub fn on_envelope(&mut self, env: &Envelope) -> Option<Vec<u8>> {
++        let payload = match wire::decode(&env.payload) {
++            Ok(p) => p,
++            Err(_) => return self.drop(env, "undecodable"),
++        };
++        match payload {
++            Payload::Roster(r) => self.take_roster(env, r),
++            Payload::Sealed(s) => self.take_sealed(env, &s),
++            // 加入这一路是 Task 6 的事；在那之前收到就当没收到。
++            Payload::Join(_) | Payload::JoinPending { .. } => None,
++        }
++    }
++
++    fn take_roster(&mut self, env: &Envelope, incoming: SignedRoster) -> Option<Vec<u8>> {
++        // 还没在任何组里的电脑，**不从网上接一份名单当自己的第一份**：
++        // `accept(None, ..)` 只查「是一份自签的创世名单」，同账号里谁都造得
++        // 出一份。加入别人的组要走 `accept_invite`（Task 6），它还要核对
++        // 签名者就是给我算过 6 位数的那台电脑。
++        let Some(current) = self.roster.as_ref() else {
++            return self.drop(env, "roster_without_group");
++        };
++        if let Err(e) = roster::accept(Some(current), &incoming) {
++            return self.drop(env, &format!("roster_{e:?}"));
++        }
++        if let Some(s) = &self.store {
++            if let Err(e) = s.save_roster(&incoming) {
++                // 存不下就不换：内存跟磁盘各说一套的话，重启之后会退回旧名单，
++                // 而那时候谁也不记得发生过什么。对方下一次广播会再送来。
++                self.journal
++                    .mesh(&format!("roster_not_saved from={} err={e}", env.from));
++                return None;
++            }
++        }
++        if let Some(mine) = incoming.roster.member(&self.me.endpoint) {
++            self.me = mine.clone();
++        }
++        self.roster = Some(incoming);
++        None
++    }
++
++    fn take_sealed(&mut self, env: &Envelope, s: &Sealed) -> Option<Vec<u8>> {
++        let Some(current) = self.roster.as_ref() else {
++            return self.drop(env, "sealed_without_group");
++        };
++        let m = match seal::open(s, &self.keys, &current.roster, env.from.as_str()) {
++            Ok(m) => m,
++            Err(e) => return self.drop(env, &format!("sealed_{e:?}")),
++        };
++        let now = (self.clock)();
++        if now.abs_diff(m.sent_at) > SENT_AT_WINDOW_SECS {
++            return self.drop(env, "stale");
++        }
++        if !self.seen.first_time(&m.from, &m.id) {
++            return self.drop(env, "replay");
++        }
++        match m.kind {
++            Kind::Msg => {
++                let key = session_key(&m.to_session);
++                self.queues.entry(key).or_default().push_back(QueuedMsg {
++                    msg: m.clone(),
++                    received_at: Instant::now(),
++                });
++                self.reply(&m, Kind::Receipt, "queued".to_string())
++            }
++            Kind::StatusRequest => {
++                let body = serde_json::json!({ "os": std::env::consts::OS }).to_string();
++                self.reply(&m, Kind::Status, body)
++            }
++            // 回执和状态只该作为 `ask` 的答复回来，不该从轮询里进来；进来了
++            // 也不回——回的话两台电脑能互相回到天荒地老。
++            Kind::Receipt | Kind::Status => None,
++        }
++    }
++
++    /// 给 `to_what` 的发件人回一条加密的 `kind`。`id` 跟原消息一样，对方靠它配对。
++    fn reply(&self, to_what: &Message, kind: Kind, body: String) -> Option<Vec<u8>> {
++        let roster = self.roster.as_ref()?;
++        let peer = roster.roster.member(&to_what.from)?;
++        let kx: [u8; 32] = STANDARD.decode(&peer.kx_pub).ok()?.try_into().ok()?;
++        let m = Message {
++            id: to_what.id.clone(),
++            kind,
++            from: self.me.endpoint.clone(),
++            from_session: to_what.to_session.clone(),
++            to: to_what.from.clone(),
++            to_session: to_what.from_session.clone(),
++            body,
++            sent_at: (self.clock)(),
++        };
++        let sealed = seal::seal(&m, &self.keys, &kx, (self.rand)());
++        Some(wire::encode(&Payload::Sealed(sealed)))
++    }
++
++    fn drop(&self, env: &Envelope, why: &str) -> Option<Vec<u8>> {
++        self.journal
++            .mesh(&format!("dropped from={} why={why}", env.from));
++        None
++    }
++}
++
++/// `#12` 这种写法直接就是会话 id；会话名要等 Task 7 按看板上的名字解析。
++fn session_key(to_session: &str) -> u32 {
++    to_session
++        .strip_prefix('#')
++        .and_then(|n| n.parse().ok())
++        .filter(|n| *n != UNRESOLVED_SESSION)
++        .unwrap_or(UNRESOLVED_SESSION)
++}
++
++/// `Link` 收到的信封怎么分：`c-` 开头的是电脑，交给 `Mesh`；别的交给
++/// `proto`（手机那一路）。`proto` 是 `None` 就不回——这一步手机那一路还没
++/// 接到中转上，但路留着。
++pub fn route(mesh: Arc<Mutex<Mesh>>, proto: Option<Handler>) -> Handler {
++    Arc::new(move |env: &Envelope| {
++        if env.from.as_str().starts_with(COMPUTER_PREFIX) {
++            mesh.lock()
++                .unwrap_or_else(|e| e.into_inner())
++                .on_envelope(env)
++        } else {
++            proto.as_ref().and_then(|h| h(env))
++        }
++    })
++}
++
++fn unix_now() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or(0)
++}
++
++/// 操作系统的 CSPRNG。拿不到就没法造钥匙、没法加密，继续下去只会更糟。
++pub fn os_rand() -> [u8; 32] {
++    let mut b = [0u8; 32];
++    getrandom::getrandom(&mut b).expect("系统随机数不可用");
++    b
++}
++
++#[cfg(test)]
++mod tests {
++    use super::net::testing::FakeHub;
++    use super::net::Net;
++    use super::*;
++    use dct_link::EndpointId;
++    use std::time::Duration;
++
++    const NOW: u64 = 1_800_000_000;
++
++    fn keys(b: u8) -> MachineKeys {
++        MachineKeys::from_seeds([b; 32], [b.wrapping_add(100); 32]).unwrap()
++    }
++
++    fn member(k: &MachineKeys, name: &str) -> Member {
++        Member {
++            name: name.into(),
++            endpoint: id::endpoint_for(&k.sign_pub()),
++            sign_pub: STANDARD.encode(k.sign_pub()),
++            kx_pub: STANDARD.encode(k.kx_pub()),
++            added_at: 1,
++        }
++    }
++
++    /// A 建组、把 B 签进去（version 2）。返回两台都拿着 v2 名单的 `Mesh`。
++    fn pair_ab() -> (Mesh, Mesh, SignedRoster) {
++        let (ka, kb) = (keys(1), keys(2));
++        let (ma, mb) = (member(&ka, "A"), member(&kb, "B"));
++        let g = roster::genesis(ma.clone(), "mine".into(), &ka);
++        let mut r2 = g.roster.clone();
++        r2.version = 2;
++        r2.members.push(mb);
++        let v2 = roster::sign(r2, &ma, &ka);
++        let a = Mesh::new(ka, "A".into(), Some(v2.clone())).with_clock(|| NOW);
++        let b = Mesh::new(kb, "B".into(), Some(v2.clone())).with_clock(|| NOW);
++        (a, b, v2)
++    }
++
++    fn env(from: &str, to: &str, payload: Vec<u8>) -> Envelope {
++        Envelope {
++            from: EndpointId::new(from).unwrap(),
++            to: EndpointId::new(to).unwrap(),
++            seq: 1,
++            payload,
++            recipients: vec![],
++        }
++    }
++
++    fn msg(from: &Mesh, to: &Mesh, kind: Kind, id: &str, sent_at: u64) -> Message {
++        Message {
++            id: id.into(),
++            kind,
++            from: from.endpoint().into(),
++            from_session: "#3".into(),
++            to: to.endpoint().into(),
++            to_session: "#7".into(),
++            body: "hi".into(),
++            sent_at,
++        }
++    }
++
++    fn sealed_env(from: &Mesh, to: &Mesh, m: &Message) -> Envelope {
++        let s = seal::seal(m, &from.keys, &to.keys.kx_pub(), [42; 32]);
++        env(
++            from.endpoint(),
++            to.endpoint(),
++            wire::encode(&Payload::Sealed(s)),
++        )
++    }
++
++    fn open_reply(me: &Mesh, from: &Mesh, payload: &[u8]) -> Message {
++        let Payload::Sealed(s) = wire::decode(payload).unwrap() else {
++            panic!("回的该是密封的");
++        };
++        seal::open(
++            &s,
++            &me.keys,
++            &me.roster.as_ref().unwrap().roster,
++            from.endpoint(),
++        )
++        .unwrap()
++    }
++
++    fn journal() -> (tempfile::TempDir, Arc<Journal>, std::path::PathBuf) {
++        let t = tempfile::tempdir().unwrap();
++        let p = t.path().join("sessions.log");
++        let j = Journal::new();
++        j.set_path(p.clone());
++        (t, Arc::new(j), p)
++    }
++
++    #[test]
++    fn a_message_from_a_member_is_queued_and_answered_with_a_sealed_receipt() {
++        let (a, mut b, _) = pair_ab();
++        let m = msg(&a, &b, Kind::Msg, "m1", NOW);
++        let reply = b.on_envelope(&sealed_env(&a, &b, &m)).expect("该回回执");
++        let r = open_reply(&a, &b, &reply);
++        assert_eq!(r.kind, Kind::Receipt);
++        assert_eq!(r.id, "m1");
++        assert_eq!(r.to_session, "#3");
++        let q = &b.queues[&7];
++        assert_eq!(q.len(), 1);
++        assert_eq!(q[0].msg, m);
++    }
++
++    #[test]
++    fn a_status_request_is_answered_with_an_encrypted_status() {
++        let (a, mut b, _) = pair_ab();
++        let m = msg(&a, &b, Kind::StatusRequest, "s1", NOW);
++        let reply = b.on_envelope(&sealed_env(&a, &b, &m)).unwrap();
++        let r = open_reply(&a, &b, &reply);
++        assert_eq!(r.kind, Kind::Status);
++        assert!(r.body.contains(std::env::consts::OS));
++        assert!(b.queues.is_empty(), "状态查询不进排队");
++    }
++
++    #[test]
++    fn a_sealed_message_from_a_machine_not_in_the_roster_is_dropped_without_reply() {
++        let (_a, mut b, _) = pair_ab();
++        let (t, j, path) = journal();
++        b = b.with_journal(j);
++        // 一台不在名单里的电脑：它自己的钥匙签、用 B 的真公钥加密——密码学上
++        // 一切都对，只是名单里没有它。
++        let stranger = Mesh::new(keys(9), "X".into(), None).with_clock(|| NOW);
++        let m = msg(&stranger, &b, Kind::Msg, "x1", NOW);
++        assert_eq!(b.on_envelope(&sealed_env(&stranger, &b, &m)), None);
++        assert!(b.queues.is_empty());
++        let log = std::fs::read_to_string(&path).unwrap();
++        assert_eq!(log.lines().count(), 1, "丢掉要留一行痕迹：{log}");
++        assert!(log.contains("dropped") && log.contains(stranger.endpoint()));
++        drop(t);
++    }
++
++    #[test]
++    fn a_replayed_message_is_dropped_the_second_time() {
++        let (a, mut b, _) = pair_ab();
++        let e = sealed_env(&a, &b, &msg(&a, &b, Kind::Msg, "m1", NOW));
++        assert!(b.on_envelope(&e).is_some());
++        assert_eq!(b.on_envelope(&e), None, "同一条再来一次该被丢掉");
++        assert_eq!(b.queues[&7].len(), 1, "也不能排两次");
++    }
++
++    #[test]
++    fn a_message_outside_the_time_window_is_dropped() {
++        let (a, mut b, _) = pair_ab();
++        let old = msg(&a, &b, Kind::Msg, "old", NOW - SENT_AT_WINDOW_SECS - 1);
++        assert_eq!(b.on_envelope(&sealed_env(&a, &b, &old)), None);
++        let future = msg(&a, &b, Kind::Msg, "fut", NOW + SENT_AT_WINDOW_SECS + 1);
++        assert_eq!(b.on_envelope(&sealed_env(&a, &b, &future)), None);
++        let edge = msg(&a, &b, Kind::Msg, "edge", NOW - SENT_AT_WINDOW_SECS);
++        assert!(
++            b.on_envelope(&sealed_env(&a, &b, &edge)).is_some(),
++            "窗口边上还该收"
++        );
++    }
++
++    #[test]
++    fn the_seen_set_is_bounded() {
++        let mut s = Seen::default();
++        for i in 0..SEEN_CAP + 10 {
++            assert!(s.first_time("c-a", &i.to_string()));
++        }
++        assert_eq!(s.order.len(), SEEN_CAP);
++        assert_eq!(s.set.len(), SEEN_CAP);
++        assert!(!s.first_time("c-a", &(SEEN_CAP + 9).to_string()));
++        assert!(s.first_time("c-a", "0"), "最老的已经被挤出去了");
++        assert!(s.first_time("c-b", "5"), "去重键里有 from");
++    }
++
++    #[test]
++    fn a_roster_with_a_bad_signature_is_dropped_and_the_old_one_kept() {
++        let (a, mut b, v2) = pair_ab();
++        let mut r3 = v2.roster.clone();
++        r3.version = 3;
++        r3.members.retain(|m| m.name != "B");
++        let mut forged = roster::sign(r3, &a.me, &a.keys);
++        // 签名换成另一把钥匙签的：形状完全合法，只是验不过。
++        forged.sig = roster::sign(forged.roster.clone(), &a.me, &keys(9)).sig;
++        let e = env(
++            a.endpoint(),
++            b.endpoint(),
++            wire::encode(&Payload::Roster(forged)),
++        );
++        assert_eq!(b.on_envelope(&e), None);
++        assert_eq!(b.roster, Some(v2));
++    }
++
++    #[test]
++    fn a_valid_newer_roster_is_taken_and_saved() {
++        let (a, b, v2) = pair_ab();
++        let t = tempfile::tempdir().unwrap();
++        let st = store::Store::at(t.path().join("mesh"));
++        st.save_roster(&v2).unwrap();
++        let mut b = b.with_store(store::Store::at(t.path().join("mesh")));
++        let mut r3 = v2.roster.clone();
++        r3.version = 3;
++        r3.members.push(member(&keys(3), "C"));
++        let v3 = roster::sign(r3, &a.me, &a.keys);
++        let e = env(
++            a.endpoint(),
++            b.endpoint(),
++            wire::encode(&Payload::Roster(v3.clone())),
++        );
++        assert_eq!(b.on_envelope(&e), None);
++        assert_eq!(b.roster, Some(v3.clone()));
++        assert_eq!(st.roster().unwrap(), Some(v3));
++    }
++
++    /// 没在组里的电脑不从网上接第一份名单——哪怕它是一份合法的创世名单。
++    #[test]
++    fn a_machine_with_no_group_does_not_take_a_roster_off_the_wire() {
++        let stranger_keys = keys(9);
++        let g = roster::genesis(member(&stranger_keys, "X"), "evil".into(), &stranger_keys);
++        let mut lone = Mesh::new(keys(4), "L".into(), None);
++        let e = env(
++            &g.signer,
++            lone.endpoint(),
++            wire::encode(&Payload::Roster(g.clone())),
++        );
++        assert_eq!(lone.on_envelope(&e), None);
++        assert_eq!(lone.roster, None);
++    }
++
++    #[test]
++    fn garbage_is_dropped_silently() {
++        let (a, mut b, _) = pair_ab();
++        assert_eq!(
++            b.on_envelope(&env(a.endpoint(), b.endpoint(), b"{nope".to_vec())),
++            None
++        );
++    }
++
++    #[test]
++    fn computer_envelopes_go_to_the_mesh_and_others_to_proto() {
++        let (a, b, _) = pair_ab();
++        let a_ep = a.endpoint().to_string();
++        let b_ep = b.endpoint().to_string();
++        let b = Arc::new(Mutex::new(b));
++        let proto_calls = Arc::new(Mutex::new(Vec::<String>::new()));
++        let pc = proto_calls.clone();
++        let h = route(
++            b.clone(),
++            Some(Arc::new(move |e: &Envelope| {
++                pc.lock().unwrap().push(e.from.to_string());
++                Some(b"proto".to_vec())
++            })),
++        );
++
++        // 电脑来的：Mesh 回了一个密封回执，proto 没被碰。
++        let m = msg(&a, &b.lock().unwrap(), Kind::Msg, "m1", NOW);
++        let e = sealed_env(&a, &b.lock().unwrap(), &m);
++        let out = h(&e).unwrap();
++        assert!(matches!(wire::decode(&out), Ok(Payload::Sealed(_))));
++        assert!(proto_calls.lock().unwrap().is_empty());
++        assert_eq!(b.lock().unwrap().queues[&7].len(), 1);
++
++        // 手机来的：走 proto。
++        assert_eq!(
++            h(&env("phone:1", &b_ep, b"{}".to_vec())),
++            Some(b"proto".to_vec())
++        );
++        assert_eq!(
++            proto_calls.lock().unwrap().as_slice(),
++            &["phone:1".to_string()]
++        );
++
++        // 没有 proto：不回，也不交给 Mesh。
++        let h2 = route(b.clone(), None);
++        assert_eq!(h2(&env("phone:1", &b_ep, b"{}".to_vec())), None);
++        let _ = a_ep;
++    }
++
++    #[test]
++    fn session_keys_parse_hash_ids_and_park_names() {
++        assert_eq!(session_key("#12"), 12);
++        assert_eq!(session_key("dc-terminal"), UNRESOLVED_SESSION);
++        assert_eq!(session_key("#0"), UNRESOLVED_SESSION);
++        assert_eq!(session_key("#x"), UNRESOLVED_SESSION);
++    }
++
++    /// `FakeHub` 本身：两台内存里的电脑隔着它 `ask`，拿回对方的回执；
++    /// `peers` 只列别人；下线的收不到。
++    #[test]
++    fn two_meshes_talk_through_the_fake_hub() {
++        let (a, b, _) = pair_ab();
++        let a_ep = a.endpoint().to_string();
++        let b_ep = b.endpoint().to_string();
++        let m = msg(&a, &b, Kind::Msg, "m1", NOW);
++        let sealed = seal::seal(&m, &a.keys, &b.keys.kx_pub(), [5; 32]);
++        let a = Arc::new(Mutex::new(a));
++        let b = Arc::new(Mutex::new(b));
++        let hub = FakeHub::new();
++        hub.register(a.clone());
++        hub.register(b.clone());
++        let net = hub.net_for(&a_ep);
++
++        assert_eq!(net.peers().unwrap(), vec![b_ep.clone()]);
++
++        let reply = net
++            .ask(
++                &b_ep,
++                wire::encode(&Payload::Sealed(sealed)),
++                Duration::from_secs(3),
++            )
++            .unwrap();
++        let r = open_reply(&a.lock().unwrap(), &b.lock().unwrap(), &reply);
++        assert_eq!(r.kind, Kind::Receipt);
++
++        hub.set_online(&b_ep, false);
++        assert!(net.peers().unwrap().is_empty());
++        assert_eq!(
++            net.send(&b_ep, vec![]),
++            Err(crate::link::LinkError::Relay(dct_link::LinkError::Offline))
++        );
++    }
++
++    #[test]
++    fn a_new_mesh_takes_its_own_record_from_the_roster_when_it_is_in_one() {
++        let (a, _b, v2) = pair_ab();
++        let again = Mesh::new(keys(1), "改了名但名单里还是 A".into(), Some(v2));
++        assert_eq!(again.me, a.me);
++    }
++
++    #[test]
++    fn load_creates_keys_once_and_keeps_the_endpoint() {
++        let t = tempfile::tempdir().unwrap();
++        let first = Mesh::load(store::Store::at(t.path().join("mesh"))).unwrap();
++        let second = Mesh::load(store::Store::at(t.path().join("mesh"))).unwrap();
++        assert_eq!(first.endpoint(), second.endpoint());
++        assert!(first.endpoint().starts_with(COMPUTER_PREFIX));
++    }
++}
+diff --git a/src/mesh/net.rs b/src/mesh/net.rs
+new file mode 100644
+index 0000000..cdc5ddd
+--- /dev/null
++++ b/src/mesh/net.rs
+@@ -0,0 +1,233 @@
++//! 电脑往外发东西的那一侧：问谁在线、投一个信封、投了等答复。
++//!
++//! 收的那一侧是 `link::Link`（长轮询，在自己的线程上），发的这一侧是这里。
++//! 做成 trait 是为了多台电脑的流程（加入、批准、留言）能在一个进程里、不碰
++//! 网络地跑完：测试里用 `testing::FakeHub`，几台内存里的 `Mesh` 直接互相调
++//! `on_envelope`。
++//!
++//! **调用 `Net` 的时候别攥着自己那把 `Mesh` 锁。** 真网络上那只是让别的请求
++//! 多等一会儿；`FakeHub` 上是同步调用，对方要是回头调到你，就是死锁。
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::Duration;
++
++use dct_link::{EndpointId, Envelope};
++
++use crate::link::{self, LinkConfig, LinkError};
++
++pub trait Net: Send + Sync {
++    /// 跟我同账号、此刻在线的其它端点。
++    fn peers(&self) -> Result<Vec<String>, LinkError>;
++    /// 投一个信封，不等答复。
++    fn send(&self, to: &str, payload: Vec<u8>) -> Result<(), LinkError>;
++    /// 投一个信封，最多等 `timeout` 拿对面的答复。
++    fn ask(&self, to: &str, payload: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, LinkError>;
++}
++
++/// 真的走中转。跟 `Link` 共用同一个 `LinkConfig`（于是共用同一格令牌，
++/// 续期一次两边都换上）。
++pub struct LinkNet {
++    cfg: LinkConfig,
++    agent: ureq::Agent,
++    seq: AtomicU64,
++}
++
++impl LinkNet {
++    pub fn new(cfg: LinkConfig) -> LinkNet {
++        let agent = link::agent(&cfg);
++        LinkNet {
++            cfg,
++            agent,
++            seq: AtomicU64::new(seq_start()),
++        }
++    }
++
++    fn envelope(&self, to: &str, payload: Vec<u8>) -> Result<Envelope, LinkError> {
++        Ok(Envelope {
++            from: self.cfg.endpoint.clone(),
++            to: EndpointId::new(to).map_err(|_| LinkError::BadEndpoint)?,
++            seq: self.seq.fetch_add(1, Ordering::Relaxed),
++            payload,
++            recipients: vec![],
++        })
++    }
++}
++
++/// `seq` 从毫秒时间戳起步，而不是从 0。中转按 `(from, seq)` 挂 `ask` 的号，
++/// 而且**绝不顶掉已经挂着的号**（撞上就回 `Busy`）——守护进程重启之后要是
++/// 又从 0 数起，上一个进程还挂在中转上的那几个号就会让头几次 `ask` 平白失败。
++fn seq_start() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_millis() as u64)
++        .unwrap_or(1)
++}
++
++impl Net for LinkNet {
++    fn peers(&self) -> Result<Vec<String>, LinkError> {
++        link::peers(&self.cfg, &self.agent).map(|v| v.into_iter().map(String::from).collect())
++    }
++
++    fn send(&self, to: &str, payload: Vec<u8>) -> Result<(), LinkError> {
++        let env = self.envelope(to, payload)?;
++        link::send(&self.cfg, &self.agent, env)
++    }
++
++    fn ask(&self, to: &str, payload: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, LinkError> {
++        let env = self.envelope(to, payload)?;
++        let (want_from, want_seq) = (env.to.clone(), env.seq);
++        let reply = link::ask_within(&self.cfg, &self.agent, env, Some(timeout))?;
++        // 中转只按 `(to, seq)` 配对，这里再对一遍：配错了的答复当成没答。
++        if reply.from != want_from || reply.seq != want_seq {
++            return Err(LinkError::Unreachable);
++        }
++        Ok(reply.payload)
++    }
++}
++
++/// 内存里的中转，给多台电脑的流程测试用。
++#[cfg(test)]
++pub mod testing {
++    use super::*;
++    use crate::mesh::Mesh;
++    use std::collections::{HashMap, HashSet};
++    use std::sync::{Arc, Mutex};
++
++    /// 几台 `Mesh` 按端点登记在这里；`send`/`ask` 直接同步调对方的
++    /// `on_envelope`，`peers` 列出其它登记过、且在线的端点。
++    #[derive(Default)]
++    pub struct FakeHub {
++        nodes: Mutex<HashMap<String, Arc<Mutex<Mesh>>>>,
++        offline: Mutex<HashSet<String>>,
++        seq: AtomicU64,
++    }
++
++    impl FakeHub {
++        pub fn new() -> Arc<FakeHub> {
++            Arc::new(FakeHub::default())
++        }
++
++        /// 把一台 `Mesh` 挂上来，端点就是它自己的端点。
++        pub fn register(&self, mesh: Arc<Mutex<Mesh>>) {
++            let ep = mesh.lock().unwrap().endpoint().to_string();
++            self.nodes.lock().unwrap().insert(ep, mesh);
++        }
++
++        pub fn set_online(&self, endpoint: &str, online: bool) {
++            let mut off = self.offline.lock().unwrap();
++            if online {
++                off.remove(endpoint);
++            } else {
++                off.insert(endpoint.to_string());
++            }
++        }
++
++        /// 以 `me` 的身份往外发的那个 `Net`。
++        pub fn net_for(self: &Arc<Self>, me: &str) -> FakeNet {
++            FakeNet {
++                hub: self.clone(),
++                me: me.to_string(),
++            }
++        }
++
++        fn deliver(
++            &self,
++            from: &str,
++            to: &str,
++            payload: Vec<u8>,
++        ) -> Result<Option<Vec<u8>>, LinkError> {
++            let to_id = EndpointId::new(to).map_err(|_| LinkError::BadEndpoint)?;
++            if self.offline.lock().unwrap().contains(to) {
++                return Err(LinkError::Relay(dct_link::LinkError::Offline));
++            }
++            // 先把对方拿出来、放掉表锁，再去锁对方——对方的 `on_envelope`
++            // 里要是又用到这张表，不至于自己跟自己抢。
++            let target = self.nodes.lock().unwrap().get(to).cloned();
++            let Some(target) = target else {
++                return Err(LinkError::Relay(dct_link::LinkError::Offline));
++            };
++            let env = Envelope {
++                from: EndpointId::new(from).map_err(|_| LinkError::BadEndpoint)?,
++                to: to_id,
++                seq: self.seq.fetch_add(1, Ordering::Relaxed),
++                payload,
++                recipients: vec![],
++            };
++            let reply = target.lock().unwrap().on_envelope(&env);
++            Ok(reply)
++        }
++    }
++
++    pub struct FakeNet {
++        hub: Arc<FakeHub>,
++        me: String,
++    }
++
++    impl Net for FakeNet {
++        fn peers(&self) -> Result<Vec<String>, LinkError> {
++            let off = self.hub.offline.lock().unwrap().clone();
++            let mut out: Vec<String> = self
++                .hub
++                .nodes
++                .lock()
++                .unwrap()
++                .keys()
++                .filter(|ep| **ep != self.me && !off.contains(*ep))
++                .cloned()
++                .collect();
++            out.sort();
++            Ok(out)
++        }
++
++        fn send(&self, to: &str, payload: Vec<u8>) -> Result<(), LinkError> {
++            self.hub.deliver(&self.me, to, payload).map(|_| ())
++        }
++
++        fn ask(
++            &self,
++            to: &str,
++            payload: Vec<u8>,
++            _timeout: Duration,
++        ) -> Result<Vec<u8>, LinkError> {
++            self.hub
++                .deliver(&self.me, to, payload)?
++                .ok_or(LinkError::Relay(dct_link::LinkError::NoAnswer))
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn net() -> LinkNet {
++        LinkNet::new(LinkConfig::new(
++            "http://127.0.0.1:9",
++            EndpointId::new("c-aaaa").unwrap(),
++            "t",
++        ))
++    }
++
++    #[test]
++    fn envelopes_come_from_me_and_their_seq_goes_up() {
++        let n = net();
++        let a = n.envelope("c-bbbb", b"x".to_vec()).unwrap();
++        let b = n.envelope("c-bbbb", b"y".to_vec()).unwrap();
++        assert_eq!(a.from.as_str(), "c-aaaa");
++        assert_eq!(a.to.as_str(), "c-bbbb");
++        assert_eq!(b.seq, a.seq + 1);
++    }
++
++    /// 不从 0 数起，见 `seq_start`。
++    #[test]
++    fn seq_does_not_restart_from_zero() {
++        assert!(net().envelope("c-bbbb", vec![]).unwrap().seq > 1_000_000);
++    }
++
++    #[test]
++    fn a_bad_address_is_refused_before_anything_is_sent() {
++        assert_eq!(
++            net().send("not an id!", vec![]),
++            Err(LinkError::BadEndpoint)
++        );
++    }
++}
+diff --git a/src/mesh/store.rs b/src/mesh/store.rs
+new file mode 100644
+index 0000000..0436b22
+--- /dev/null
++++ b/src/mesh/store.rs
+@@ -0,0 +1,385 @@
++//! 这台电脑在「我的电脑」组里的身份，落在磁盘上的那部分：两把钥匙、自己叫
++//! 什么、最新的一份组名单。都在 `~/.dct/mesh/` 底下。
++//!
++//! **钥匙是文件，所有平台都一样，包括 Mac。** 第一步不用 Secure Enclave
++//! （计划里的裁定）：这两把钥匙要能被 `seal`/`roster` 直接拿来算，而 SE 里
++//! 的钥匙做不了 X25519。文件用 `sys::fs::create_private` 建（Unix 0600，
++//! Windows 只有属主一条 ACE），目录收紧到只有属主。
++//!
++//! **写盘一律是「临时文件 + rename」**：名单被写坏一半，下一次启动读到的是
++//! 一份解析不了的名单，这台电脑就从组里悄悄掉出去了；钥匙被写坏一半更糟，
++//! 它的身份（端点 id 就是签名公钥的哈希）直接换了。
++use std::path::{Path, PathBuf};
++
++use anyhow::{anyhow, bail, Context, Result};
++use base64::{engine::general_purpose::STANDARD, Engine as _};
++use dct_mesh::roster::MAX_NAME_LEN;
++use dct_mesh::{MachineKeys, SignedRoster};
++
++const SIGN_KEY: &str = "sign.key";
++const KX_KEY: &str = "kx.key";
++const NAME: &str = "name";
++const ROSTER: &str = "roster.json";
++
++pub struct Store {
++    dir: PathBuf,
++}
++
++impl Store {
++    pub fn at(dir: PathBuf) -> Store {
++        Store { dir }
++    }
++
++    /// `~/.dct/mesh`，跟 `KeyStore::default_dir()` 同一个父目录。
++    pub fn default_dir() -> PathBuf {
++        dir_for_socket(&crate::proto::socket_path())
++    }
++
++    pub fn dir(&self) -> &Path {
++        &self.dir
++    }
++
++    /// 读出这台电脑的两把钥匙；还没有就用 `rand` 生成、落盘。
++    ///
++    /// 两个文件的写入顺序是有讲究的：**先落 `kx.key`，再落 `sign.key`**，于是
++    /// 「`sign.key` 在」就意味着两把都完整写过。只有 `kx.key` 没有 `sign.key`
++    /// 是上次写到一半断了——那时这台电脑的身份还从没被用过（端点 id 由
++    /// `sign.key` 算出），整套重新生成是安全的。反过来「有 `sign.key` 没有
++    /// `kx.key`」不可能由我们自己写出来，是有人动过这个目录，**不猜、报错**：
++    /// 悄悄补一把新的 `kx.key` 等于让组里其它电脑加密给我的东西全都解不开。
++    pub fn load_or_create_keys(&self, rand: &dyn Fn() -> [u8; 32]) -> Result<MachineKeys> {
++        let sign_path = self.dir.join(SIGN_KEY);
++        let kx_path = self.dir.join(KX_KEY);
++        if sign_path.exists() {
++            if !kx_path.exists() {
++                bail!(
++                    "{} 在，{} 却不见了——不会替你重新生成（那会换掉这台电脑的加密钥匙）",
++                    sign_path.display(),
++                    kx_path.display()
++                );
++            }
++            let sign = read_seed(&sign_path)?;
++            let kx = read_seed(&kx_path)?;
++            return MachineKeys::from_seeds(sign, kx)
++                .map_err(|e| anyhow!("{} 不是一把能用的钥匙：{e}", sign_path.display()));
++        }
++
++        self.ensure_dir()?;
++        // P-256 的种子要落在 [1, n) 里，随机 32 字节落在外面的概率约 2^-32；
++        // 连着好几次都落在外面，说明 `rand` 坏了，不是运气差。
++        let mut attempt = 0;
++        let (sign, kx, keys) = loop {
++            let sign = rand();
++            let kx = rand();
++            if let Ok(k) = MachineKeys::from_seeds(sign, kx) {
++                break (sign, kx, k);
++            }
++            attempt += 1;
++            if attempt >= 8 {
++                bail!("随机数给不出一把合法的签名钥匙，随机源可能坏了");
++            }
++        };
++        write_atomic(&kx_path, STANDARD.encode(kx).as_bytes())?;
++        write_atomic(&sign_path, STANDARD.encode(sign).as_bytes())?;
++        Ok(keys)
++    }
++
++    /// 这台电脑在组里叫什么。没设过就是主机名（整理成名单接受的样子）。
++    pub fn name(&self) -> Result<String> {
++        match std::fs::read_to_string(self.dir.join(NAME)) {
++            Ok(s) => Ok(s.trim().to_string()),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(tidy_name(&hostname())),
++            Err(e) => Err(e).context("读不了电脑名"),
++        }
++    }
++
++    /// 改名。规则跟名单的一样（`roster::accept` 会拒掉不合规的名字），在这里
++    /// 就拦住，免得存进去一个将来签不进名单的名字。
++    pub fn set_name(&self, n: &str) -> Result<()> {
++        let n = n.trim();
++        if n.is_empty() || n.contains('/') || n.chars().count() > MAX_NAME_LEN {
++            bail!("电脑名不能为空、不能带 /，最长 {MAX_NAME_LEN} 个字");
++        }
++        self.ensure_dir()?;
++        write_atomic(&self.dir.join(NAME), n.as_bytes())
++    }
++
++    /// 最新的一份组名单；还没进过任何组就是 `None`。
++    pub fn roster(&self) -> Result<Option<SignedRoster>> {
++        let path = self.dir.join(ROSTER);
++        match std::fs::read(&path) {
++            Ok(b) => serde_json::from_slice(&b)
++                .map(Some)
++                .with_context(|| format!("{} 解析不了", path.display())),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
++            Err(e) => Err(e).with_context(|| format!("读不了 {}", path.display())),
++        }
++    }
++
++    /// 存名单。**不在这里验**——能走到这一步的名单必须已经被
++    /// `roster::accept`（或者建组时的 `genesis`）放行过。
++    pub fn save_roster(&self, r: &SignedRoster) -> Result<()> {
++        self.ensure_dir()?;
++        let bytes = serde_json::to_vec_pretty(r)?;
++        write_atomic(&self.dir.join(ROSTER), &bytes)
++    }
++
++    fn ensure_dir(&self) -> Result<()> {
++        std::fs::create_dir_all(&self.dir)
++            .with_context(|| format!("建不了 {}", self.dir.display()))?;
++        crate::sys::fs::restrict_dir_to_owner(&self.dir)
++            .with_context(|| format!("收紧不了 {} 的权限", self.dir.display()))
++    }
++}
++
++/// 跟着 socket 走，测试把 socket 放临时目录就自动隔离（同 `secrets_path_for_socket`）。
++pub fn dir_for_socket(socket: &Path) -> PathBuf {
++    match socket.parent() {
++        Some(d) => d.join("mesh"),
++        None => PathBuf::from("mesh"),
++    }
++}
++
++fn read_seed(path: &Path) -> Result<[u8; 32]> {
++    let text =
++        std::fs::read_to_string(path).with_context(|| format!("读不了 {}", path.display()))?;
++    let raw = STANDARD
++        .decode(text.trim())
++        .with_context(|| format!("{} 不是 base64", path.display()))?;
++    raw.try_into()
++        .map_err(|_| anyhow!("{} 不是 32 字节", path.display()))
++}
++
++/// 写到旁边的临时文件、落盘、再 rename 到正式位置。rename 在同一个目录里是
++/// 原子的（Windows 上 std 用的是 `MoveFileExW(REPLACE_EXISTING)`，
++/// `create_private` 那边已经给全了共享位，见它的注释）。
++fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
++    use std::io::Write as _;
++    let tmp = tmp_path(path);
++    let write = || -> std::io::Result<()> {
++        let mut f = crate::sys::fs::create_private(&tmp)?;
++        f.write_all(bytes)?;
++        f.sync_all()
++    };
++    write().with_context(|| format!("写不了 {}", tmp.display()))?;
++    std::fs::rename(&tmp, path).with_context(|| format!("换不上 {}", path.display()))
++}
++
++fn tmp_path(path: &Path) -> PathBuf {
++    let mut name = path.file_name().unwrap_or_default().to_os_string();
++    name.push(".tmp");
++    path.with_file_name(name)
++}
++
++/// 主机名整理成名单接受的样子：去掉 `.local` 这类后缀、去掉 `/`、截到上限。
++/// 整理完是空的（问不出主机名）就叫 `dct`——总比建不了组好，用户随时能改。
++fn tidy_name(raw: &str) -> String {
++    let base = raw.trim().split('.').next().unwrap_or("");
++    let cleaned: String = base
++        .chars()
++        .filter(|c| *c != '/' && !c.is_control())
++        .take(MAX_NAME_LEN)
++        .collect();
++    if cleaned.is_empty() {
++        "dct".to_string()
++    } else {
++        cleaned
++    }
++}
++
++#[cfg(unix)]
++fn hostname() -> String {
++    let mut buf = [0u8; 256];
++    // SAFETY: 缓冲区够大，长度如实给出；gethostname 最多写 len 个字节。
++    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
++    if rc != 0 {
++        return String::new();
++    }
++    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
++    String::from_utf8_lossy(&buf[..end]).into_owned()
++}
++
++#[cfg(windows)]
++fn hostname() -> String {
++    std::env::var("COMPUTERNAME").unwrap_or_default()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use dct_mesh::roster::{genesis, Member};
++    use std::cell::Cell;
++
++    fn counter_rand() -> impl Fn() -> [u8; 32] {
++        let n = Cell::new(0u8);
++        move || {
++            n.set(n.get() + 1);
++            [n.get(); 32]
++        }
++    }
++
++    fn store() -> (tempfile::TempDir, Store) {
++        let tmp = tempfile::tempdir().unwrap();
++        let s = Store::at(tmp.path().join("mesh"));
++        (tmp, s)
++    }
++
++    fn member_of(k: &MachineKeys, name: &str) -> Member {
++        Member {
++            name: name.into(),
++            endpoint: dct_mesh::id::endpoint_for(&k.sign_pub()),
++            sign_pub: STANDARD.encode(k.sign_pub()),
++            kx_pub: STANDARD.encode(k.kx_pub()),
++            added_at: 1,
++        }
++    }
++
++    #[test]
++    fn keys_are_created_once_and_loaded_back_the_same() {
++        let (_t, s) = store();
++        let a = s.load_or_create_keys(&counter_rand()).unwrap();
++        // 第二次给一个完全不同的随机源：真用了它就会得到另一把钥匙。
++        let b = s
++            .load_or_create_keys(&|| panic!("钥匙已经在了，不该再要随机数"))
++            .unwrap();
++        assert_eq!(a.sign_pub(), b.sign_pub());
++        assert_eq!(a.kx_pub(), b.kx_pub());
++    }
++
++    #[test]
++    fn a_reopened_store_sees_the_same_keys() {
++        let (t, s) = store();
++        let a = s.load_or_create_keys(&counter_rand()).unwrap();
++        let again = Store::at(t.path().join("mesh"));
++        let b = again.load_or_create_keys(&|| [9u8; 32]).unwrap();
++        assert_eq!(a.sign_pub(), b.sign_pub());
++    }
++
++    #[test]
++    fn a_bad_signing_seed_is_retried_with_fresh_randomness() {
++        let (_t, s) = store();
++        // 第一对里签名种子是全 0（不合法），第二对才合法。
++        let n = Cell::new(0u8);
++        let rand = move || {
++            n.set(n.get() + 1);
++            if n.get() == 1 {
++                [0u8; 32]
++            } else {
++                [n.get(); 32]
++            }
++        };
++        let k = s.load_or_create_keys(&rand).unwrap();
++        assert_eq!(
++            k.sign_pub(),
++            MachineKeys::from_seeds([3; 32], [4; 32])
++                .unwrap()
++                .sign_pub()
++        );
++    }
++
++    #[test]
++    fn a_half_written_key_pair_without_sign_key_is_regenerated() {
++        let (_t, s) = store();
++        std::fs::create_dir_all(s.dir()).unwrap();
++        std::fs::write(s.dir().join(KX_KEY), STANDARD.encode([7u8; 32])).unwrap();
++        let k = s.load_or_create_keys(&counter_rand()).unwrap();
++        assert_eq!(
++            k.kx_pub(),
++            MachineKeys::from_seeds([1; 32], [2; 32]).unwrap().kx_pub()
++        );
++    }
++
++    #[test]
++    fn a_sign_key_without_its_kx_key_is_an_error_not_a_silent_new_key() {
++        let (_t, s) = store();
++        s.load_or_create_keys(&counter_rand()).unwrap();
++        std::fs::remove_file(s.dir().join(KX_KEY)).unwrap();
++        assert!(s.load_or_create_keys(&counter_rand()).is_err());
++        assert!(!s.dir().join(KX_KEY).exists(), "不该悄悄补一把");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn key_files_are_owner_only() {
++        use std::os::unix::fs::PermissionsExt;
++        let (_t, s) = store();
++        s.load_or_create_keys(&counter_rand()).unwrap();
++        for f in [SIGN_KEY, KX_KEY] {
++            let mode = std::fs::metadata(s.dir().join(f))
++                .unwrap()
++                .permissions()
++                .mode();
++            assert_eq!(mode & 0o777, 0o600, "{f}");
++        }
++        let dir_mode = std::fs::metadata(s.dir()).unwrap().permissions().mode();
++        assert_eq!(dir_mode & 0o777, 0o700);
++    }
++
++    #[test]
++    fn no_roster_yet_is_none() {
++        let (_t, s) = store();
++        assert!(s.roster().unwrap().is_none());
++    }
++
++    #[test]
++    fn a_saved_roster_reads_back() {
++        let (_t, s) = store();
++        let k = s.load_or_create_keys(&counter_rand()).unwrap();
++        let r = genesis(member_of(&k, "laptop"), "mine".into(), &k);
++        s.save_roster(&r).unwrap();
++        assert_eq!(s.roster().unwrap(), Some(r));
++        assert!(
++            !s.dir().join("roster.json.tmp").exists(),
++            "临时文件该被 rename 走"
++        );
++    }
++
++    /// 原子写的可观察后果：写新名单的过程中出了错，旧名单一个字节不动。
++    /// 把临时文件的位置先占成一个目录，写临时文件那一步就必然失败——如果
++    /// 实现是直接截断正式文件再写，这里旧名单早就没了。
++    #[test]
++    fn a_failed_roster_write_leaves_the_old_roster_intact() {
++        let (_t, s) = store();
++        let k = s.load_or_create_keys(&counter_rand()).unwrap();
++        let old = genesis(member_of(&k, "laptop"), "mine".into(), &k);
++        s.save_roster(&old).unwrap();
++
++        std::fs::create_dir(s.dir().join("roster.json.tmp")).unwrap();
++        let newer = genesis(member_of(&k, "desk"), "mine".into(), &k);
++        assert!(s.save_roster(&newer).is_err());
++        assert_eq!(s.roster().unwrap(), Some(old));
++    }
++
++    #[test]
++    fn name_defaults_to_something_the_roster_accepts_and_can_be_changed() {
++        let (_t, s) = store();
++        let n = s.name().unwrap();
++        assert!(!n.is_empty() && !n.contains('/') && n.chars().count() <= MAX_NAME_LEN);
++        s.set_name("公司Windows").unwrap();
++        assert_eq!(s.name().unwrap(), "公司Windows");
++    }
++
++    #[test]
++    fn a_name_the_roster_would_refuse_is_refused_here() {
++        let (_t, s) = store();
++        assert!(s.set_name("").is_err());
++        assert!(s.set_name("a/b").is_err());
++        assert!(s.set_name(&"x".repeat(MAX_NAME_LEN + 1)).is_err());
++    }
++
++    #[test]
++    fn hostnames_are_tidied_into_valid_names() {
++        assert_eq!(tidy_name("Leis-MacBook.local"), "Leis-MacBook");
++        assert_eq!(tidy_name(""), "dct");
++        assert_eq!(tidy_name("a/b"), "ab");
++        assert_eq!(tidy_name(&"y".repeat(80)).chars().count(), MAX_NAME_LEN);
++    }
++
++    #[test]
++    fn the_default_dir_sits_next_to_the_other_dct_files() {
++        assert_eq!(
++            dir_for_socket(Path::new("/h/.dct/daemon.sock")),
++            PathBuf::from("/h/.dct/mesh")
++        );
++    }
++}

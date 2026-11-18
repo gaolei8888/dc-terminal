@@ -1,0 +1,939 @@
+# Review package: 7898caa..5c862f2
+
+## Commits
+5c862f2 docs: record the fix-1 brief and report for the control-byte fix
+4e15c1b fix: sanitize control bytes and escape sequences out of session names
+
+## Files changed
+ .../fix-1-brief.md                                 | 103 +++++
+ .../fix-1-report.md                                | 226 +++++++++++
+ src/session.rs                                     | 441 ++++++++++++++++++++-
+ 3 files changed, 758 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-brief.md b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-brief.md
+new file mode 100644
+index 0000000..9b2b109
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-brief.md
+@@ -0,0 +1,103 @@
++# Fix 1 — 会话名由原始按键字节拼成，控制字符会写进终端
++
++来源：`final-review-report.md` 的 Finding 1（Important，四条合并阻塞项之一）。
++判定为 **Important**：它命中的是 README 明确记录的常见路径（没配 `[llm]`），
++而且是一条通往用户终端的注入路径。
++
++## 缺陷链条
++
++`collect_first_input`（`src/session.rs:202`）记录的是 `send_input` 收到的**原始
++字节**。在**附着视图**里每一次按键都被单独转发（`src/ui/attach.rs:193` 调用
++`key_to_input`，`src/ui/mod.rs:874`），产出的是：
++
++| 按键 | 送出的字节 |
++|---|---|
++| Backspace | `\x7f` |
++| 上/下/左/右 | `\x1b[A` … `\x1b[D` |
++| Esc | `\x1b` |
++| Home / End / PageUp / PageDown / Delete / Insert | `\x1b[…` |
++| Ctrl+a…Ctrl+z | `\x01`…`\x1a` |
++
++README 原话：**「Inside a session every keystroke goes to the agent, `Esc` included.」**
++
++所以一个改过错字的用户，`first_input` 会变成
++`"fix teh\x7f\x7f\x7fthe login bug"`。
++
++`request_name`（`src/session.rs:899`）把兜底名字**一点没洗**就钉死了：
++
++```rust
++let fallback: String = s.first_input.chars().take(NAME_MAX_CHARS).collect();
++*recover(s.name_slot.lock()) = Some(fallback);
++```
++
++没有 `clean_name`、没有 trim、没有控制字符过滤。而 `clean_name`
++（`src/session.rs:136`，只作用于**模型**输出）会去引号、去尾部标点，
++**但同样不过滤控制字符**。
++
++## 为什么它能到达终端
++
++三个环节，报告已逐个对着 `ratatui-0.28.1` 的源码核实过：
++
++1. `char_width`（`src/ui/widgets.rs:127`）对控制字符返回 `0`，所以 `truncate`
++   既不丢弃它们、也不把它们算进宽度预算 —— 它们**原样穿过截断**。
++2. `Span::render_ref`（ratatui `src/text/span.rs:396-400`）**不丢弃零宽字素**，
++   而是把它 append 到前一个单元格的 symbol 上。
++   （`Buffer::set_stringn` 确实过滤控制字符，`Paragraph` 也跳过零宽 symbol，
++   **但看板列表项、九宫格标题、附着视图的块标题走的都是 `Line` → `Span::render_ref`**，
++   那条路不过滤。）
++3. crossterm 后端把单元格 symbol 原样写出：`queue!(self.writer, Print(cell.symbol()))`。
++
++结论：名字里嵌的 `\x1b[A` 就是**每一帧都往看板里发一次的光标上移命令**。
++
++## 用户会遇到什么
++
++- **最常见**：没配 `[llm]`（README 称之为「正常情况，不是问题」），于是兜底名
++  **就是**最终名字。用户在附着视图里打第一句话、退格改掉一个错字、回车。
++  看板上从此永久显示一个含 `\x7f` 的乱名字。**没有改名的办法。**
++- **更糟**：用户在打字前按了上箭头（调历史）或 Esc（agent 自己的弹窗要用），
++  名字以一个真的转义序列开头，**看板每一帧重绘都被打乱**。
++- 只输入空白（一个空格加回车）会产生一个**非空但不可见**的 tag。
++  `session_label` 只看 `!tag.is_empty()`，于是返回那个空白 tag，
++  原本显示 agent 种类的那一列**永久变空**。
++- `first_input` 也是塞进 `name_prompt` 的东西，所以模型是拿着一串
++  `\x7f` 在给会话起名。
++
++## 安全性
++
++`name_prompt` 把 **agent 屏幕**的最后 2000 个字符喂给模型，而那块屏幕可能含有
++agent 从仓库或网上取回的内容。被恶意屏幕内容操纵的模型可以返回至多 24 个
++`clean_name` 不会清洗的字符，走同一条不过滤的渲染路径。**有界，但这是一条
++通往用户终端的注入路径。**
++
++## 要改什么
++
++1. `append_capped`（`src/session.rs:227`）跳过 `char::is_control()` 的字符。
++   **更好的做法**：把 `\x7f` / `\x08` 当作「弹掉上一个字符」，让记录下来的文本
++   与用户真正想打的话一致。
++2. 同一个过滤也要作用到 `clean_name` 的输出，**模型那条路也得覆盖**。
++   最干净的落点是一个共享的 `sanitize`，作用在 `request_name` 里的**两处写入**上。
++3. 洗完之后**重新检查兜底是否为空**：清洗后的兜底若为空，
++   **`name_slot` 保持 `None`**，让之后一次真正的输入还能给这个会话起名，
++   而不是永久钉死一个看不见的名字。
++
++## 测试要求
++
++- 断言一个含 `\x1b[A` 和 `\x7f` 的 tag **永远不会到达渲染出的 buffer**。
++  这是本条修复的核心回归测试。
++- 退格语义：`"fix teh\x7f\x7f\x7fthe"` 记录下来应当是 `"fix the"`（若采纳弹出语义）。
++- 只输入空白 → `name_slot` 仍是 `None`，之后一次真正的输入还能起名。
++- `clean_name` 的输出同样过滤（模型返回带控制字符时）。
++
++## 全局约束
++
++- **本简报里的引用代码不是权威**，是意图说明。照抄之前先想它对不对。
++- **收尾动作是变异测试，不是「测试全绿」**：把过滤条件取反、把空值检查删掉、
++  把 `sanitize` 的某一处调用去掉，各跑一次测试。**没有测试失败 = 测试没写够，回去补。**
++- 已知陷阱（上一轮 ledger 记的）：**那六个命名测试在负载下退化成「假绿」而不是
++  「假红」** —— 它们需要一个 tick 落进 0.2 秒的窗口，而轮询间隔是 50ms。
++  **别被绿骗了**，新写的测试不要依赖同样的时序。
++- 每个用户能看到的字符串写给没编过程序的人：不用黑话、不给栈追踪、不给原始 OS 错误。
++- key 处理分支里永远不要 `continue`。
++- 提交信息用英文，**不要 AI 署名行**。
++- 收尾跑：`cargo test -- --test-threads=1`、`cargo fmt --check`、`cargo clippy --all-targets`。
++- 测试不碰网络、不碰真实 `~/.dct`。
+diff --git a/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md
+new file mode 100644
+index 0000000..397aceb
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-1-report.md
+@@ -0,0 +1,226 @@
++# Fix 1 report — control bytes in session names
++
++Owner: fix-1 (of 4 blocking items from the final review). Scope: only Finding 1
++(`src/session.rs`, the unsanitized-keystroke-bytes-become-the-name defect). The
++other three findings are separate tasks and were not touched.
++
++## What changed and why
++
++The bug chain (see `fix-1-brief.md` for the full argument, verified against
++`ratatui-0.28.1` source): the attach view forwards every keystroke verbatim
++(`ui/mod.rs::key_to_input`) — arrows are `\x1b[A`..`\x1b[D`, Backspace is
++`\x7f`, Esc is `\x1b`, Ctrl+letter is `\x01`..`\x1a`. `collect_first_input`
++recorded these raw bytes into `first_input`, `request_name` copied them
++straight into `name_slot` with no filtering, and `name_slot`'s content
++(`SessionInfo.tag`) is rendered via `Line` → `Span::render_ref`, a path that —
++unlike `Buffer::set_stringn`/`Paragraph` — does not drop control characters.
++A backspace-laden or escape-prefixed name would therefore corrupt every
++subsequent frame of the board/grid/attach title.
++
++Fixes, all in `src/session.rs`:
++
++1. **`is_backspace` / `apply_keystrokes`** (new, near `clean_name`): a shared
++   character-processing core. `\x7f`/`\x08` pop the last character already
++   accumulated (per the "recorded text should match what the user meant to
++   type" decision — `"fix teh\x7f\x7f\x7fthe"` now records as `"fix the"`,
++   not a literal byte replay). A full CSI escape sequence (`ESC '[' `
++   parameter-bytes* terminator-byte, terminator = ASCII `0x40..=0x7E`) is
++   consumed and dropped as one unit — dropping only the leading `ESC` and
++   leaving `[A` behind was an early bug I caught with a mutation test (see
++   below): `[` and the letter that follows it are *not* control characters
++   individually, so a naive `char::is_control()` filter lets them through.
++   Bare `Esc` (not followed by `[`) is dropped with no lookahead. Any other
++   control character (Ctrl+letter) is dropped outright.
++2. **`append_capped`** now delegates to `apply_keystrokes` with a cap, so
++   `first_input` — the buffer collected incrementally, one `send_input` call
++   per keystroke in the attach view — is clean at the point of collection.
++   This also fixes the secondary problem the brief flagged: `first_input` is
++   fed verbatim into `name_prompt`, so the model itself used to be handed a
++   string full of `\x7f`.
++3. **`sanitize`** (new, `pub(crate)`, one-shot version of the same filter):
++   applied to the model's answer before it can reach `name_slot`, since
++   `clean_name` only strips quotes/punctuation and was never meant to strip
++   control bytes.
++4. **`fallback_name` / `model_name`** (new, pure functions): the two
++   decision points from the brief — "cap → sanitize → trim → treat empty as
++   `None`" — extracted out of `request_name` into free functions, for the
++   same reason `collect_first_input` was already a free function (see its
++   doc comment): it's logic worth testing directly, decoupled from the
++   locks/threads/PTY machinery in `request_name`. This extraction was not
++   optional cosmetics — see mutation M3 below, it's the only way the
++   fallback-side `sanitize` call turned out to be provably necessary.
++   `request_name` now just calls `*recover(s.name_slot.lock()) =
++   fallback_name(&s.first_input);` and, in the model thread, `if let
++   Some(name) = model_name(&text) { ... }`.
++5. Empty-after-sanitize handling: if `fallback_name`/`model_name` return
++   `None`, `name_slot` is left/set to `None`, not `Some(String::new())`.
++   `name_slot.is_none()` doubles as the "have we tried yet" gate in `tick()`,
++   so a whitespace-only first message no longer permanently pins an
++   invisible empty tag — the next Working→Idle transition gets another shot
++   at naming the session.
++
++## Mutation testing
++
++Per the brief's instruction, "all green" was not the bar — every mutation
++below was hand-introduced, the suite re-run, and the result recorded. Two of
++them **survived** on the first pass; both led to either a stronger test or
++(in one case) a refactor that made the surviving code path testable at all.
++The exact code was restored from a saved copy (`diff` verified identical)
++after every mutation.
++
++| # | Mutation | Result | Test(s) that caught it |
++|---|---|---|---|
++| M1 | `apply_keystrokes`: negate `!ch.is_control()` → `ch.is_control()` | **Caught** | 21 tests failed (nearly everything touching `first_input`/`sanitize`) |
++| M2 | `request_name`'s fallback write: drop the `is_empty()` → `None` branch, always `Some(fallback)` | **Survived first**, then caught | See below — required strengthening the whitespace test |
++| M3 | `fallback_name`: remove the `sanitize(&capped)` call | **Survived first**, then caught | See below — required extracting `fallback_name` as a directly-testable function |
++| M4 | `model_name`: remove the `sanitize(&clean_name(raw))` call (use `clean_name` alone) | Caught | `model_name_is_none_when_nothing_survives_the_wash`, `model_name_strips_control_bytes_after_clean_name`, `the_model_named_path_is_sanitized_too` |
++| M5 | `fallback_name`: invert the emptiness check (`!cleaned.is_empty() → None`) | Caught | 6 tests failed, incl. `fallback_name_is_none_for_whitespace_only_input`, `whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt` |
++| M6 | CSI terminator range narrowed to `0x40..=0x3f` (always empty ⇒ the loop never finds a terminator and silently eats the rest of the string) | Caught | `fallback_name_strips_control_bytes_even_if_first_input_somehow_carries_them` (its input has real text *after* the escape sequence, which is what exposes over-consumption) |
++| M7 | Negate the CSI-introducer check (`chars.peek() == Some(&'[')` → `!=`) | Caught | 6 tests failed, incl. `sanitize_strips_escape_sequences_and_ctrl_codes`, `collect_first_input_drops_escape_sequences_and_control_codes` |
++| M8 | Negate `is_backspace` (`==` → `!=` / `&&` instead of `||`) | Caught | 24 tests failed |
++
++### M2 in detail — why it survived, and the fix
++
++The first version of the "whitespace-only input" test only asserted that
++`SessionInfo.tag` stayed `""`. That assertion is blind to the bug: `list()`
++does `name_slot.clone().unwrap_or_default()`, so `None` and `Some("")` both
++render as `""` — they're indistinguishable from the outside. The mutation
++(always writing `Some(fallback)`, even when empty) pins `name_slot` to
++`Some("")` forever, which the old test could not see.
++
++The fix was to test the thing that actually depends on `None` vs `Some("")`:
++whether the naming gate reopens. I rewrote
++`whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt` to
++force a *second* Working→Idle transition (using `fake_agent()` / `cat`, whose
++screen content I control by writing `"READY"` to it directly, since
++`finishing_agent()` only prints `READY` once and then sleeps 30s — it can't
++be used to force a second transition). After the whitespace round, I swap in
++a `FixedBackend` that returns a real name and drive a second round; the test
++only passes if that second round can actually produce a name, which requires
++`name_slot` to have been left `None`.
++
++### M3 in detail — why it survived, and the fix
++
++`s.first_input` is written *only* through `collect_first_input` →
++`append_capped`, which (after this fix) already strips control bytes and
++escape sequences at collection time. So by the time `request_name` reads
++`s.first_input`, it is provably already clean — no test driven through the
++public `SessionManager` API can make the `sanitize(&fallback)` call in
++`request_name` matter, because nothing can get an unsanitized byte into
++`first_input` in the first place under the current code.
++
++Rather than accept an untestable "defense in depth" line (which the brief's
++own process explicitly disallows — "no test failure = the test wasn't written
++well enough, go add more"), I extracted the fallback-computation logic into
++`fallback_name(first_input: &str) -> Option<String>`, a pure function with no
++`Session`/PTY dependency. That makes it possible to test the sanitize step in
++isolation, by handing it a string that *deliberately* bypasses
++`append_capped` — `fallback_name("fix\x1b[A the bug")` must equal
++`Some("fix the bug".to_string())`. This also matches the file's existing
++convention (`collect_first_input`'s own doc comment gives the identical
++rationale for being a free function). The same extraction was applied
++symmetrically to the model-name path as `model_name`.
++
++## Test commands and output
++
++TDD: the new tests were written first and confirmed to fail to compile
++(`sanitize` didn't exist yet), then the implementation was added.
++
++Full session module suite, single-threaded (the timing-sensitive naming
++tests share real subprocesses and must not run concurrently):
++
++```
++$ cargo test --lib session:: -- --test-threads=1
++...
++test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 16.49s
++```
++
++Full workspace suite (unit + all integration test binaries):
++
++```
++$ cargo test -- --test-threads=1
++...
++test result: ok. 686 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.95s
++test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s   (doctests)
++test result: ok. 9 passed; ...
++test result: ok. 1 passed; ...   (x several integration binaries)
++test result: ok. 3 passed; ...
++test result: ok. 6 passed; ...
++test result: ok. 5 passed; ...
++test result: ok. 2 passed; ...
++test result: ok. 1 passed; ...
++... (17 test binaries total, all "0 failed")
++```
++
++Formatting and lints:
++
++```
++$ cargo fmt --check
++(no output — clean)
++
++$ cargo clippy --all-targets
++    Checking dct v0.1.0 (/Users/lei/work/dc/dc-terminal)
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.7s
++(no warnings)
++
++$ git diff --check
++(no output — clean)
++```
++
++One clippy warning was fixed along the way: `while let Some(next) =
++chars.next()` inside the CSI-consuming loop → `for next in chars.by_ref()`
++(clippy::while_let_on_iterator).
++
++## New tests added (all in `src/session.rs`, `mod tests`)
++
++Pure-function level:
++- `sanitize_strips_escape_sequences_and_ctrl_codes`
++- `sanitize_pops_the_previous_character_on_backspace`
++- `sanitize_backspace_on_an_empty_buffer_does_nothing`
++- `sanitize_keeps_ordinary_text_untouched`
++- `fallback_name_strips_control_bytes_even_if_first_input_somehow_carries_them`
++- `fallback_name_is_none_for_whitespace_only_input`
++- `fallback_name_caps_and_trims`
++- `model_name_strips_control_bytes_after_clean_name`
++- `model_name_is_none_when_nothing_survives_the_wash`
++- `collect_first_input_applies_backspace_as_the_user_intended`
++- `collect_first_input_backspace_reaches_across_calls`
++- `collect_first_input_drops_escape_sequences_and_control_codes`
++- `collect_first_input_backspace_on_an_empty_buffer_does_nothing_bad`
++
++Full `SessionManager` integration level (real subprocess, real `tick()`,
++50ms-poll deadline loops — the same pattern the file already uses everywhere
++else; per the brief's known-flake warning, none of these depend on landing a
++tick inside a narrow timing window, they poll to a 5s deadline):
++- `a_tag_born_from_control_bytes_never_carries_them_into_the_render_path` —
++  the brief's required core regression test: feeds `\x1b[A` (arrow-up,
++  simulating "pressed up-arrow to recall history before typing") plus a
++  typo-and-backspace sequence through `send_input` one keystroke at a time,
++  asserts the resulting `tag` never contains a control character at any
++  point during polling, and lands on the exact backspace-corrected string
++  `"fix the"`.
++- `the_model_named_path_is_sanitized_too` — model returns a name containing
++  `ESC` and `DEL`, asserts the stored tag is clean.
++- `whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt`
++  — see M2 above.
++
++## Concerns / follow-ups
++
++None blocking. Two notes for whoever reviews this:
++
++- `append_capped`'s CSI-consumption loop has no explicit upper bound on how
++  many bytes it will consume looking for a terminator; if it ever finds
++  none, it silently consumes the rest of the current `text` chunk. This is
++  safe in practice given `FIRST_INPUT_MAX` (200 chars) and the 24-char
++  `name_prompt` model-name cap bound the blast radius, and it's the same
++  trade-off any ANSI-stripper makes on malformed input — but it's worth
++  knowing about if this function is ever reused somewhere with an unbounded
++  input size.
++- I extracted `fallback_name`/`model_name` beyond what the brief's "要改什么"
++  section literally asked for (it only asked for a shared `sanitize` called
++  at the two write points). I judged this necessary rather than optional
++  because mutation M3 could not otherwise be honestly closed — the
++  alternative was leaving a genuinely dead/untestable line in `request_name`,
++  which conflicts with the brief's own "no test failure = test not written
++  well enough" instruction. Flagging this as a deliberate scope decision in
++  case the reviewer disagrees with the trade-off.
+diff --git a/src/session.rs b/src/session.rs
+index 0e08c21..47ca8bd 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -155,20 +155,142 @@ pub(crate) fn clean_name(raw: &str) -> String {
+     //   也分两轮、各管一种字符集，剥标点那一轮会在够到句号后停在引号上、
+     //   剥引号那一轮又认不得标点，两轮各退半步，谁都剥不干净，会留下
+     //   「修登录白屏」这种带着里层引号的残留。合成一个字符集一次性从
+     //   结尾向里扫，才能把「引号叠标点」这种情况一次剥到底。
+     let line = line.trim_start_matches(|c: char| QUOTES.contains(&c) || c.is_whitespace());
+     let line = line
+         .trim_end_matches(|c: char| QUOTES.contains(&c) || TAIL.contains(&c) || c.is_whitespace());
+     line.chars().take(NAME_MAX_CHARS).collect()
+ }
+ 
++/// 退格类按键：真实效果是撤销上一个字符，不是产出一个要显示的符号。
++/// `\x7f`（DEL）是现在大多数终端 Backspace 键实际发送的字节，`\x08`（BS）
++/// 是老式终端的写法——两个都可能出现，都按同一个语义处理。
++fn is_backspace(ch: char) -> bool {
++    ch == '\x7f' || ch == '\x08'
++}
++
++/// 把 `text` 里的按键效果应用到 `out` 上，`cap` 是 `out` 允许的最大字符数
++/// （`None` = 不限）。这是 `sanitize` 和 `append_capped` 共用的核心：前者
++/// 一次性洗一整段（模型答案），后者跨多次调用增量地攒（附着视图逐键转发，
++/// `out` 是持续存在的 `first_input` 缓冲区）——退格要能弹掉**上一次调用**
++/// 追加的字符，所以这段逻辑必须直接对着持久化的 `out` 操作，不能先在
++/// `text` 内部独立处理一遍再拼接。
++///
++/// 三类字符分开处理：
++/// - 退格（`\x7f`/`\x08`）弹出 `out` 的最后一个字符，不是简单丢弃——
++///   用户按退格是真心想删掉上一个字，`out` 里留下的得是他最终想表达的
++///   那句话，不是键入序列的字面重放。
++/// - **完整的 CSI 转义序列**（ESC `[` 参数字节* 终止字节）整段丢弃，不是
++///   只丢 ESC 本身。方向键、Home/End/PageUp/PageDown/Delete/Insert
++///   （`ui/mod.rs::key_to_input`）全都是这个形状，比如上箭头是
++///   `\x1b[A`——序列后半截的 `[` 和 `A` 单独看都是普通可打印 ASCII 字符，
++///   `char::is_control()` 认不出它们，只丢 ESC 会让 `[A` 原样漏进 `out`。
++///   终止字节是 ASCII `0x40..=0x7E`（字母、`~`），前面允许任意多个参数/
++///   中间字节（`\x1b[5~` 翻页键就带一个参数字节 `5`）。裸 `Esc`（后面
++///   不跟 `[`，agent 拿它取消/清空/关弹窗）不产出任何字符，但也不用
++///   往下吃字符——它本来就是单字节序列。
++/// - 其余控制字符（Ctrl+字母等）直接丢弃，不占字符预算。
++fn apply_keystrokes(out: &mut String, text: &str, cap: Option<usize>) {
++    let mut chars = text.chars().peekable();
++    while let Some(ch) = chars.next() {
++        if is_backspace(ch) {
++            out.pop();
++        } else if ch == '\x1b' {
++            if chars.peek() == Some(&'[') {
++                chars.next(); // 吃掉 CSI 的引导字符 '['
++                for next in chars.by_ref() {
++                    if ('\x40'..='\x7e').contains(&next) {
++                        break; // 终止字节，序列到此结束
++                    }
++                    // 否则是参数/中间字节，继续吃，直到吃到终止字节
++                    // 或者这段文本本身就在这里用完。
++                }
++            }
++            // 裸 Esc：什么都不产出，也没有后续字节要吃。
++        } else if !ch.is_control() {
++            let room = match cap {
++                Some(n) => out.chars().count() < n,
++                None => true,
++            };
++            if room {
++                out.push(ch);
++            }
++        }
++    }
++}
++
++/// 把一段可能夹着控制字符/转义序列的文本洗成干净的、能安全画在标题上的
++/// 文本。
++///
++/// 两个调用方喂给它的字符串，最终都会存进 `name_slot`、再顺着看板列表项/
++/// 九宫格标题/附着视图块标题一路走 `Line` → `Span::render_ref` 画到用户
++/// 终端上——这条渲染路径不像 `Buffer::set_stringn`/`Paragraph` 那样过滤
++/// 控制字符，零宽的控制字符会原样穿过 `truncate`，再原样写进终端（细节见
++/// fix-1-brief）。两条调用路各自的“脏”字符来源完全不同：`request_name`
++/// 里的兜底源头是用户在附着视图里逐键敲出来的原始按键字节（方向键、Esc、
++/// Ctrl+字母这些 README 明确记录“每一次按键都转发给 agent”的东西，虽然
++/// `append_capped` 已经在收集阶段处理过一轮，这里再洗一次是防御性的，
++/// 不依赖调用方记得先洗）；模型答的名字源头是 `clean_name`，它只管引号
++/// 和标点、不管控制字符——一段被操纵过的屏幕内容可以诱导模型把控制字符
++/// 原样吐回来。两条路落地前必须过同一道过滤，漏一条就是漏一条到用户
++/// 终端的注入路径。
++pub(crate) fn sanitize(text: &str) -> String {
++    let mut out = String::new();
++    apply_keystrokes(&mut out, text, None);
++    out
++}
++
++/// 把「已经封存的第一句话」变成一个能存进 `name_slot` 的兜底名字。
++///
++/// 抽成自由函数，跟 `collect_first_input` 同一个理由：这是一条能测的
++/// 纯逻辑（截断 → 洗 → 判空），跟 `request_name` 里那圈锁、线程、模型
++/// 调用无关，不该混在一起只能靠跑一整个 `SessionManager` 才测得到。
++///
++/// **不能假设 `first_input` 已经干净**：正常路径下它确实已经被
++/// `append_capped` 洗过一轮（`collect_first_input` 是它唯一的写入口），
++/// 但 `name_slot` 落地前的这道关卡不该依赖调用方记得先洗——`sanitize`
++/// 在这里是防御性的最后一道，不是对上游的信任。
++///
++/// 洗完再 `trim()` 一次，重新判断是否为空：如果什么都不剩（比如用户
++/// 只敲了个空格就回车），返回 `None`——调用方据此把 `name_slot` 留成
++/// `None`，不写一个看不见的空字符串。`name_slot` 非 `None` 就是「已经
++/// 起过名」的标志位（见 `request_name`），写成 `Some("")` 会把这个
++/// 会话永久钉死成一个看不见的名字，往后再也没有机会用一次真正的输入
++/// 重新起名。
++fn fallback_name(first_input: &str) -> Option<String> {
++    let capped: String = first_input.chars().take(NAME_MAX_CHARS).collect();
++    let cleaned = sanitize(&capped);
++    let cleaned = cleaned.trim();
++    if cleaned.is_empty() {
++        None
++    } else {
++        Some(cleaned.to_string())
++    }
++}
++
++/// 把模型答的名字变成一个能存进 `name_slot` 的名字。
++///
++/// `clean_name` 只管引号和标点（见它自己的文档），不管控制字符——一段
++/// 被操纵过的屏幕内容能诱导模型把控制字符原样吐回来，这里补上 `sanitize`
++/// 那一道，跟 `fallback_name` 走的是同一份判空逻辑：洗完/去空白之后
++/// 什么都不剩，返回 `None`，调用方不写、不覆盖已经在槽里的兜底。
++fn model_name(raw: &str) -> Option<String> {
++    let cleaned = sanitize(&clean_name(raw));
++    let cleaned = cleaned.trim();
++    if cleaned.is_empty() {
++        None
++    } else {
++        Some(cleaned.to_string())
++    }
++}
++
+ /// 让模型给这个会话起个名字。
+ ///
+ /// **只送屏幕末尾**，理由同 `explain_prompt`：整屏几千字，又慢又贵，
+ /// 还容易让模型抓错重点。
+ ///
+ /// **语言写进 prompt，不做参数**：名字由守护进程生成并钉死，而界面语言
+ /// 用户随时能切（`l` 键，不重启 daemon）。跟着用户输入的语言走，切界面
+ /// 语言之后也不会留下一堆对不上的名字。
+ pub fn name_prompt(first_input: &str, screen: &str) -> crate::llm::Prompt {
+     const TAIL: usize = 2000;
+@@ -211,29 +333,30 @@ pub(crate) fn collect_first_input(buf: &mut String, sealed: &mut bool, text: &st
+     // 合法的字符边界。
+     match text.find(['\r', '\n']) {
+         Some(i) => {
+             append_capped(buf, &text[..i]);
+             *sealed = true;
+         }
+         None => append_capped(buf, text),
+     }
+ }
+ 
+-/// 按**字符数**封顶追加。这里不按显示宽度算：这段字是喂给模型的原料，
++/// 按**字符数**封顶追加，同时把退格、转义序列按真实按键语义处理（见
++/// `apply_keystrokes`）。这里不按显示宽度算：这段字是喂给模型的原料，
+ /// 不是画在屏幕上的东西，宽度是界面那一侧的事。
++///
++/// 直接对 `buf` 操作、不能先在 `text` 内部独立处理一遍再拼接：附着视图
++/// 是一个键一次 `send_input`（见 `collect_first_input` 的文档），退格键
++/// 单独送过来的时候，`text` 里除了它自己什么都没有，要弹的字符在**上一次
++/// 调用**追加进去的 `buf` 里。
+ fn append_capped(buf: &mut String, text: &str) {
+-    for ch in text.chars() {
+-        if buf.chars().count() >= FIRST_INPUT_MAX {
+-            return;
+-        }
+-        buf.push(ch);
+-    }
++    apply_keystrokes(buf, text, Some(FIRST_INPUT_MAX));
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct SessionInfo {
+     pub id: u32,
+     pub profile: String,
+     /// agent 干活的目录，就是用户指定的真实项目目录。
+     pub dir: String,
+     pub state: SessionState,
+     /// 这个 agent 此刻在干什么（屏幕最后一行有内容的文字）。
+@@ -892,37 +1015,37 @@ impl SessionManager {
+     }
+ 
+     /// 给这个会话起个名字。**只在它第一次干完活时调用一次**（见 `tick`）。
+     ///
+     /// 跟 `request_explanation` 是同一条路，但**不需要 generation 计数器**：
+     /// 失败会反复发生、迟到的旧解释会盖掉新解释，而名字一辈子只问一次，
+     /// 全程只有一个线程可能写这个槽。
+     fn request_name(&self, s: &mut Session) {
+         // 先把兜底同步写进去：从这一刻起 `name_slot` 就是 `Some(_)`，
+         // 它同时兼任「已经起过名了」的标志位。模型答得出就覆盖，
+-        // 答不出就把第一句留在这儿。
+-        let fallback: String = s.first_input.chars().take(NAME_MAX_CHARS).collect();
+-        *recover(s.name_slot.lock()) = Some(fallback);
++        // 答不出就把第一句留在这儿。`fallback_name` 可能给 `None`
++        // （洗完/去空白之后什么都不剩），这种情况下 `name_slot` 就该
++        // 留成 `None`，不能钉死一个看不见的空 tag——见它自己的文档。
++        *recover(s.name_slot.lock()) = fallback_name(&s.first_input);
+ 
+         let Some(b) = recover(self.backend.lock()).clone() else {
+             return; // 没配后端：功能安静下线，兜底那句留着
+         };
+         let p = name_prompt(&s.first_input, &s.pty.screen_text());
+         let slot = s.name_slot.clone();
+         std::thread::spawn(move || {
+             // 15 秒，比 `explanation` 的 30 秒短：那个是用户正等着看解释，
+             // 这个是后台起名，没人等，等太久只是白占一个线程。
+             if let Ok(text) =
+                 crate::llm::complete_with_timeout(b, p, std::time::Duration::from_secs(15))
+             {
+-                let name = clean_name(&text);
+-                if !name.is_empty() {
++                if let Some(name) = model_name(&text) {
+                     if let Ok(mut g) = slot.lock() {
+                         *g = Some(name);
+                     }
+                 }
+             }
+             // 失败就什么都不做——兜底那句已经在槽里了
+         });
+     }
+ }
+ 
+@@ -1208,20 +1331,73 @@ mod tests {
+     /// 字节永远不会跟 ASCII 的 `\n` 撞在一起，切在这里不会崩在字符中间。
+     #[test]
+     fn a_multibyte_utf8_sentence_before_the_newline_does_not_panic() {
+         let mut buf = String::new();
+         let mut sealed = false;
+         collect_first_input(&mut buf, &mut sealed, "修复登录问题\n还有别的");
+         assert_eq!(buf, "修复登录问题");
+         assert!(sealed);
+     }
+ 
++    /// 附着视图是逐键转发（`ui/attach.rs` 每按一次键就一次 `send_input`），
++    /// 真实 Backspace 键发的字节是 `\x7f`，不是删除键。改错字产出的字节流
++    /// 是「打错的字 + 退格 + 改对的字」，记下来的 `first_input` 必须是用户
++    /// 最终想说的那句话，不是这串字节的字面重放——这是 fix-1-brief 明确
++    /// 要求的退格语义，也是本条修复要过的第一道测试。
++    #[test]
++    fn collect_first_input_applies_backspace_as_the_user_intended() {
++        let mut buf = String::new();
++        let mut sealed = false;
++        collect_first_input(&mut buf, &mut sealed, "fix teh\x7f\x7f\x7fthe");
++        assert_eq!(buf, "fix the");
++    }
++
++    /// 逐键转发场景下，退格弹的是**上一次调用**追加进 `buf` 的字符，
++    /// 不是同一次调用里的字符——附着视图一个键一次 `send_input`，退格
++    /// 键单独送过来的时候，`buf` 里除了它自己什么都没有，弹出必须能
++    /// 够到 `buf` 本身，跨调用生效。
++    #[test]
++    fn collect_first_input_backspace_reaches_across_calls() {
++        let mut buf = String::new();
++        let mut sealed = false;
++        for k in [
++            "f", "i", "x", " ", "t", "e", "h", "\x7f", "\x7f", "\x7f", "t", "h", "e",
++        ] {
++            collect_first_input(&mut buf, &mut sealed, k);
++        }
++        assert_eq!(buf, "fix the");
++    }
++
++    /// README 表里那几种附着视图会原样转发的转义序列——上下左右、Esc、
++    /// Ctrl+字母：它们是控制信号，不是文字，一个都不该进 `first_input`。
++    /// 这条直接照抄 fix-1-brief 的按键表，覆盖「打字前先按了上箭头调
++    /// 历史」这种真实会发生的场景。
++    #[test]
++    fn collect_first_input_drops_escape_sequences_and_control_codes() {
++        let mut buf = String::new();
++        let mut sealed = false;
++        for k in ["\x1b[A", "\x1b[D", "\x1b", "\x01", "\x1a", "hi"] {
++            collect_first_input(&mut buf, &mut sealed, k);
++        }
++        assert_eq!(buf, "hi");
++    }
++
++    /// 第一个键就是退格：没有上一个字符可弹，不能 panic，也不能把
++    /// 后面正常敲的字弄丢。
++    #[test]
++    fn collect_first_input_backspace_on_an_empty_buffer_does_nothing_bad() {
++        let mut buf = String::new();
++        let mut sealed = false;
++        collect_first_input(&mut buf, &mut sealed, "\x7f\x7fhi");
++        assert_eq!(buf, "hi");
++    }
++
+     /// 模型多半会回一句带标点、带引号的话，不会老老实实只给名字。
+     /// 洗不干净的话，格子标题上会出现「「修登录白屏」。」这种东西。
+     #[test]
+     fn clean_name_strips_quotes_punctuation_and_extra_lines() {
+         assert_eq!(clean_name("「修登录白屏」。"), "修登录白屏");
+         assert_eq!(clean_name("\"fix login blank\""), "fix login blank");
+         assert_eq!(clean_name("修登录白屏\n（这个会话在修登录）"), "修登录白屏");
+         assert_eq!(clean_name("  修登录白屏  "), "修登录白屏");
+     }
+ 
+@@ -1269,20 +1445,111 @@ mod tests {
+     /// 按字符切，不按字节，不会在多字节字符中间切出半个字来，也不会因为
+     /// “大于等于”之类的边界写错而多切/少切一个字符。
+     #[test]
+     fn clean_name_keeps_a_name_exactly_at_the_cap_intact() {
+         let exact = "修".repeat(NAME_MAX_CHARS);
+         let cleaned = clean_name(&exact);
+         assert_eq!(cleaned, exact);
+         assert_eq!(cleaned.chars().count(), NAME_MAX_CHARS);
+     }
+ 
++    /// `sanitize` 是 `request_name` 两处写入共用的最后一道过滤——README
++    /// 表里那几种真实会被转发的转义序列，一个都不能留下来。这条覆盖
++    /// 「非退格」的控制字符：方向键、Esc、Ctrl+字母。
++    #[test]
++    fn sanitize_strips_escape_sequences_and_ctrl_codes() {
++        assert_eq!(sanitize("\x1b[A"), "");
++        assert_eq!(sanitize("\x1b[D"), "");
++        assert_eq!(sanitize("\x1b"), "");
++        assert_eq!(sanitize("\x01"), ""); // Ctrl+a
++        assert_eq!(sanitize("\x1a"), ""); // Ctrl+z
++    }
++
++    /// 退格（`\x7f`/`\x08`）按「弹出上一个字符」处理，不是简单丢弃——
++    /// 这是 fix-1-brief 采纳的读法，记下来的文本要跟用户真正想打的话
++    /// 一致。
++    #[test]
++    fn sanitize_pops_the_previous_character_on_backspace() {
++        assert_eq!(sanitize("fix teh\x7f\x7f\x7fthe"), "fix the");
++        assert_eq!(sanitize("a\x08b"), "b"); // 老式退格同样按弹出处理
++    }
++
++    /// 第一个字符就是退格：没有上一个字符可弹，不能 panic，后面的正常
++    /// 字符照常保留。
++    #[test]
++    fn sanitize_backspace_on_an_empty_buffer_does_nothing() {
++        assert_eq!(sanitize("\x7fhi"), "hi");
++    }
++
++    /// 没有控制字符的普通文本（含中文）原样穿过，`sanitize` 不该动它。
++    #[test]
++    fn sanitize_keeps_ordinary_text_untouched() {
++        assert_eq!(sanitize("fix login bug"), "fix login bug");
++        assert_eq!(sanitize("修复登录问题"), "修复登录问题");
++    }
++
++    /// `fallback_name` 是 `name_slot` 落地前的最后一道关卡，**不能假设
++    /// `first_input` 已经干净**——正常路径下它确实已经被 `append_capped`
++    /// 洗过一轮，但这条测试故意绕开那条路径，直接构造一个「万一没洗
++    /// 干净」的输入，钉死这道关卡自己也会挡，不是单纯依赖上游。这也是
++    /// 唯一能把 `request_name` 里 `sanitize(&fallback)` 这一步单独测出来
++    /// 的地方：走完整的 `SessionManager` 全流程时，`first_input` 在到
++    /// 这里之前早就是干净的，那条调用会被测试悄悄放过。
++    #[test]
++    fn fallback_name_strips_control_bytes_even_if_first_input_somehow_carries_them() {
++        assert_eq!(
++            fallback_name("fix\x1b[A the bug"),
++            Some("fix the bug".to_string())
++        );
++    }
++
++    /// 只有空白：洗完/去空白之后什么都不剩，必须是 `None`，不是
++    /// `Some("")`——两者在 `list()` 里看起来一样（都读成空串），但只有
++    /// `None` 才能让 `request_name` 的「只起一次」门槛重新打开。
++    #[test]
++    fn fallback_name_is_none_for_whitespace_only_input() {
++        assert_eq!(fallback_name(" "), None);
++        assert_eq!(fallback_name("   "), None);
++        assert_eq!(fallback_name(""), None);
++    }
++
++    /// 普通情况：截到上限、去掉首尾空白。
++    #[test]
++    fn fallback_name_caps_and_trims() {
++        assert_eq!(fallback_name("  hi  "), Some("hi".to_string()));
++        let long = "x".repeat(NAME_MAX_CHARS + 10);
++        assert_eq!(
++            fallback_name(&long).unwrap().chars().count(),
++            NAME_MAX_CHARS
++        );
++    }
++
++    /// `model_name` 要把 `clean_name`（剥引号/标点）和 `sanitize`（洗
++    /// 控制字符/转义序列）串起来——`clean_name` 自己不管控制字符（见它
++    /// 的文档），漏了这一步，被操纵过的屏幕内容诱导模型吐回来的控制
++    /// 字符就会原样进 `name_slot`。
++    #[test]
++    fn model_name_strips_control_bytes_after_clean_name() {
++        assert_eq!(
++            model_name("「修\x1b登录\x7f白屏」。"),
++            Some("修登白屏".to_string())
++        );
++    }
++
++    /// 模型答案洗完是空的（比如整句就是标点和控制字符）：`None`，不是
++    /// 一个看不见的空字符串。
++    #[test]
++    fn model_name_is_none_when_nothing_survives_the_wash() {
++        assert_eq!(model_name("。。。"), None);
++        assert_eq!(model_name("\x1b\x01"), None);
++    }
++
+     /// prompt 必须带上第一句输入和屏幕末尾两样，缺一样模型就只能猜。
+     #[test]
+     fn name_prompt_carries_both_the_first_line_and_the_screen() {
+         let p = name_prompt("修一下登录白屏", "…… 正在改 auth.ts ……");
+         assert!(p.user.contains("修一下登录白屏"));
+         assert!(p.user.contains("auth.ts"));
+         assert!(p.max_tokens <= 64, "起个名字不需要长回答");
+     }
+ 
+     struct FixedBackend(String);
+@@ -1449,20 +1716,170 @@ mod tests {
+                 break;
+             }
+             assert!(
+                 Instant::now() < deadline,
+                 "真正干完一轮活之后应该起出真实名字，最后是 {tag:?}"
+             );
+             sleep(Duration::from_millis(50));
+         }
+     }
+ 
++    /// **核心回归测试**（fix-1-brief）：附着视图逐键转发时，用户先按了
++    /// 上箭头调历史，再打字、中途用退格改错字。这一串字节混进
++    /// `first_input`，最终变成 `SessionInfo.tag`——那正是看板列表项、
++    /// 九宫格标题、附着视图块标题渲染时读的字段，走的是 `Line` →
++    /// `Span::render_ref` 那条不过滤控制字符的路（`ratatui` 只有
++    /// `Buffer::set_stringn`/`Paragraph` 过滤，这几处都不走那两条）。
++    /// 这条测试钉死：不管起名最后走的是兜底还是模型，落进 `tag` 的字符串
++    /// 绝不含控制字符，从源头掐断这条到用户终端的注入路径，也钉死退格
++    /// 的弹出语义——`"fix teh\x7f\x7f\x7fthe"` 最终应该读作 `"fix the"`，
++    /// 是用户真正想说的话，不是按键序列的字面重放。
++    #[test]
++    fn a_tag_born_from_control_bytes_never_carries_them_into_the_render_path() {
++        let repo = init_repo();
++        let m = SessionManager::new();
++        m.register_profile(finishing_agent());
++        m.set_backend(Some(Arc::new(DeadBackend)));
++        let id = m
++            .create(repo.path(), "finishing", empty_secrets(), &[])
++            .unwrap();
++
++        for k in [
++            "\x1b[A", "f", "i", "x", " ", "t", "e", "h", "\x7f", "\x7f", "\x7f", "t", "h", "e",
++        ] {
++            m.send_input(id, k).unwrap();
++        }
++        m.send_input(id, "").unwrap(); // 回车
++
++        let deadline = Instant::now() + Duration::from_secs(5);
++        loop {
++            m.tick();
++            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
++            assert!(
++                !tag.chars().any(|c| c.is_control()),
++                "控制字符漏进了 tag：{tag:?}"
++            );
++            if tag == "fix the" {
++                break;
++            }
++            assert!(Instant::now() < deadline, "兜底没生效，最后是 {tag:?}");
++            sleep(Duration::from_millis(50));
++        }
++    }
++
++    /// 同一道过滤也得覆盖模型那条路：屏幕内容可能来自仓库或网络，被
++    /// 操纵过的屏幕可以诱导模型把控制字符原样吐回来，而 `clean_name`
++    /// 只管引号和标点、不管控制字符（见它自己的文档）。这条测试直接让
++    /// 模型答案里带上 Esc 和退格，钉死 `sanitize` 在 `request_name` 的
++    /// 第二处写入（模型答案）也生效，不只是兜底那一处。
++    #[test]
++    fn the_model_named_path_is_sanitized_too() {
++        let repo = init_repo();
++        let m = SessionManager::new();
++        m.register_profile(finishing_agent());
++        m.set_backend(Some(Arc::new(FixedBackend("修\x1b登录\x7f白屏".into()))));
++        let id = m
++            .create(repo.path(), "finishing", empty_secrets(), &[])
++            .unwrap();
++
++        m.send_input(id, "修一下登录白屏").unwrap();
++        m.send_input(id, "").unwrap();
++
++        let deadline = Instant::now() + Duration::from_secs(5);
++        loop {
++            m.tick();
++            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
++            if tag == "修登白屏" {
++                break;
++            }
++            assert!(
++                !tag.chars().any(|c| c.is_control()),
++                "模型答案里的控制字符没被洗掉：{tag:?}"
++            );
++            assert!(Instant::now() < deadline, "一直没起出名字，最后是 {tag:?}");
++            sleep(Duration::from_millis(50));
++        }
++    }
++
++    /// 只送空白（一个空格加回车）：洗完/去空白之后兜底是空的，`name_slot`
++    /// 必须留 `None`，不能把一个看不见的空 tag 钉死。
++    ///
++    /// 光看 `tag` 停在 `""` 测不出这件事——`list()` 对 `None` 和
++    /// `Some("")` 做的都是 `unwrap_or_default()`，两种状态在界面上长得
++    /// 一模一样，钉死成 `Some("")` 的 bug 会被这种断言完全放过。真正
++    /// 能测出区别的是**下一轮**：`name_slot` 是不是 `None` 决定了
++    /// `tick()` 的起名门槛（`recover(s.name_slot.lock()).is_none()`）
++    /// 会不会再打开一次。所以这条测试逼出第二轮 Working → Idle，这次
++    /// 换一个答得出名字的后端，只有 `name_slot` 真的还是 `None`，
++    /// 这一轮才可能起出名字来。
++    #[test]
++    fn whitespace_only_input_leaves_the_name_slot_open_for_a_later_real_attempt() {
++        let repo = init_repo();
++        let m = SessionManager::new();
++        // `fake_agent`（cat，只声明 idle_pattern）比 `finishing_agent` 更
++        // 适合这条测试：`finishing_agent` 的脚本打完一次 READY 就
++        // `sleep 30` 不再吭声，逼不出第二次 Working → Idle。`cat` 回显
++        // 什么、屏幕上就有什么，能按需要反复把 "READY" 打上屏幕，
++        // 从而反复触发状态判定。
++        m.register_profile(fake_agent());
++        m.set_backend(Some(Arc::new(DeadBackend)));
++        let id = m.create(repo.path(), "fake", empty_secrets(), &[]).unwrap();
++
++        // 第一句话只有空白——封存的 first_input 就是 " "。
++        m.send_input(id, " ").unwrap();
++        m.send_input(id, "").unwrap();
++
++        // 手动把 "READY" 打上屏幕，触发第一次 Working → Idle。
++        m.send_input(id, "READY").unwrap();
++        let deadline = Instant::now() + Duration::from_secs(5);
++        loop {
++            m.tick();
++            if state_of(&m, id) == SessionState::Idle {
++                break;
++            }
++            assert!(
++                Instant::now() < deadline,
++                "一直没进入 Idle，没法验证起名逻辑"
++            );
++            sleep(Duration::from_millis(50));
++        }
++        // 这一轮的兜底是空白，`request_name` 是在这次 tick 里同步写的
++        // （见它自己的文档），所以状态一到 Idle 就已经有答案：`tag`
++        // 应该还是看不见的空串。
++        assert_eq!(
++            m.list().iter().find(|s| s.id == id).unwrap().tag,
++            "",
++            "空白兜底不该产出一个看不见但非空的 tag"
++        );
++
++        // 换一个答得出名字的后端，再逼一次 Working → Idle：`send_input`
++        // 的空串分支会无条件把状态同步置回 Working（不管屏幕内容），
++        // "READY" 还留在屏幕上，下一次 tick 就会再判一次 Idle。
++        m.set_backend(Some(Arc::new(FixedBackend("真实名字".into()))));
++        m.send_input(id, "").unwrap();
++
++        let deadline = Instant::now() + Duration::from_secs(5);
++        loop {
++            m.tick();
++            let tag = m.list().iter().find(|s| s.id == id).unwrap().tag.clone();
++            if tag == "真实名字" {
++                break;
++            }
++            assert!(
++                Instant::now() < deadline,
++                "空白那一轮不该把 name_slot 钉死，第二轮该能起出真名字，\
++                 最后是 {tag:?}"
++            );
++            sleep(Duration::from_millis(50));
++        }
++    }
++
+     /// **钉死**：从 `Failed` 缓过来变成 `Idle` 不算「干完一轮活」，不该拿它
+     /// 起名。这个场景里 `was == SessionState::Working` 和
+     /// `!s.first_input.is_empty()` 两道判断**都**能单独拦住误触发（这里
+     /// 从没送过输入，first_input 全程是空的，跟
+     /// `a_freshly_created_busy_pattern_agent_is_not_named_off_its_splash_screen`
+     /// 那个坑同源）——两道判断在这个测试里冗余覆盖，这条测的是另一件事：
+     /// `name_slot` 那道「只起一次」的门槛在误触发场景下反而是帮凶——如果
+     /// Failed → Idle 被当成起名时机，它会拿这时候还空着的 `first_input`
+     /// 把 `name_slot` 提前钉死，等真正干完一轮活、有真实内容可用的时候，
+     /// `name_slot` 已经非 `None` 了，再也翻不了身。

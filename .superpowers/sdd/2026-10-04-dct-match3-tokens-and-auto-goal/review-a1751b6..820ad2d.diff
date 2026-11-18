@@ -1,0 +1,508 @@
+# Review package: a1751b6..HEAD
+
+## Commits
+820ad2d feat(game): without --goal-number, pick the goal number by how the on-screen numbers change (step counter drops by exactly one, score only rises)
+
+## Files changed
+ crates/dct-game/src/goal.rs       | 140 ++++++++++++++++++++++++++++++++++++++
+ crates/dct-game/src/lib.rs        |   1 +
+ crates/dct-game/src/play.rs       |  54 +++++++++------
+ crates/dct-game/src/play_tests.rs |  67 ++++++++++++++++++
+ src/game/skill.md                 |   2 +-
+ src/game/text.rs                  |  11 +++
+ 6 files changed, 252 insertions(+), 23 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/goal.rs b/crates/dct-game/src/goal.rs
+new file mode 100644
+index 0000000..2849973
+--- /dev/null
++++ b/crates/dct-game/src/goal.rs
+@@ -0,0 +1,140 @@
++//! 不看数字的意思，只看数字怎么变，认出哪个是「目标」。
++//! 步数每成功一步刚好降 1；分数、连击只增不减；剩下的就是目标。
++//! 恰好剩一个才认；多于一个或没有就不认（宁可不判停滞，也不乱判）。
++
++pub const MIN_SAMPLES: usize = 4;
++
++#[derive(Default)]
++pub struct GoalFinder {
++    samples: usize,
++    all_minus_one: Vec<bool>,
++    ever_increased: Vec<bool>,
++    found: Option<usize>,
++}
++
++impl GoalFinder {
++    pub fn new() -> GoalFinder {
++        GoalFinder::default()
++    }
++
++    /// 只在**成功走了一步**之后调用。前后个数不同的步不进样本（OCR 漏读、弹窗飘字）。
++    pub fn observe(&mut self, before: &[u64], after: &[u64]) {
++        if self.found.is_some() || before.len() != after.len() || before.is_empty() {
++            return;
++        }
++        if self.samples == 0 {
++            self.all_minus_one = vec![true; before.len()];
++            self.ever_increased = vec![false; before.len()];
++        }
++        if self.all_minus_one.len() != before.len() {
++            return; // 列表个数和已有样本不一致：这一步不进样本
++        }
++        self.samples += 1;
++        for (i, (b, a)) in before.iter().zip(after).enumerate() {
++            if *a != b.saturating_sub(1) || *b == 0 {
++                self.all_minus_one[i] = false;
++            }
++            if a > b {
++                self.ever_increased[i] = true;
++            }
++        }
++        if self.samples >= MIN_SAMPLES {
++            let left: Vec<usize> = (0..self.all_minus_one.len()).filter(|&i| !self.all_minus_one[i] && !self.ever_increased[i]).collect();
++            if left.len() == 1 {
++                self.found = Some(left[0]);
++            }
++        }
++    }
++
++    pub fn index(&self) -> Option<usize> {
++        self.found
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn feed(f: &mut GoalFinder, steps: &[(&[u64], &[u64])]) {
++        for (b, a) in steps {
++            f.observe(b, a);
++        }
++    }
++
++    #[test]
++    fn the_step_counter_and_a_rising_score_are_excluded_leaving_the_goal() {
++        // [步数, 目标, 分数]：步数每步 -1，目标不规律降，分数涨
++        let mut f = GoalFinder::new();
++        feed(&mut f, &[
++            (&[38, 122, 0], &[37, 110, 120]),
++            (&[37, 110, 120], &[36, 100, 300]),
++            (&[36, 100, 300], &[35, 100, 340]),
++            (&[35, 100, 340], &[34, 80, 600]),
++        ]);
++        assert_eq!(f.index(), Some(1));
++    }
++
++    #[test]
++    fn a_goal_that_never_moves_is_still_found_by_elimination() {
++        let mut f = GoalFinder::new();
++        feed(&mut f, &[
++            (&[20, 50, 0], &[19, 50, 100]),
++            (&[19, 50, 100], &[18, 50, 150]),
++            (&[18, 50, 150], &[17, 50, 400]),
++            (&[17, 50, 400], &[16, 50, 410]),
++        ]);
++        assert_eq!(f.index(), Some(1));
++    }
++
++    #[test]
++    fn two_irregular_numbers_are_ambiguous() {
++        let mut f = GoalFinder::new();
++        feed(&mut f, &[
++            (&[38, 122, 30], &[37, 110, 25]),
++            (&[37, 110, 25], &[36, 100, 20]),
++            (&[36, 100, 20], &[35, 100, 15]),
++            (&[35, 100, 15], &[34, 80, 5]),
++        ]);
++        assert_eq!(f.index(), None);
++    }
++
++    #[test]
++    fn fewer_than_four_samples_decide_nothing() {
++        let mut f = GoalFinder::new();
++        feed(&mut f, &[
++            (&[38, 122], &[37, 110]),
++            (&[37, 110], &[36, 100]),
++            (&[36, 100], &[35, 90]),
++        ]);
++        assert_eq!(f.index(), None);
++    }
++
++    #[test]
++    fn steps_with_different_list_lengths_are_not_samples() {
++        let mut f = GoalFinder::new();
++        feed(&mut f, &[
++            (&[38, 122], &[37, 110]),
++            (&[37, 110], &[36]),            // 漏读一个：不进样本
++            (&[36, 100], &[35, 100, 9]),    // 多出一个：不进样本
++            (&[35, 100], &[34, 90]),
++            (&[34, 90], &[33, 80]),
++        ]);
++        assert_eq!(f.index(), None, "只有 3 个有效样本");
++        feed(&mut f, &[(&[33, 80], &[32, 70])]);
++        assert_eq!(f.index(), Some(1));
++    }
++
++    #[test]
++    fn once_found_the_goal_stays_found_for_the_run() {
++        let mut f = GoalFinder::new();
++        feed(&mut f, &[
++            (&[38, 122, 0], &[37, 110, 120]),
++            (&[37, 110, 120], &[36, 100, 300]),
++            (&[36, 100, 300], &[35, 100, 340]),
++            (&[35, 100, 340], &[34, 80, 600]),
++        ]);
++        assert_eq!(f.index(), Some(1));
++        // 之后目标数字涨了一次（重置）也不改
++        feed(&mut f, &[(&[34, 80, 600], &[33, 90, 650])]);
++        assert_eq!(f.index(), Some(1));
++    }
++}
+diff --git a/crates/dct-game/src/lib.rs b/crates/dct-game/src/lib.rs
+index 2ab8a76..bcdc08e 100644
+--- a/crates/dct-game/src/lib.rs
++++ b/crates/dct-game/src/lib.rs
+@@ -1,17 +1,18 @@
+ //! 三消游戏的选步：读到的棋盘 → 合法交换 → 模拟消除 → 打分。纯算法，不碰屏幕、磁盘和网络，
+ //! 所以能直接拿存下来的真实棋盘测（设计：docs/superpowers/specs/2026-10-02-dct-match3-play-design.md）。
+ pub mod ask;
+ pub mod board;
+ pub mod choose;
+ #[cfg(unix)]
+ pub mod dco;
++pub mod goal;
+ pub mod lab;
+ pub mod navigate;
+ pub mod play;
+ pub mod screen;
+ pub mod sim;
+ 
+ pub use board::{fixed_ids, looks_like_board, Board, BoardError, Cell, GridRead};
+ pub use choose::{choose, Candidate, Features, Weights};
+ pub use sim::{Move, Pos};
+ 
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index 0ffc91f..148c6ad 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -1,15 +1,16 @@
+ //! 一盘游戏怎么玩：读盘 → 选步 → 划 → 等画面停下 → 下一步，以及什么时候停。
+ //! 跟 dco 说话（`Dco`）和计时（`Clock`）都是传进来的，所以测试里换成假的，不碰真机也不真睡觉。
+ use crate::ask::{board_text, describe, describe_move, Advisor, AskInput};
+ use crate::board::{fixed_ids, looks_like_board, Board, GridRead};
+ use crate::choose::{choose, Candidate, Weights};
++use crate::goal::GoalFinder;
+ use crate::screen::Element;
+ use serde_json::{json, Value};
+ 
+ #[derive(Clone, Debug)]
+ pub struct Profile {
+     pub window: Value,
+     pub region: [f64; 4], // x, y, w, h
+     pub rows: usize,
+     pub cols: usize,
+     pub extra: Value, // inset / class_de / top_div / odd_share：原样带给 read_grid
+@@ -50,20 +51,31 @@ pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
+         .filter_map(|e| {
+             let t = e.text.trim();
+             if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+                 return None;
+             }
+             t.parse::<u64>().ok()
+         })
+         .collect()
+ }
+ 
++/// 停滞计数的一次更新；`gi` 是当前生效的目标下标（用户给的优先，否则识别器认出的），没有就不动。
++fn update_stall(no_progress: &mut usize, gi: Option<usize>, before: &Option<Vec<u64>>, after: &Option<Vec<u64>>) {
++    if let (Some(gi), Some(b), Some(a)) = (gi, before, after) {
++        match goal_dropped(b, a, gi) {
++            Some(true) => *no_progress = 0,
++            Some(false) => *no_progress += 1,
++            None => {}
++        }
++    }
++}
++
+ /// 连着这么多步目标数字都没下降，就算停滞。
+ pub const STALL_STEPS: usize = 6;
+ 
+ /// 目标那个数字下降了才算「下降」。两张清单个数不同（OCR 漏读了一个）、或者序号越界，都算「不知道」，返回 `None`。
+ pub(crate) fn goal_dropped(before: &[u64], after: &[u64], goal: usize) -> Option<bool> {
+     if before.len() != after.len() || goal >= before.len() {
+         return None;
+     }
+     Some(after[goal] < before[goal])
+ }
+@@ -275,20 +287,21 @@ fn centre(p: &Profile, (r, c): (usize, usize)) -> (f64, f64) {
+ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'_>, sink: &mut dyn FnMut(Value)) -> Summary {
+     let mut steps = 0;
+     let mut baseline: Option<usize> = None;
+     let mut failed: Vec<(crate::sim::Move, Vec<Vec<u16>>)> = Vec::new();
+     let mut asked = 0usize;
+     let mut streak = 0;
+     let mut locked: Vec<(usize, usize)> = Vec::new();
+     let mut current: Option<GridRead> = None;
+     let mut no_move_confirms = 0;
+     let mut no_progress = 0usize;
++    let mut finder = GoalFinder::new();
+     let mut progress_prev: Option<Vec<u64>> = if o.dry_run { None } else { read_numbers(dco, p) };
+     let stop = loop {
+         if steps >= o.max_steps {
+             break Stop::StepsDone;
+         }
+         let t_read = clock.now_ms();
+         let g = match current.take() {
+             Some(g) => g,
+             None => match dco.read_grid(p) {
+                 Ok(g) => g,
+@@ -448,72 +461,69 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         let t_settle = clock.now_ms();
+         let result = settle(dco, clock, p, &g);
+         rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });
+         match result {
+             // 游戏动了一下又弹回原样（被笼子、锁住的糖），棋盘和划之前一样：算没反应：同一盘棋上不再重复选这一步。
+             Settle::Settled(next) if same(&next, &g) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(next.observation_id);
+                 let progress_after = read_numbers(dco, p);
+-                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
+-                    match goal_dropped(b, a, gi) {
+-                        Some(true) => no_progress = 0,
+-                        Some(false) => no_progress += 1,
+-                        None => {}
+-                    }
+-                }
+-                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++                let gi = o.goal_index.or(finder.index());
++                update_stall(&mut no_progress, gi, &progress_prev, &progress_after);
++                rec["progress"] = json!({ "before": progress_prev, "after": progress_after, "goal_index": gi });
+                 progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+                 locked.push(chosen.mv.a);
+                 locked.push(chosen.mv.b);
+                 if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(next);
+             }
+             Settle::Settled(next) => {
+                 rec["outcome"] = json!("moved");
+                 rec["observed_changed"] = json!(changed_cells(&g, &next));
+                 rec["after_observation_id"] = json!(next.observation_id);
+                 let progress_after = read_numbers(dco, p);
+-                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
+-                    match goal_dropped(b, a, gi) {
+-                        Some(true) => no_progress = 0,
+-                        Some(false) => no_progress += 1,
+-                        None => {}
++                // 只有成功走了一步才让识别器看：被拒绝的步数字不降，会把「每步刚好少 1」的步数误排除。
++                if o.goal_index.is_none() {
++                    let had = finder.index();
++                    if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
++                        finder.observe(b, a);
++                    }
++                    if had.is_none() {
++                        if let Some(i) = finder.index() {
++                            rec["goal_found"] = json!(i + 1);
++                        }
+                     }
+                 }
+-                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++                let gi = o.goal_index.or(finder.index());
++                update_stall(&mut no_progress, gi, &progress_prev, &progress_after);
++                rec["progress"] = json!({ "before": progress_prev, "after": progress_after, "goal_index": gi });
+                 progress_prev = progress_after;
+                 sink(rec);
+                 streak = 0;
+                 failed.clear();
+                 locked.clear();
+                 current = Some(next);
+             }
+             Settle::NoChange(same_board) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(same_board.observation_id);
+                 let progress_after = read_numbers(dco, p);
+-                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
+-                    match goal_dropped(b, a, gi) {
+-                        Some(true) => no_progress = 0,
+-                        Some(false) => no_progress += 1,
+-                        None => {}
+-                    }
+-                }
+-                rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
++                let gi = o.goal_index.or(finder.index());
++                update_stall(&mut no_progress, gi, &progress_prev, &progress_after);
++                rec["progress"] = json!({ "before": progress_prev, "after": progress_after, "goal_index": gi });
+                 progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+                 locked.push(chosen.mv.a);
+                 locked.push(chosen.mv.b);
+                 if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(same_board);
+diff --git a/crates/dct-game/src/play_tests.rs b/crates/dct-game/src/play_tests.rs
+index 8be686b..ffd6d75 100644
+--- a/crates/dct-game/src/play_tests.rs
++++ b/crates/dct-game/src/play_tests.rs
+@@ -1218,10 +1218,77 @@ fn a_move_blocked_only_by_a_lock_is_still_tried_and_stuck_means_all_refused() {
+ }
+ 
+ #[test]
+ fn the_ask_record_carries_the_token_counts() {
+     let say = Say::new(Some(1));
+     let mut d = Fake::new(settled_script());
+     let (_, log) = run_ask(&mut d, Some(&say), true, 30, 1);
+     assert_eq!(log[0]["ask"]["tokens_in"], 11);
+     assert_eq!(log[0]["ask"]["tokens_out"], 2);
+ }
++
++#[test]
++fn without_goal_number_the_finder_picks_the_goal_and_stall_then_works() {
++    // 数字列表 [步数, 目标]：步数每步 -1，目标恒为 50（不动）。4 步样本后认出目标 = 下标 1，之后 6 步没降 → 停滞 → 问模型
++    let say = Say::new(Some(0));
++    let mut reads = vec![Ok(grid(A))];
++    for _ in 0..60 {
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(A)));
++        reads.push(Ok(grid(A)));
++    }
++    let mut d = Fake::new(reads);
++    let mut texts: Vec<Vec<&'static str>> = vec![vec!["30", "50"]];
++    for i in 0..14 {
++        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), "50"]);
++    }
++    d.texts = texts.into();
++    // goal_index 为 None（用户没给）→ 认
++    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 14);
++    assert!(log.iter().any(|l| l["goal_found"] == 2), "应在某一步认出第 2 个数字：{log:?}");
++    assert!(log.iter().any(|l| l["stalled"] == true));
++    assert!(say.calls.get() >= 1);
++}
++
++#[test]
++fn a_user_given_goal_number_is_never_overridden_by_the_finder() {
++    let mut reads = vec![Ok(grid(A))];
++    for _ in 0..60 {
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(MOVED)));
++        reads.push(Ok(grid(A)));
++        reads.push(Ok(grid(A)));
++    }
++    let mut d = Fake::new(reads);
++    let mut texts: Vec<Vec<&'static str>> = vec![vec!["30", "50"]];
++    for i in 0..10 {
++        texts.push(vec![Box::leak(format!("{}", 29 - i).into_boxed_str()), "50"]);
++    }
++    d.texts = texts.into();
++    let say = Say::new(Some(0));
++    let mut log = vec![];
++    // 用户指定第 1 个数（下标 0 = 步数，每步都降）
++    let o = Options { max_steps: 10, dry_run: false, advisor: Some(&say), ask_always: false, ask_budget: 30, goal: "", goal_index: Some(0) };
++    let _ = play(&mut d, &mut Clk(0), &profile(3, 4), &o, &mut |v| log.push(v));
++    assert!(log.iter().all(|l| l.get("goal_found").is_none()), "用户给了，就不自动认");
++    assert!(log.iter().all(|l| l["progress"]["goal_index"] == 0 || l["progress"]["goal_index"].is_null()));
++}
++
++#[test]
++fn a_refused_step_between_moved_steps_does_not_stop_the_finder_seeing_the_step_counter() {
++    // [步数, 目标]：步数每成功一步 -1，目标不动。中间夹一步被拒绝（数字都没变）。
++    // 被拒绝的步不能进识别器的样本，否则步数那一列会被当成「不规律」，4 个有效样本时就认不出目标。
++    let b: &[&[u16]] = &[&[2, 1, 1, 1], &[3, 1, 2, 3], &[2, 3, 2, 3]];
++    let mut reads = vec![Ok(grid(A)), Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A))];
++    for _ in 0..30 {
++        reads.push(Ok(grid(A))); // 第 3 步一直没变：被拒绝
++    }
++    reads.extend([Ok(grid(b)), Ok(grid(b)), Ok(grid(A)), Ok(grid(A))]);
++    let mut d = Fake::new(reads);
++    d.texts = lists(&[&["30", "50"], &["29", "50"], &["28", "50"], &["28", "50"], &["27", "50"], &["26", "50"]]);
++    let (_, log) = run_ask_goal(&mut d, None, false, 0, 5, None);
++    let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
++    assert_eq!(outcomes, ["moved", "moved", "no_change", "moved", "moved"], "{outcomes:?}");
++    assert_eq!(log[4]["goal_found"], 2, "第 4 个成功样本时认出第 2 个数字：{log:?}");
++    assert!(log[..4].iter().all(|l| l.get("goal_found").is_none()));
++}
+diff --git a/src/game/skill.md b/src/game/skill.md
+index b14b809..8a9d4c0 100644
+--- a/src/game/skill.md
++++ b/src/game/skill.md
+@@ -40,21 +40,21 @@ description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。
+ - 弹窗只关「Close」「Not now」「No thanks」这一类安全的，其它一律不点；
+ - 遇到要花钱的画面、广告、生命用完、通关了、不认识的画面，就停下，什么都不点；
+ - 也会一边做一边印一行，例如「点了「Play」，开始新的一局」「这一局没过，点了「Try again」重来」。
+ 
+ 把这些话转述给用户。它停下以后，把最后一句话原样告诉用户（比如「生命用完了」「出现了广告，请你自己关掉」），由用户决定下一步。
+ 
+ ## 玩不动的时候
+ 
+ 规则选的步没反应时，可以加 `--ask-model`：卡住了才问大模型，让它从规则列出的几步里挑一步。想让它每一步都挑，加 `--ask-every-step`：每一步都问大模型（会慢一些，用来对比）。加 `--goal "清掉冰块"` 告诉它这一关要干什么。没配大模型、或者大模型没回应，也能玩，只是这次只用规则。
+ 
+-连着好几步屏幕上的目标数字都没变小，就算「没有进展」，dct 会把它记下来、说出来；加了 `--ask-model` 的话，还会去问大模型。要用 `--goal-number 2` 告诉 dct 哪个数字是目标：它把从屏幕上读到的普通数字按出现的先后排好，第一个就是 1，`--goal-number 2` 就是第二个。读到了哪些数字，看 dct 打印的记录里的 `progress`。没写 `--goal-number` 时 dct 不会判断有没有进展。
++连着好几步屏幕上的目标数字都没变小，就算「没有进展」，dct 会把它记下来、说出来；加了 `--ask-model` 的话，还会去问大模型。要用 `--goal-number 2` 告诉 dct 哪个数字是目标：它把从屏幕上读到的普通数字按出现的先后排好，第一个就是 1，`--goal-number 2` 就是第二个。读到了哪些数字，看 dct 打印的记录里的 `progress`。没写 `--goal-number` 时，dct 会在走几步以后自己认：它认的是变化不规律、又不是每步刚好少 1 的那个数字（每步刚好少 1 的是步数，只涨不降的是分数）。认出来了会说一句「我认为屏幕上第 N 个数字是这一关的目标」；认错了，就用 `--goal-number` 指明。
+ 
+ ## 停
+ 
+ - 用户说「停」，马上中断这条命令。
+ - 命令自己停下时（没有能走的步、读不出棋盘、画面一直在动、连着两次没反应、dco 急停），把它印的最后一句话原样告诉用户。
+ - 不要自己去点屏幕补救，也不要换别的办法去操作游戏；让用户决定下一步。
+ 
+ ## 不要做
+ 
+ - 不要自己调用 dco 去点关卡按钮、道具、广告、付款。`--auto-next` 停下以后，也不要替它去点屏幕上的按钮、关广告或买东西。
+diff --git a/src/game/text.rs b/src/game/text.rs
+index e3f0d70..d3b0a71 100644
+--- a/src/game/text.rs
++++ b/src/game/text.rs
+@@ -38,20 +38,23 @@ pub fn step_line(step: usize, rec: &Value) -> String {
+         outcome => {
+             let t = &rec["timing_ms"];
+             if t.is_object() {
+                 s += &format!("（读 {} ms，选 {} ms，划 {} ms）", n(&t["read"]), n(&t["choose"]), n(&t["swipe"]));
+             }
+             if outcome == "no_change" {
+                 s += "；这一步划了没反应";
+             }
+         }
+     }
++    if let Some(n) = rec["goal_found"].as_u64() {
++        s += &format!("；我认为屏幕上第 {n} 个数字是这一关的目标");
++    }
+     if rec["stalled"].as_bool() == Some(true) {
+         s += "；这几步看起来没有进展";
+     }
+     if rec["decider"] == "model" {
+         s += "（大模型选的）";
+     }
+     s
+ }
+ 
+ /// 写进记录文件的停下原因（给程序看的，不是给人看的）。
+@@ -325,11 +328,19 @@ mod tests {
+         }
+     }
+ 
+     #[test]
+     fn step_line_says_so_when_stalled() {
+         let rec = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved","stalled":true});
+         assert!(step_line(1, &rec).contains("这几步看起来没有进展"));
+         let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
+         assert!(!step_line(1, &rec2).contains("没有进展"));
+     }
++
++    #[test]
++    fn step_line_says_which_number_was_taken_as_the_goal() {
++        let rec = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved","goal_found":2});
++        assert!(step_line(1, &rec).contains("我认为屏幕上第 2 个数字是这一关的目标"));
++        let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
++        assert!(!step_line(1, &rec2).contains("目标"));
++    }
+ }

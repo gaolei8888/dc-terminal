@@ -48,6 +48,8 @@ pub fn prompt_for_pick(state: &str, all: &[Opt]) -> Prompt {
         system: PICK_SYSTEM.to_string(),
         user,
         max_tokens: PICK_MAX_TOKENS,
+        image_png_base64: None,
+        image_mime: None,
     }
 }
 
@@ -100,6 +102,8 @@ pub fn prompt_for_fix(body: &str, rejection: &str) -> Prompt {
         system: FIX_SYSTEM.to_string(),
         user: serde_json::json!({"body": body, "rejection": rejection}).to_string(),
         max_tokens: FIX_MAX_TOKENS,
+        image_png_base64: None,
+        image_mime: None,
     }
 }
 

@@ -1,0 +1,543 @@
+# Review package: 150b103..06399b4
+
+## Commits
+06399b4 fix(keys): map chip errors honestly, refuse orphaned handle files
+
+## Files changed
+ crates/dct-brain/src/sign.rs |  28 +++++++++++
+ src/keys/mac.rs              |  63 ++++++++++++++++++++----
+ src/keys/mod.rs              | 111 +++++++++++++++++++++++++++++++++++++++++--
+ swift/Keys.swift             |  39 ++++++++++++---
+ 4 files changed, 223 insertions(+), 18 deletions(-)
+
+## Diff
+diff --git a/crates/dct-brain/src/sign.rs b/crates/dct-brain/src/sign.rs
+index 0c7c07c..72b5a1c 100644
+--- a/crates/dct-brain/src/sign.rs
++++ b/crates/dct-brain/src/sign.rs
+@@ -16,35 +16,52 @@ use p256::ecdsa::{signature::Verifier as _, Signature as EcSig, VerifyingKey};
+ use serde::{Deserialize, Serialize};
+ 
+ pub const ALG: &str = "es256";
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum SignError {
+     /// 这台机器没有安全芯片 / 钥匙还没建。
+     Unavailable,
+     /// 用户取消了 Touch ID，或者没通过。
+     Cancelled,
++    /// 安全芯片返回的其它错误（既不是「没有芯片」也不是用户主动取消），带着
++    /// 操作系统给的错误码——比如 -25308（`errSecInteractionNotAllowed`）就是
++    /// 设备锁屏、或者不是从普通终端会话里调用时最常见的失败。
++    Chip(i32),
+     Other(String),
+ }
+ 
+ impl std::fmt::Display for SignError {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+             SignError::Unavailable => write!(f, "这台电脑上用不了安全芯片签名"),
+             SignError::Cancelled => write!(f, "没有通过指纹确认"),
++            SignError::Chip(status) => f.write_str(&chip_message(*status)),
+             SignError::Other(m) => write!(f, "签名失败：{m}"),
+         }
+     }
+ }
+ 
+ impl std::error::Error for SignError {}
+ 
++/// 安全芯片返回非取消错误时，给不懂编程的用户看的那句话。单独挑出来是纯函数，
++/// 好独立测试这条最常踩到的映射：-25308 几乎总是「不在已解锁的普通终端会话里」，
++/// 而不是硬件坏了，别的错误码就老实报个数字，不瞎猜原因。
++pub fn chip_message(status: i32) -> String {
++    const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
++    if status == ERR_SEC_INTERACTION_NOT_ALLOWED {
++        "安全芯片现在不能用：请在已解锁的 Mac 上、从普通终端窗口运行".to_string()
++    } else {
++        format!("安全芯片出错（代码 {status}）")
++    }
++}
++
+ pub trait Signer {
+     fn role(&self) -> SignerRole;
+     /// SEC1 未压缩公钥，65 字节，`0x04` 开头。
+     fn public_key(&self) -> [u8; 65];
+     /// 对 `msg` 签名（内部先做 SHA-256），返回 64 字节 `r||s`。
+     /// `reason` 是给用户看的那句人话，Touch ID 弹窗里显示它；自动钥匙忽略。
+     fn sign(&self, msg: &[u8], reason: &str) -> Result<[u8; 64], SignError>;
+ }
+ 
+ pub fn key_id(public_key: &[u8; 65]) -> String {
+@@ -393,20 +410,31 @@ mod tests {
+     }
+ 
+     #[test]
+     fn an_empty_batch_list_never_contains_the_ticket() {
+         let (auto, _, trusted) = keys();
+         let mut st = sign_one(ticket(Tier::SelfOnly, 'a'), &auto, "").unwrap();
+         st.batch = Some(vec![]);
+         assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::NotInBatch));
+     }
+ 
++    #[test]
++    fn chip_message_calls_out_the_locked_terminal_case_by_name() {
++        assert_eq!(
++            chip_message(-25308),
++            "安全芯片现在不能用：请在已解锁的 Mac 上、从普通终端窗口运行"
++        );
++        // 别的错误码不瞎猜原因，只报个数字。
++        assert_eq!(chip_message(-1), "安全芯片出错（代码 -1）");
++        assert_eq!(chip_message(0), "安全芯片出错（代码 0）");
++    }
++
+     #[test]
+     fn an_unknown_algorithm_is_unsupported() {
+         let (auto, _, trusted) = keys();
+         let mut st = sign_one(ticket(Tier::SelfOnly, 'a'), &auto, "").unwrap();
+         st.signature.alg = "rs256".into();
+         assert_eq!(verify(&st, &trusted, "mac-lei", 150), Err(VerifyError::Unsupported));
+     }
+ 
+     #[test]
+     fn the_same_key_paired_under_two_roles_is_refused() {
+diff --git a/src/keys/mac.rs b/src/keys/mac.rs
+index cc6992f..22b9482 100644
+--- a/src/keys/mac.rs
++++ b/src/keys/mac.rs
+@@ -1,53 +1,100 @@
+ //! swift/Keys.swift 的绑定。Swift 的 `Int` 是 64 位有符号，对应 `isize`。
+ use dct_brain::sign::SignError;
+ use std::ffi::CString;
+ use std::os::raw::c_char;
+ 
+ extern "C" {
+     fn dct_se_available() -> bool;
+-    fn dct_se_create(biometric: bool, blob_out: *mut u8, blob_cap: isize, blob_len: *mut isize, pub_out: *mut u8) -> i32;
+-    fn dct_se_sign(blob: *const u8, blob_len: isize, msg: *const u8, msg_len: isize, reason: *const c_char, sig_out: *mut u8) -> i32;
++    fn dct_se_create(
++        biometric: bool,
++        blob_out: *mut u8,
++        blob_cap: isize,
++        blob_len: *mut isize,
++        pub_out: *mut u8,
++        status_out: *mut i32,
++    ) -> i32;
++    fn dct_se_sign(
++        blob: *const u8,
++        blob_len: isize,
++        msg: *const u8,
++        msg_len: isize,
++        reason: *const c_char,
++        sig_out: *mut u8,
++        status_out: *mut i32,
++    ) -> i32;
+ }
+ 
+-fn status(code: i32) -> SignError {
++/// 把 Swift 的返回码翻成 `SignError`。`status` 是 Swift 侧 `(error as NSError).code`，
++/// 只有 code 是 2（把手打不开）或 6（安全芯片的其它错误）时才有意义。
++fn status_error(code: i32, status: i32) -> SignError {
+     match code {
+         1 => SignError::Unavailable,
++        2 => SignError::Other(load_failed_message(status)),
+         3 => SignError::Cancelled,
+-        2 => SignError::Other("钥匙文件不对，可能是从别的电脑拷来的".into()),
+         4 => SignError::Other("钥匙太大".into()),
++        6 => SignError::Chip(status),
+         c => SignError::Other(format!("安全芯片返回 {c}")),
+     }
+ }
+ 
++/// 钥匙的「把手」文件打不开：可能是磁盘坏了，也可能是从别的 Mac 拷过来的——
++/// 安全芯片加密过的把手离开这台机器就没用了。不猜是哪一种，只说打不开。
++fn load_failed_message(status: i32) -> String {
++    if status == 0 {
++        "钥匙文件打不开（可能已损坏或不属于这台 Mac）".into()
++    } else {
++        format!("钥匙文件打不开（可能已损坏或不属于这台 Mac，错误码 {status}）")
++    }
++}
++
+ pub struct MacEnclave;
+ 
+ impl super::SecureEnclave for MacEnclave {
+     fn available(&self) -> bool {
+         unsafe { dct_se_available() }
+     }
+ 
+     fn create(&self, biometric: bool) -> Result<(Vec<u8>, [u8; 65]), SignError> {
+         let mut blob = vec![0u8; 1024];
+         let mut len: isize = 0;
+         let mut public = [0u8; 65];
+-        let rc = unsafe { dct_se_create(biometric, blob.as_mut_ptr(), blob.len() as isize, &mut len, public.as_mut_ptr()) };
++        let mut status: i32 = 0;
++        let rc = unsafe {
++            dct_se_create(
++                biometric,
++                blob.as_mut_ptr(),
++                blob.len() as isize,
++                &mut len,
++                public.as_mut_ptr(),
++                &mut status,
++            )
++        };
+         if rc != 0 {
+-            return Err(status(rc));
++            return Err(status_error(rc, status));
+         }
+         blob.truncate(len as usize);
+         Ok((blob, public))
+     }
+ 
+     fn sign(&self, blob: &[u8], msg: &[u8], reason: &str) -> Result<[u8; 64], SignError> {
+         // 人话里不该有 NUL；有就去掉，别让整次签名失败。
+         let reason = CString::new(reason.replace('\0', "")).unwrap();
+         let mut sig = [0u8; 64];
++        let mut status: i32 = 0;
+         let rc = unsafe {
+-            dct_se_sign(blob.as_ptr(), blob.len() as isize, msg.as_ptr(), msg.len() as isize, reason.as_ptr(), sig.as_mut_ptr())
++            dct_se_sign(
++                blob.as_ptr(),
++                blob.len() as isize,
++                msg.as_ptr(),
++                msg.len() as isize,
++                reason.as_ptr(),
++                sig.as_mut_ptr(),
++                &mut status,
++            )
+         };
+         if rc != 0 {
+-            return Err(status(rc));
++            return Err(status_error(rc, status));
+         }
+         Ok(sig)
+     }
+ }
+diff --git a/src/keys/mod.rs b/src/keys/mod.rs
+index e537566..66feb1c 100644
+--- a/src/keys/mod.rs
++++ b/src/keys/mod.rs
+@@ -68,20 +68,29 @@ pub struct KeyStore {
+ 
+ fn entry(public: &[u8; 65]) -> PublicEntry {
+     PublicEntry { key_id: key_id(public), public_key: STANDARD.encode(public) }
+ }
+ 
+ fn decode(e: &PublicEntry) -> Result<[u8; 65]> {
+     let raw = STANDARD.decode(&e.public_key).context("公钥文件坏了")?;
+     raw.try_into().map_err(|_| anyhow!("公钥长度不对"))
+ }
+ 
++/// `init` 建钥匙失败时给用户看的话：`SignError` 的 `Display` 是从「签名」的角度写的
++/// （比如 `Other` 变体套着「签名失败：」），这里是在「建钥匙」，得换个说法。
++fn create_failed_message(e: &SignError) -> String {
++    match e {
++        SignError::Other(m) => format!("创建钥匙失败：{m}"),
++        other => format!("创建钥匙失败：{other}"),
++    }
++}
++
+ impl KeyStore {
+     pub fn at(dir: PathBuf) -> Self {
+         KeyStore { dir }
+     }
+ 
+     /// `~/.dct/keys`，跟 daemon.sock 同一个目录下。
+     pub fn default_dir() -> PathBuf {
+         crate::proto::socket_path()
+             .parent()
+             .map(|p| p.join("keys"))
+@@ -100,41 +109,82 @@ impl KeyStore {
+     }
+ 
+     pub fn public_keys(&self) -> Result<Option<PublicKeys>> {
+         match std::fs::read(self.public_path()) {
+             Ok(b) => Ok(Some(serde_json::from_slice(&b).context("公钥文件坏了")?)),
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+             Err(e) => Err(e.into()),
+         }
+     }
+ 
++    /// 有钥匙把手文件、却没有 public.json 的那些角色的文件名。正常情况下永远是空的
++    /// （两者一起建、一起在的），非空说明状态半途而废——可能是 public.json 被误删，
++    /// 也可能是有人手动拷过来一半。这种时候不能猜着重建，猜错了就把还能用的把手
++    /// 文件覆盖掉了。
++    fn stray_handles(&self) -> Vec<&'static str> {
++        [(SignerRole::Auto, "auto.se"), (SignerRole::User, "user.se")]
++            .into_iter()
++            .filter(|(role, _)| self.blob_path(*role).exists())
++            .map(|(_, name)| name)
++            .collect()
++    }
++
+     /// 已经有钥匙就原样返回，**不重建**：重建会换公钥，配对过的 dco 就全都不认了。
+     pub fn init(&self, se: &dyn SecureEnclave) -> Result<PublicKeys> {
+         if let Some(k) = self.public_keys()? {
+             return Ok(k);
+         }
++        let stray = self.stray_handles();
++        if !stray.is_empty() {
++            return Err(anyhow!(
++                "发现钥匙文件（{}），但公钥记录 public.json 不见了。为了不覆盖已经有的钥匙，\
++                 这里不会自动建新的，请先检查 {}",
++                stray.join("、"),
++                self.dir.display()
++            ));
++        }
+         if !se.available() {
+             return Err(anyhow!("这台电脑没有安全芯片，没法建钥匙"));
+         }
+         std::fs::create_dir_all(&self.dir)?;
++        self.create_both(se).inspect_err(|_| {
++            // 别把没建完的钥匙留在磁盘上：下次 init 才能干净地重来，
++            // 不然会被上面那条 stray_handles 检查拦住。
++            for role in [SignerRole::Auto, SignerRole::User] {
++                let _ = std::fs::remove_file(self.blob_path(role));
++            }
++        })
++    }
++
++    fn create_both(&self, se: &dyn SecureEnclave) -> Result<PublicKeys> {
+         let mut made = Vec::new();
+         for (role, biometric) in [(SignerRole::Auto, false), (SignerRole::User, true)] {
+-            let (blob, public) = se.create(biometric).map_err(|e| anyhow!("{e}"))?;
++            let (blob, public) = se.create(biometric).map_err(|e| anyhow!(create_failed_message(&e)))?;
+             let mut f = crate::sys::fs::create_private(&self.blob_path(role))?;
+             f.write_all(&blob)?;
+             made.push(entry(&public));
+         }
+         let keys = PublicKeys { user: made.pop().unwrap(), auto: made.pop().unwrap() };
+-        std::fs::write(self.public_path(), serde_json::to_vec_pretty(&keys)?)?;
++        self.write_public_atomic(&keys)?;
+         Ok(keys)
+     }
+ 
++    /// 先写临时文件、再原地改名覆盖 public.json：改名在同一个文件系统上是原子的，
++    /// 半路崩了也不会留下一份写了一半、解析不出来的 public.json。公钥不是秘密，
++    /// 权限沿用 `std::fs::write` 的默认行为，不额外收紧。
++    fn write_public_atomic(&self, keys: &PublicKeys) -> Result<()> {
++        let tmp = self.dir.join(format!(".public.json.tmp.{}", std::process::id()));
++        std::fs::write(&tmp, serde_json::to_vec_pretty(keys)?)?;
++        std::fs::rename(&tmp, self.public_path())?;
++        Ok(())
++    }
++
+     /// 两把公钥，给验签用（批准记录、执行票；以后配对 dco 时也交给它）。
+     pub fn trusted(&self) -> Result<Vec<TrustedKey>> {
+         let k = self.public_keys()?.ok_or_else(|| anyhow!("还没建钥匙，先运行 dct keys init"))?;
+         Ok(vec![
+             TrustedKey { role: SignerRole::Auto, public_key: decode(&k.auto)? },
+             TrustedKey { role: SignerRole::User, public_key: decode(&k.user)? },
+         ])
+     }
+ 
+     pub fn signer<'a>(&self, role: SignerRole, se: &'a dyn SecureEnclave) -> Result<EnclaveSigner<'a>> {
+@@ -213,37 +263,43 @@ pub fn run_cli(args: &[String]) -> i32 {
+ mod tests {
+     use super::*;
+     use dct_brain::sign::soft::SoftSigner;
+     use dct_brain::sign::Signer;
+     use std::cell::RefCell;
+ 
+     /// 假的安全芯片：「把手」就是一个字节的种子，签名用软件钥匙。
+     struct FakeEnclave {
+         next_seed: RefCell<u8>,
+         cancel_user: bool,
++        /// 建用户钥匙（`biometric == true`）时故意失败一次，用来测「自动钥匙建好了、
++        /// 用户钥匙没建成」这一半路失败要怎么收场。
++        fail_user_create: bool,
+     }
+ 
+     impl FakeEnclave {
+         fn new() -> Self {
+-            FakeEnclave { next_seed: RefCell::new(1), cancel_user: false }
++            FakeEnclave { next_seed: RefCell::new(1), cancel_user: false, fail_user_create: false }
+         }
+         fn soft(blob: &[u8]) -> SoftSigner {
+             let role = if blob[1] == 1 { SignerRole::User } else { SignerRole::Auto };
+             SoftSigner::from_seed(role, blob[0])
+         }
+     }
+ 
+     impl SecureEnclave for FakeEnclave {
+         fn available(&self) -> bool {
+             true
+         }
+         fn create(&self, biometric: bool) -> Result<(Vec<u8>, [u8; 65]), SignError> {
++            if biometric && self.fail_user_create {
++                return Err(SignError::Other("模拟：安全芯片建用户钥匙失败".into()));
++            }
+             let mut s = self.next_seed.borrow_mut();
+             let blob = vec![*s, biometric as u8];
+             *s += 1;
+             Ok((blob.clone(), Self::soft(&blob).public_key()))
+         }
+         fn sign(&self, blob: &[u8], msg: &[u8], reason: &str) -> Result<[u8; 64], SignError> {
+             if blob[1] == 1 && self.cancel_user {
+                 return Err(SignError::Cancelled);
+             }
+             Self::soft(blob).sign(msg, reason)
+@@ -290,11 +346,60 @@ mod tests {
+         assert_eq!(s.sign(b"x", "发到 TikTok"), Err(SignError::Cancelled));
+     }
+ 
+     #[test]
+     fn no_keys_yet_means_no_signer() {
+         let d = tempfile::tempdir().unwrap();
+         let ks = KeyStore::at(d.path().join("keys"));
+         assert!(ks.public_keys().unwrap().is_none());
+         assert!(ks.signer(SignerRole::Auto, &FakeEnclave::new()).is_err());
+     }
++
++    #[test]
++    fn a_failed_create_leaves_no_trace_and_a_retry_succeeds() {
++        let d = tempfile::tempdir().unwrap();
++        let keys_dir = d.path().join("keys");
++        let ks = KeyStore::at(keys_dir.clone());
++        let mut se = FakeEnclave::new();
++        se.fail_user_create = true;
++
++        // 自动钥匙建成了，用户钥匙没建成：这次 init 必须整体失败，且不留下
++        // 半成品——否则下一次 init 会被 stray_handles 检查拦住，永远建不成。
++        assert!(ks.init(&se).is_err());
++        assert!(!keys_dir.join("public.json").exists());
++        assert!(!keys_dir.join("auto.se").exists());
++        assert!(!keys_dir.join("user.se").exists());
++
++        se.fail_user_create = false;
++        let keys = ks.init(&se).unwrap();
++        assert_ne!(keys.auto.key_id, keys.user.key_id);
++        assert!(keys_dir.join("public.json").exists());
++        assert!(keys_dir.join("auto.se").exists());
++        assert!(keys_dir.join("user.se").exists());
++    }
++
++    #[test]
++    fn init_refuses_when_a_handle_file_exists_without_public_json() {
++        let d = tempfile::tempdir().unwrap();
++        let keys_dir = d.path().join("keys");
++        std::fs::create_dir_all(&keys_dir).unwrap();
++        std::fs::write(keys_dir.join("auto.se"), b"leftover from somewhere").unwrap();
++        let ks = KeyStore::at(keys_dir.clone());
++
++        let err = ks.init(&FakeEnclave::new()).unwrap_err();
++        assert!(err.to_string().contains("auto.se"), "message was: {err}");
++
++        // 拒绝之后什么都不该改：把手文件原样在，没有新建 user.se 或 public.json。
++        assert!(keys_dir.join("auto.se").exists());
++        assert!(!keys_dir.join("user.se").exists());
++        assert!(!keys_dir.join("public.json").exists());
++    }
++
++    #[test]
++    fn chip_message_maps_locked_terminal_status_to_an_actionable_sentence() {
++        assert_eq!(
++            dct_brain::sign::chip_message(-25308),
++            "安全芯片现在不能用：请在已解锁的 Mac 上、从普通终端窗口运行"
++        );
++        assert_eq!(dct_brain::sign::chip_message(-1), "安全芯片出错（代码 -1）");
++    }
+ }
+diff --git a/swift/Keys.swift b/swift/Keys.swift
+index 8652f70..19b8c4b 100644
+--- a/swift/Keys.swift
++++ b/swift/Keys.swift
+@@ -1,66 +1,91 @@
+ // dct 的两把钥匙放在 Mac 的安全芯片里（设计：docs/superpowers/specs/2026-09-27-dct-brain-design.md 第 2 节）。
+ // 私钥永远不出安全芯片；我们拿到的 dataRepresentation 是它加密过的「把手」，只有这台 Mac 能用。
+-// 状态码：0 成功，1 没有安全芯片，2 把手不对，3 用户没通过指纹 / 取消，4 缓冲区太小，5 其它错误。
++// 状态码：0 成功，1 没有安全芯片，2 把手打不开，3 用户没通过指纹 / 取消，4 缓冲区太小，
++// 6 安全芯片的其它错误。`statusOut` 在返回 2 或 6 时带着 `(error as NSError).code`
++//（比如 -25308 = errSecInteractionNotAllowed：设备锁屏，或者不在普通终端会话里），
++// 别的返回码上是 0。
+ import CryptoKit
+ import Foundation
+ import LocalAuthentication
+ import Security
+ 
+ @_cdecl("dct_se_available")
+ public func dct_se_available() -> Bool {
+     SecureEnclave.isAvailable
+ }
+ 
++/// LAError 的取消码（用户主动取消 / 系统打断 / 应用被切走）映射到 3；
++/// 别的一律是 6，`statusOut` 里带上底层的 NSError 代码，好让调用方判断具体原因。
++private func classify(_ error: Error, _ statusOut: UnsafeMutablePointer<Int32>) -> Int32 {
++    let ns = error as NSError
++    statusOut.pointee = Int32(ns.code)
++    if ns.domain == LAError.errorDomain,
++        let code = LAError.Code(rawValue: ns.code),
++        code == .userCancel || code == .systemCancel || code == .appCancel
++    {
++        return 3
++    }
++    return 6
++}
++
+ @_cdecl("dct_se_create")
+ public func dct_se_create(
+     _ biometric: Bool,
+     _ blobOut: UnsafeMutablePointer<UInt8>, _ blobCap: Int, _ blobLen: UnsafeMutablePointer<Int>,
+-    _ pubOut: UnsafeMutablePointer<UInt8>
++    _ pubOut: UnsafeMutablePointer<UInt8>,
++    _ statusOut: UnsafeMutablePointer<Int32>
+ ) -> Int32 {
++    statusOut.pointee = 0
+     guard SecureEnclave.isAvailable else { return 1 }
+     var flags: SecAccessControlCreateFlags = [.privateKeyUsage]
+     if biometric { flags.insert(.biometryCurrentSet) }
+     var err: Unmanaged<CFError>?
+     guard let ac = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, flags, &err) else {
+-        return 5
++        if let err = err {
++            statusOut.pointee = Int32(CFErrorGetCode(err.takeRetainedValue()))
++        }
++        return 6
+     }
+     do {
+         let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: ac)
+         let blob = key.dataRepresentation
+         guard blob.count <= blobCap else { return 4 }
+         blob.copyBytes(to: blobOut, count: blob.count)
+         blobLen.pointee = blob.count
+         let pub = key.publicKey.x963Representation  // 65 字节，0x04 开头
+-        guard pub.count == 65 else { return 5 }
++        guard pub.count == 65 else { return 6 }  // 不该发生；没有具体 NSError 可报，status 留 0
+         pub.copyBytes(to: pubOut, count: 65)
+         return 0
+     } catch {
+-        return 5
++        return classify(error, statusOut)
+     }
+ }
+ 
+ @_cdecl("dct_se_sign")
+ public func dct_se_sign(
+     _ blob: UnsafePointer<UInt8>, _ blobLen: Int,
+     _ msg: UnsafePointer<UInt8>, _ msgLen: Int,
+     _ reason: UnsafePointer<CChar>,
+-    _ sigOut: UnsafeMutablePointer<UInt8>
++    _ sigOut: UnsafeMutablePointer<UInt8>,
++    _ statusOut: UnsafeMutablePointer<Int32>
+ ) -> Int32 {
++    statusOut.pointee = 0
+     guard SecureEnclave.isAvailable else { return 1 }
+     let ctx = LAContext()
+     ctx.localizedReason = String(cString: reason)  // Touch ID 弹窗里显示的那句人话
+     let key: SecureEnclave.P256.Signing.PrivateKey
+     do {
+         key = try SecureEnclave.P256.Signing.PrivateKey(
+             dataRepresentation: Data(bytes: blob, count: blobLen), authenticationContext: ctx)
+     } catch {
++        statusOut.pointee = Int32((error as NSError).code)
+         return 2
+     }
+     do {
+         let sig = try key.signature(for: Data(bytes: msg, count: msgLen))
+         sig.rawRepresentation.copyBytes(to: sigOut, count: 64)  // r||s
+         return 0
+     } catch {
+-        return 3
++        return classify(error, statusOut)
+     }
+ }

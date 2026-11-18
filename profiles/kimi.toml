@@ -26,6 +26,15 @@ error_pattern = "API Error|Connection closed mid-response"
 # 恢复守护进程重启前的会话时用：跑的是 claude 二进制，`--continue`
 # 接回这个目录下最近一次对话。
 resume_args = ["--continue"]
+# 开会话时由 dct 指定对话 id，重启后按 id 接回同一段对话。
+# `claude --help`（2026-10-14）：`--session-id <uuid>`、`-r, --resume [value]`。
+session_id_args = ["--session-id", "{id}"]
+resume_id_args = ["--resume", "{id}"]
+# claude 给每个在跑的窗口写一份 `~/.claude/sessions/<pid>.json`，`sessionId`
+# 就是它此刻的对话（`--continue` 接回的、`/clear` 换过的也对）。不是公开约定，
+# 读不到就照旧。实测：claude 2.1.302（2026-10-18）。
+conversation_file = "~/.claude/sessions/{pid}.json"
+conversation_file_key = "sessionId"
 
 [label]
 zh = "Kimi"

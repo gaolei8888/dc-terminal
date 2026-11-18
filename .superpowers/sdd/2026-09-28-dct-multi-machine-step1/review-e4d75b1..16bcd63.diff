@@ -1,0 +1,1528 @@
+# Review package: e4d75b1..16bcd63
+
+## Commits
+16bcd63 feat(srv): verify relay tokens, keep envelopes within an account, list online peers
+
+## Files changed
+ Cargo.lock                   |   3 +
+ crates/dct-link/src/lib.rs   |  28 ++-
+ crates/dct-page/page.html    |   2 +-
+ crates/dct-srv/Cargo.toml    |   8 +
+ crates/dct-srv/src/issuer.rs | 154 ++++++++++++++++
+ crates/dct-srv/src/keys.rs   |  70 +++++++
+ crates/dct-srv/src/lib.rs    | 421 ++++++++++++++++++++++++++++++++++++++++---
+ crates/dct-srv/src/main.rs   |  76 ++++++--
+ 8 files changed, 716 insertions(+), 46 deletions(-)
+
+## Diff
+diff --git a/Cargo.lock b/Cargo.lock
+index feaadf4..9ac2769 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -471,23 +471,26 @@ dependencies = [
+ 
+ [[package]]
+ name = "dct-page"
+ version = "0.1.0"
+ 
+ [[package]]
+ name = "dct-srv"
+ version = "0.1.0"
+ dependencies = [
+  "axum",
++ "base64",
+  "dct-link",
++ "dct-mesh",
+  "dct-page",
+  "getrandom 0.2.17",
++ "p256",
+  "serde",
+  "serde_json",
+  "sha2",
+  "tempfile",
+  "tokio",
+  "tower",
+ ]
+ 
+ [[package]]
+ name = "der"
+diff --git a/crates/dct-link/src/lib.rs b/crates/dct-link/src/lib.rs
+index 07a6406..2ff23e4 100644
+--- a/crates/dct-link/src/lib.rs
++++ b/crates/dct-link/src/lib.rs
+@@ -22,21 +22,23 @@ use serde::{Deserialize, Serialize};
+ /// 装的 dct；两边的版本对不上，`AuthFrame` 那一下就要说清楚，而不是等到某个
+ /// 字段解不出来才炸。
+ ///
+ /// 2 = 两个接口的请求/响应体（`PollResponse`、`SendRequest`）进了这个 crate，
+ /// `LinkError` 多了 `Busy`。信封本身一个字节没变——**但版本号还是加了一**：
+ /// 「只有信封变了才加一」这条会立刻退化成「我觉得这次不算」，而这个数字唯一
+ /// 的用处就是在两边版本不一致时说话。现在还没有任何一台机器在跑它，加一是
+ /// 免费的；等真有人在用了，免费的就只剩后悔。
+ ///
+ /// 3 = 多了 `/link/ask`（发一个信封、挂着等配对的答复）和 `LinkError::NoAnswer`。
+-pub const LINK_VERSION: u32 = 3;
++///
++/// 4 = 令牌要验、`/link/peers`。
++pub const LINK_VERSION: u32 = 4;
+ 
+ /// 长轮询：**我有什么要收的吗**。请求体就是 `AuthFrame`。
+ pub const PATH_POLL: &str = "/link/poll";
+ 
+ /// 一次长轮询挂多久。**两边必须知道同一个数**，所以它在这里而不在任何一边：
+ ///
+ /// - 中转拿它决定挂多久之后空手打发人走；
+ /// - 守护进程拿它算自己的读超时，**那个必须更长**。反过来的话，每一次轮询都
+ ///   会在中转开口之前被客户端自己掐掉，看起来就是「怎么连都连不上」，而两边
+ ///   的日志都显示自己没错。
+@@ -54,20 +56,25 @@ pub const PATH_SEND: &str = "/link/send";
+ /// `SendRequest`，答复体是一个 `Envelope`。
+ ///
+ /// 手机为什么不用 `/link/poll` 自己收答复：那样页面里要自己记「哪个 `seq`
+ /// 对应哪个还没兑现的 Promise」。这个仓库里的 JS 一行都跑不了测试（页面全
+ /// 靠 Rust 扫源码的守卫钉着），把新增的复杂度放在唯一测不了的地方是最差的
+ /// 选择。放在这里，它有测试，也做得了变异测试。
+ ///
+ /// 中转依然不看 payload：配对只用信封上的 `to` 和 `seq`。
+ pub const PATH_ASK: &str = "/link/ask";
+ 
++/// 在线是谁：跟自己同账号、在线、不是自己的端点。请求体是 `AuthFrame`，
++/// 答复体是 `PeersResponse`。中转拿账号隔离同一条规矩来算这份名单——见
++/// `LinkError::NotYours`。
++pub const PATH_PEERS: &str = "/link/peers";
++
+ /// 一个 payload 最多多少字节。
+ ///
+ /// 中转要在**解 base64 之前**就能拒绝，所以这条界限是给两边共用的常量而不是
+ /// 中转的私有配置。整屏画面带样式的 JSON 实测几十 KB，1 MiB 已经宽到不可能
+ /// 挡住正常使用；它挡的是「一条请求把中转的内存吃光」。
+ pub const MAX_PAYLOAD: usize = 1024 * 1024;
+ 
+ /// 端点 id 最长多少字符。见 `EndpointId` 上的注释。
+ pub const MAX_ENDPOINT_LEN: usize = 64;
+ 
+@@ -219,20 +226,26 @@ pub struct PollResponse {
+ /// `POST /link/send` 的请求体。
+ ///
+ /// `auth` 和 `envelope.from` 会被中转比对：**信封上的寄件人必须就是出示
+ /// 凭据的那个人**。不比对的话，任何一个能连上中转的人都能冒充别人发东西。
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct SendRequest {
+     pub auth: AuthFrame,
+     pub envelope: Envelope,
+ }
+ 
++/// `POST /link/peers` 的答复：同账号在线的其它端点，按字典序排。
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PeersResponse {
++    pub online: Vec<EndpointId>,
++}
++
+ /// 中转回坏消息时的响应体。成功不回 body（`204`）。
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct ErrorBody {
+     pub error: LinkError,
+ }
+ 
+ /// 中转能回的坏消息，**全集**。
+ ///
+ /// 是码不是话：翻译在 `dct` 和网页那边。这个枚举没有「其他错误」那一项，
+ /// 故意的——真出了没预料到的情况，中转应该多加一个变体（于是两边一起被
+@@ -326,41 +339,41 @@ mod tests {
+     /// 的同一招，理由也一样，而且这次更凶：中转升级和笔记本升级之间隔着的
+     /// 不是「用户什么时候重启守护进程」，是「用户什么时候想起来更新 dct」。
+     /// 形状变了而版本号没变，症状会是某个人的手机某天开始解不出画面，而他
+     /// 那台电脑上的 dct 是三周前装的。
+     #[test]
+     fn the_envelope_shape_is_pinned_to_the_link_version() {
+         let shape = serde_json::to_string(&sample()).unwrap();
+         assert_eq!(
+             (LINK_VERSION, shape.as_str()),
+             (
+-                3,
++                4,
+                 r#"{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}"#
+             ),
+             "信封的线上形状变了。把 LINK_VERSION 加一，再把这里的期望值更新成新的形状。"
+         );
+     }
+ 
+     /// 鉴权帧和错误码同样是契约。错误码尤其是：中转发一个 `Offline` 出去，
+     /// 手机上要显示「你的电脑离线了」——中间任何一个字母对不上，用户看到的
+     /// 就是一句解析失败。
+     #[test]
+     fn the_auth_frame_and_the_error_codes_are_pinned_too() {
+         let auth = AuthFrame {
+             version: LINK_VERSION,
+             kind: EndpointKind::Computer,
+             endpoint: EndpointId::new("laptop-1").unwrap(),
+             token: "t".into(),
+         };
+         assert_eq!(
+             serde_json::to_string(&auth).unwrap(),
+-            r#"{"version":3,"kind":"Computer","endpoint":"laptop-1","token":"t"}"#
++            r#"{"version":4,"kind":"Computer","endpoint":"laptop-1","token":"t"}"#
+         );
+         assert_eq!(
+             serde_json::to_string(&EndpointKind::Phone).unwrap(),
+             r#""Phone""#
+         );
+ 
+         // 每个变体都要在这里出现一次。
+         let all = vec![
+             LinkError::Unauthorized,
+             LinkError::VersionMismatch,
+@@ -386,33 +399,40 @@ mod tests {
+             kind: EndpointKind::Phone,
+             endpoint: EndpointId::new("phone:7").unwrap(),
+             token: "t".into(),
+         };
+         assert_eq!(
+             serde_json::to_string(&SendRequest {
+                 auth,
+                 envelope: sample()
+             })
+             .unwrap(),
+-            r#"{"auth":{"version":3,"kind":"Phone","endpoint":"phone:7","token":"t"},"envelope":{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}}"#
++            r#"{"auth":{"version":4,"kind":"Phone","endpoint":"phone:7","token":"t"},"envelope":{"from":"laptop-1","to":"phone:7","seq":3,"payload":"aGk=","recipients":[]}}"#
+         );
+         assert_eq!(
+             serde_json::to_string(&PollResponse { envelope: None }).unwrap(),
+             r#"{"envelope":null}"#
+         );
+         assert_eq!(
+             serde_json::to_string(&ErrorBody {
+                 error: LinkError::Offline
+             })
+             .unwrap(),
+             r#"{"error":"Offline"}"#
+         );
++        assert_eq!(
++            serde_json::to_string(&PeersResponse {
++                online: vec![EndpointId::new("laptop-1").unwrap()]
++            })
++            .unwrap(),
++            r#"{"online":["laptop-1"]}"#
++        );
+     }
+ 
+     #[test]
+     fn an_envelope_survives_the_round_trip() {
+         let e = sample();
+         let back: Envelope = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+         assert_eq!(back, e);
+     }
+ 
+     /// payload 是**字节**，不是文本。第二期的密文里什么都有，包括 0 和不是
+diff --git a/crates/dct-page/page.html b/crates/dct-page/page.html
+index 0c8a10e..916e1b1 100644
+--- a/crates/dct-page/page.html
++++ b/crates/dct-page/page.html
+@@ -369,21 +369,21 @@
+       },
+       mouse: function (id, event) {
+         return postJson("/api/mouse", { id: id, event: event });
+       }
+     };
+   }
+ 
+   // 信封的版本。**必须跟 `dct-link` 的 `LINK_VERSION` 一样**，对不上中转
+   // 会当场说 VersionMismatch。有一条守卫盯着这两个数字（在 `dct-srv` 的
+   // 测试里，那是唯一同时够得着这一页和那个常量的地方）。
+-  var LINK_VERSION = 3;
++  var LINK_VERSION = 4;
+ 
+   // payload 是**字节**，不是文本（第二期那里是密文）。所以走 base64，而且
+   // 要先按 UTF-8 编码——`btoa` 只认每个码位都小于 256 的字符串，直接喂中文
+   // 会当场抛异常。
+   function toBase64(text) {
+     var bytes = new TextEncoder().encode(text);
+     var s = "";
+     for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
+     return btoa(s);
+   }
+diff --git a/crates/dct-srv/Cargo.toml b/crates/dct-srv/Cargo.toml
+index 182f1dd..88b9c0c 100644
+--- a/crates/dct-srv/Cargo.toml
++++ b/crates/dct-srv/Cargo.toml
+@@ -1,31 +1,39 @@
+ [package]
+ name = "dct-srv"
+ version = "0.1.0"
+ edition = "2021"
+ license = "MIT"
+ 
+ [dependencies]
+ dct-link = { path = "../dct-link" }
++# 令牌鉴权（`relay_token::{verify, issue, Claims}`）和 issuer 钥匙（P-256）。
++# 只有这个中转需要"验"和"给 token mint 签"，笔记本和手机不该带上这份依赖。
++dct-mesh = { path = "../dct-mesh" }
+ # 手机端那一页网页。**跟 `dct` 发的是同一份字节**——它不住在这两个 crate 的
+ # 任何一个里面，正是为了让"发两份不一样的网页"这件事需要有人特意去做。
+ dct-page = { path = "../dct-page" }
+ # **async 只在这里。** 「不引入 async 运行时」那条规矩是给守护进程和 TUI 写的
+ # （见 `docs/superpowers/plans/2026-08-10-dct-phone-channel.md`），把它照搬到
+ # 中转上是刻舟求剑：中转的全部工作就是同时挂着几千条空闲长连接，这正是 async
+ # 唯一真正不可替代的场景。一个教室 1000 台设备用线程模型就是 1000 条常驻线程。
+ #
+ # 这是独立 crate，`cargo tree -p dct` 里看不到 tokio——那条验收在任务 1 里。
+ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+ axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ # token 只存摘要，不存原文：中转上留着一屋子人的明文钥匙没有任何必要。
+ sha2 = "0.10"
+ # 发布密钥由 `dct-srv key add` 当场生成，必须来自系统随机数（同 `dct` 的 getrandom 用法）。
+ getrandom = "0.2"
++# relay-keys 文件（issuer 公钥）和 `token keygen`/`token mint` 落盘的都是 base64。
++base64 = "0.22"
++# `token keygen`/`token mint` 只在这里签 issuer 令牌，要点名 `dct_mesh::relay_token::issue`
++# 要的 `SigningKey` 类型（版本跟 dct-mesh 保持一致）。
++p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ 
+ [dev-dependencies]
+ tower = { version = "0.5", features = ["util"] }
+ # 只有测试要自己拼 HTTP 请求（见 tests/serves.rs），服务本身用不到读写扩展。
+ tokio = { version = "1", features = ["io-util"] }
+ tempfile = "3"
+diff --git a/crates/dct-srv/src/issuer.rs b/crates/dct-srv/src/issuer.rs
+new file mode 100644
+index 0000000..0a3c50f
+--- /dev/null
++++ b/crates/dct-srv/src/issuer.rs
+@@ -0,0 +1,154 @@
++//! `dct-srv token keygen` / `dct-srv token mint`。
++//!
++//! **这两个子命令只给开发和本机端到端测试用。** 正式令牌由网关签发
++//! （任务 4 的契约）——这里生成的 issuer 钥匙不进任何生产环境的信任列表。
++
++use std::path::Path;
++
++use base64::{engine::general_purpose::STANDARD, Engine as _};
++use dct_mesh::relay_token::{issue, Claims};
++use p256::ecdsa::SigningKey;
++
++/// 生成一对 issuer 钥匙：32 字节签名种子和它的 65 字节 SEC1 公钥。
++///
++/// `SigningKey::from_slice` 只在种子是全零或者不小于曲线阶时才失败——
++/// 撞上的概率小到可以忽略，重抽一遍比向调用方交代一个几乎不可能发生的
++/// 错误更简单。
++pub fn generate() -> ([u8; 32], [u8; 65]) {
++    loop {
++        let mut seed = [0u8; 32];
++        getrandom::getrandom(&mut seed).expect("系统随机数不可用");
++        if let Ok(sk) = SigningKey::from_slice(&seed) {
++            let point = sk.verifying_key().to_encoded_point(false);
++            let mut pk = [0u8; 65];
++            pk.copy_from_slice(point.as_bytes());
++            return (seed, pk);
++        }
++    }
++}
++
++/// `seed`/`pub_key` 编码成 base64 之后的样子——`write_issuer_files` 和
++/// 单元测试都要这两行，拆出来避免重复。
++pub fn encode_seed(seed: &[u8; 32]) -> String {
++    STANDARD.encode(seed)
++}
++
++pub fn encode_pub(pub_key: &[u8; 65]) -> String {
++    STANDARD.encode(pub_key)
++}
++
++/// `token keygen --out <dir>` 写出的两个文件：
++/// - `<dir>/issuer.key`：32 字节标量的 base64，0600；
++/// - `<dir>/issuer.pub`：可以直接当 relay-keys 文件用。
++pub fn write_issuer_files(dir: &Path, seed: &[u8; 32], pub_key: &[u8; 65]) -> std::io::Result<()> {
++    write_secret_file(&dir.join("issuer.key"), &encode_seed(seed))?;
++    std::fs::write(dir.join("issuer.pub"), format!("{}\n", encode_pub(pub_key)))
++}
++
++/// 私钥落盘：`0600`，先写全部内容再关，跟 `PublishKeys::save` 同一个道理——
++/// 这里不用临时文件改名那一套，因为这条命令只在本机、只跑这一次，不存在
++/// 「运行中的进程正在读它」的并发场景。
++fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
++    let mut opts = std::fs::OpenOptions::new();
++    opts.write(true).create(true).truncate(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        opts.mode(0o600);
++    }
++    let mut f = opts.open(path)?;
++    std::io::Write::write_all(&mut f, contents.as_bytes())
++}
++
++/// 把 `issuer.key` 文件的内容（一行 base64 标量）还原成签名钥匙。
++pub fn signing_key_from_seed_b64(raw: &str) -> Result<SigningKey, String> {
++    let bytes = STANDARD
++        .decode(raw.trim())
++        .map_err(|e| format!("不是合法的 base64：{e}"))?;
++    SigningKey::from_slice(&bytes).map_err(|_| "不是合法的签名种子".to_string())
++}
++
++/// `token mint`：签一个令牌。`now` 由调用方给（同 `PublishKeys::add` 那条
++/// 「不碰系统时钟」的规矩），好让这条纯函数不用起进程就能测。
++pub fn mint(
++    signing_key: &SigningKey,
++    account: &str,
++    endpoint: &str,
++    ttl_secs: u64,
++    now: u64,
++) -> String {
++    let claims = Claims {
++        account: account.to_string(),
++        endpoint: endpoint.to_string(),
++        exp: now.saturating_add(ttl_secs),
++    };
++    issue(&claims, signing_key)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use dct_mesh::relay_token::verify;
++
++    #[test]
++    fn generate_then_round_trips_through_base64() {
++        let (seed, pk) = generate();
++        let sk = signing_key_from_seed_b64(&encode_seed(&seed)).unwrap();
++        assert_eq!(sk.verifying_key().to_encoded_point(false).as_bytes(), pk);
++    }
++
++    #[test]
++    fn minted_token_verifies_under_the_generated_public_key() {
++        let (seed, pk) = generate();
++        let sk = signing_key_from_seed_b64(&encode_seed(&seed)).unwrap();
++        let token = mint(&sk, "acct", "c-abc", 3600, 1_000);
++        let claims = verify(&token, &[pk], 1_000).unwrap();
++        assert_eq!(claims.account, "acct");
++        assert_eq!(claims.endpoint, "c-abc");
++        assert_eq!(claims.exp, 4_600);
++    }
++
++    #[test]
++    fn a_minted_token_expires_after_its_ttl() {
++        let (seed, pk) = generate();
++        let sk = signing_key_from_seed_b64(&encode_seed(&seed)).unwrap();
++        let token = mint(&sk, "acct", "c-abc", 10, 1_000);
++        assert!(verify(&token, &[pk], 1_009).is_ok());
++        assert!(
++            verify(&token, &[pk], 1_010).is_err(),
++            "exp 那一秒本身就该过期"
++        );
++    }
++
++    #[test]
++    fn write_issuer_files_writes_a_usable_key_and_pub_file() {
++        let dir = tempfile::tempdir().unwrap();
++        let (seed, pk) = generate();
++        write_issuer_files(dir.path(), &seed, &pk).unwrap();
++
++        let key_raw = std::fs::read_to_string(dir.path().join("issuer.key")).unwrap();
++        let sk = signing_key_from_seed_b64(&key_raw).unwrap();
++        assert_eq!(sk.verifying_key().to_encoded_point(false).as_bytes(), pk);
++
++        let pub_raw = std::fs::read_to_string(dir.path().join("issuer.pub")).unwrap();
++        let parsed = crate::keys::parse_relay_keys(&pub_raw).unwrap();
++        assert_eq!(parsed, vec![pk], "issuer.pub 得能直接当 relay-keys 文件用");
++
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            let mode = std::fs::metadata(dir.path().join("issuer.key"))
++                .unwrap()
++                .permissions()
++                .mode()
++                & 0o777;
++            assert_eq!(mode, 0o600);
++        }
++    }
++
++    #[test]
++    fn garbage_seed_file_is_refused_not_a_panic() {
++        assert!(signing_key_from_seed_b64("not base64!!").is_err());
++        assert!(signing_key_from_seed_b64(&STANDARD.encode([0u8; 32])).is_err());
++    }
++}
+diff --git a/crates/dct-srv/src/keys.rs b/crates/dct-srv/src/keys.rs
+index 0ed9817..a04dc1b 100644
+--- a/crates/dct-srv/src/keys.rs
++++ b/crates/dct-srv/src/keys.rs
+@@ -1,16 +1,49 @@
+ //! 发布密钥文件。见 `docs/superpowers/specs/2026-09-13-public-live-listing-design.md`
+ //! 「发布密钥与总开关」。
++//!
++//! 这个文件里还有 relay-keys：中转信任哪几个签令牌的 issuer 公钥
++//! （`--relay-keys`），格式跟发布密钥完全不是一回事——那是摘要，这是明文
++//! 公钥（公钥本来就不是秘密）——放在同一个文件只是因为两者都是「一份
++//! 密钥列表，按行读」。
+ 
+ use std::path::{Path, PathBuf};
+ use std::time::SystemTime;
+ 
++/// relay-keys 文件：每行一把 STANDARD base64 的 65 字节 SEC1 公钥，`#`
++/// 开头的是注释，空行忽略。
++pub fn load_relay_keys(path: &Path) -> Result<Vec<[u8; 65]>, String> {
++    let raw =
++        std::fs::read_to_string(path).map_err(|e| format!("读不了 {}：{e}", path.display()))?;
++    parse_relay_keys(&raw)
++}
++
++/// `load_relay_keys` 的纯逻辑那一半，供测试直接喂字符串。
++pub fn parse_relay_keys(raw: &str) -> Result<Vec<[u8; 65]>, String> {
++    use base64::{engine::general_purpose::STANDARD, Engine as _};
++    let mut out = Vec::new();
++    for (i, line) in raw.lines().enumerate() {
++        let line = line.trim();
++        if line.is_empty() || line.starts_with('#') {
++            continue;
++        }
++        let bytes = STANDARD
++            .decode(line)
++            .map_err(|e| format!("第 {} 行不是合法的 base64：{e}", i + 1))?;
++        let key: [u8; 65] = bytes
++            .try_into()
++            .map_err(|_| format!("第 {} 行不是 65 字节的公钥", i + 1))?;
++        out.push(key);
++    }
++    Ok(out)
++}
++
+ #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub struct PublishKeys {
+     #[serde(default)]
+     pub keys: Vec<KeyEntry>,
+     /// 被运营方下线的房间号（`dct-srv takedown`）。停播之前都公开不了。
+     #[serde(default)]
+     pub blocked: Vec<String>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+@@ -160,20 +193,57 @@ impl KeyFile {
+         self.stamp = stamp;
+         self.keys = PublishKeys::load(&self.path)?;
+         Ok(true)
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    fn b64_pub(byte: u8) -> String {
++        use base64::{engine::general_purpose::STANDARD, Engine as _};
++        let mut pk = [0u8; 65];
++        pk[0] = 0x04;
++        pk[1] = byte;
++        STANDARD.encode(pk)
++    }
++
++    #[test]
++    fn relay_keys_parses_one_key_per_line_and_skips_comments_and_blanks() {
++        let a = b64_pub(1);
++        let b = b64_pub(2);
++        let raw = format!("# comment\n{a}\n\n{b}\n");
++        let keys = parse_relay_keys(&raw).unwrap();
++        assert_eq!(keys.len(), 2);
++        assert_eq!(keys[0][1], 1);
++        assert_eq!(keys[1][1], 2);
++    }
++
++    #[test]
++    fn relay_keys_rejects_a_line_that_is_not_65_bytes() {
++        assert!(parse_relay_keys("aGVsbG8=\n").is_err(), "太短的公钥要报错");
++    }
++
++    #[test]
++    fn relay_keys_rejects_invalid_base64() {
++        assert!(parse_relay_keys("not base64!!\n").is_err());
++    }
++
++    #[test]
++    fn an_empty_relay_keys_file_is_an_empty_list_not_an_error() {
++        assert_eq!(
++            parse_relay_keys("# only comments\n\n").unwrap(),
++            Vec::<[u8; 65]>::new()
++        );
++    }
++
+     fn tmp_file() -> (tempfile::TempDir, std::path::PathBuf) {
+         let d = tempfile::tempdir().unwrap();
+         let p = d.path().join("publish-keys.json");
+         (d, p)
+     }
+ 
+     /// 生成的密钥只返回一次，文件里只有摘要；拿原文能认出是谁的。
+     #[test]
+     fn a_key_is_stored_as_a_digest_and_recognised_by_name() {
+         let mut k = PublishKeys::default();
+diff --git a/crates/dct-srv/src/lib.rs b/crates/dct-srv/src/lib.rs
+index be4f6d6..6599278 100644
+--- a/crates/dct-srv/src/lib.rs
++++ b/crates/dct-srv/src/lib.rs
+@@ -19,35 +19,37 @@
+ //! 信箱只在设备还活着的时候存在，进程一停就什么都没了，有界，满了就明说
+ //! （`Busy`），不落盘。
+ //!
+ //! # 第一期没有鉴权
+ //!
+ //! `token` 现在没人验（任务 5 才接 dc_classroom），所以**这个服务在第一期
+ //! 不能对公网开口**。这不是靠自觉：`main.rs` 直接拒绝绑非环回地址。
+ 
+ mod live;
+ pub use live::{Control, Live, PublicEntry};
++pub mod issuer;
+ pub mod keys;
+ 
+ use std::collections::HashMap;
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+ use axum::extract::{DefaultBodyLimit, FromRef, Path, State};
+ use axum::http::{HeaderMap, StatusCode, Uri};
+ use axum::response::{IntoResponse, Response};
+ use axum::routing::{get, post};
+ use axum::{Json, Router};
+ use dct_link::{
+-    AuthFrame, EndpointId, Envelope, ErrorBody, LinkError, PollResponse, SendRequest, LINK_VERSION,
+-    MAX_PAYLOAD, PATH_ASK, PATH_POLL, PATH_SEND,
++    AuthFrame, EndpointId, Envelope, ErrorBody, LinkError, PeersResponse, PollResponse,
++    SendRequest, LINK_VERSION, MAX_PAYLOAD, PATH_ASK, PATH_PEERS, PATH_POLL, PATH_SEND,
+ };
++use dct_mesh::relay_token;
+ use tokio::sync::mpsc;
+ 
+ /// 一次长轮询最多挂多久。**这个数字两边共用**，理由见 `dct_link::POLL_TIMEOUT`
+ /// ——守护进程要拿它算自己的读超时，算错一边整条链路就永远连不上。
+ pub const DEFAULT_POLL_TIMEOUT: Duration = dct_link::POLL_TIMEOUT;
+ 
+ /// 每台设备的信箱能存几个信封。
+ ///
+ /// 这条链路本质是一问一答，正常情况下信箱里最多躺着一个。定成 32 是给突发
+ /// 留的余量；真的堆到 32 个还没人取，说明对面已经不在干活了，那时候说
+@@ -78,130 +80,202 @@ impl Config {
+         self.poll_timeout * 3
+     }
+ }
+ 
+ struct Device {
+     tx: mpsc::Sender<Envelope>,
+     /// 取件的一端。同一台设备同时只该有一个轮询，多出来的就在这把锁上排队。
+     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Envelope>>>,
+     /// 最后一次**发起**轮询的时刻。见 `Config::presence_ttl`。
+     last_poll: Instant,
++    /// 这台设备属于哪个账号。`None` = 中转没配 issuer（`Relay::new`），没人
++    /// 验过令牌，账号无从知道——这时候账号隔离和 `peers` 都不该假装认得出
++    /// 「同账号」是什么意思。
++    account: Option<String>,
+ }
+ 
+ /// 正挂在 `/link/ask` 上等答复的人。键是「等的是谁的、哪一个 `seq`」，
+ /// 也就是答复信封上的 `to` 和 `seq`。
+ type Waiting = Mutex<HashMap<(EndpointId, u64), tokio::sync::oneshot::Sender<Envelope>>>;
+ 
+ pub struct Relay {
+     devices: Mutex<HashMap<EndpointId, Device>>,
+     waiting: Waiting,
+     cfg: Config,
++    /// 这个中转信任哪几个签令牌的 issuer。`None` = 不验令牌（`Relay::new`），
++    /// 只给已有测试和本机开发用——**不能**对公网开口，见 `main.rs`。
++    issuers: Option<Vec<[u8; 65]>>,
++}
++
++/// 当前 unix 秒——喂给 `relay_token::verify` 判断 `exp`。
++fn now_secs() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or(0)
+ }
+ 
+ impl Relay {
+     pub fn new(cfg: Config) -> Self {
+         Relay {
+             devices: Mutex::new(HashMap::new()),
+             waiting: Mutex::new(HashMap::new()),
+             cfg,
++            issuers: None,
+         }
+     }
+ 
+-    /// 出示凭据的人说得通吗。
+-    fn check(&self, auth: &AuthFrame) -> Result<(), LinkError> {
++    /// 验令牌的中转。`issuers` 是这个中转信任的签发方公钥——任何一把验过
++    /// 就算数（见 `relay_token::verify`）。**正式令牌由网关签**（任务 4 的
++    /// 契约）；这个构造函数本身对谁签的、签得对不对一无所知，光是把
++    /// `check()` 从「不验」切到「验」。
++    pub fn with_issuers(cfg: Config, issuers: Vec<[u8; 65]>) -> Self {
++        Relay {
++            devices: Mutex::new(HashMap::new()),
++            waiting: Mutex::new(HashMap::new()),
++            cfg,
++            issuers: Some(issuers),
++        }
++    }
++
++    /// 出示凭据的人说得通吗。验过的话，一并把令牌里的账号交回去——`poll`
++    /// 拿它记进 `Device`，`send`/`ask`/`peers` 拿它做账号隔离。`None` 有两种
++    /// 意思，调用方分不清也不需要分清：要么没配 issuer（`Relay::new`），
++    /// 要么就是没这回事——两种情况下都不该拿它去比账号。
++    fn check(&self, auth: &AuthFrame) -> Result<Option<String>, LinkError> {
+         if auth.version != LINK_VERSION {
+             return Err(LinkError::VersionMismatch);
+         }
+-        // TODO(任务 5)：`auth.token` 还没人验，`auth.kind` 也还没用上——它存在
+-        // 就是为了让那时候的中转知道该拿哪个验证器去验。在那之前这个服务只
+-        // 监听环回地址（见 `main.rs`）。
+-        Ok(())
++        let Some(issuers) = &self.issuers else {
++            return Ok(None);
++        };
++        let claims = relay_token::verify(&auth.token, issuers, now_secs())
++            .map_err(|_| LinkError::Unauthorized)?;
++        // 令牌验得过，但它是签给别人的：出示凭据的人拿着一把不属于自己的
++        // 有效令牌，这跟令牌本身伪造是两件事，要用不同的码说清楚。
++        if claims.endpoint != auth.endpoint.as_str() {
++            return Err(LinkError::NotYours);
++        }
++        Ok(Some(claims.account))
+     }
+ 
+     /// 有我的东西吗。没有就挂着，挂到超时为止。
+     pub async fn poll(&self, auth: &AuthFrame) -> Result<Option<Envelope>, LinkError> {
+-        self.check(auth)?;
++        let account = self.check(auth)?;
+ 
+         let rx = {
+             let mut map = self.devices.lock().expect("device table poisoned");
+             // 顺手把死掉的清了。设备数量是一个教室的量级，这点开销无所谓，
+             // 而单独起一个清扫任务要多一条生命周期去管。
+             let ttl = self.cfg.presence_ttl();
+             map.retain(|_, d| d.last_poll.elapsed() < ttl);
+ 
+             let inbox = self.cfg.inbox;
+             let d = map.entry(auth.endpoint.clone()).or_insert_with(|| {
+                 let (tx, rx) = mpsc::channel(inbox);
+                 Device {
+                     tx,
+                     rx: Arc::new(tokio::sync::Mutex::new(rx)),
+                     last_poll: Instant::now(),
++                    account: account.clone(),
+                 }
+             });
+             d.last_poll = Instant::now();
++            // 每次轮询都刷新一遍：一台设备换了新令牌（比如续期后账号变了），
++            // 下一次轮询就该跟着变，不该卡在它第一次露面时的那份账号。
++            d.account = account.clone();
+             d.rx.clone()
+         };
+ 
+         let mut rx = rx.lock().await;
+         match tokio::time::timeout(self.cfg.poll_timeout, rx.recv()).await {
+             Ok(Some(e)) => Ok(Some(e)),
+             // 发件的一端没了——只可能是上面那次清扫把这台设备的条目删了。
+             // 对调用方来说跟"这一轮没东西"没有区别：再来一次就是了。
+             Ok(None) => Ok(None),
+             Err(_) => Ok(None),
+         }
+     }
+ 
+     /// 投一个信封。**不排队给不在线的人**，投不到就当场说。
+     pub fn send(&self, req: &SendRequest) -> Result<(), LinkError> {
+-        self.check(&req.auth)?;
++        let account = self.check(&req.auth)?;
+ 
+         // 信封上的寄件人必须就是出示凭据的那个人。不比这一下，任何一个连得上
+         // 中转的人都能冒充别人发东西——而收件方唯一能用来判断"这是谁说的"的
+         // 依据就是 `from`。
+         if req.envelope.from != req.auth.endpoint {
+             return Err(LinkError::Unauthorized);
+         }
+ 
+         if req.envelope.payload.len() > MAX_PAYLOAD {
+             return Err(LinkError::TooBig);
+         }
+ 
+         // **先看有没有人正挂着等这一封。** 走 `/link/ask` 的手机根本不轮询，
+         // 它不在设备表里；这一步要是排在在线检查后面，笔记本发回去的答复
+-        // 会被判成"收件人不在线"直接丢掉，而提问的人还在那头挂着。
++        // 会被判成"收件人不在线"直接丢掉，而提问的人还在那头挂着。挂号表里
++        // 的这一位从没经过账号校验（它压根没有 `Device` 条目），但这没关系：
++        // 它的挂号是由 `ask()` 里那一次普通 `send()` 建立的，那一次已经把
++        // 提问者和被问者的账号比过了。
+         if let Some(tx) = self
+             .waiting
+             .lock()
+             .expect("waiting table poisoned")
+             .remove(&(req.envelope.to.clone(), req.envelope.seq))
+         {
+             // 送不进去只有一种可能：提问的人已经不等了（超时或者断开）。
+             // 那封答复就没有意义了，丢掉是对的。
+             let _ = tx.send(req.envelope.clone());
+             return Ok(());
+         }
+ 
+         let tx = {
+             let map = self.devices.lock().expect("device table poisoned");
+             match map.get(&req.envelope.to) {
+-                Some(d) if d.last_poll.elapsed() < self.cfg.presence_ttl() => d.tx.clone(),
++                Some(d) if d.last_poll.elapsed() < self.cfg.presence_ttl() => {
++                    // 账号隔离：只在两边都验过令牌（`account` 是 `Some`）时才
++                    // 判——`Relay::new` 从来分不清账号，不该假装能拦跨账号。
++                    if let Some(sender) = &account {
++                        if d.account.as_deref() != Some(sender.as_str()) {
++                            return Err(LinkError::NotYours);
++                        }
++                    }
++                    d.tx.clone()
++                }
+                 _ => return Err(LinkError::Offline),
+             }
+         };
+ 
+         tx.try_send(req.envelope.clone()).map_err(|e| match e {
+             mpsc::error::TrySendError::Full(_) => LinkError::Busy,
+             // 取件的一端被清扫掉了：设备已经不在了，跟从没来过一样。
+             mpsc::error::TrySendError::Closed(_) => LinkError::Offline,
+         })
+     }
++
++    /// 跟我同账号、在线、不是我自己的端点，按字典序排。
++    pub fn peers(&self, auth: &AuthFrame) -> Result<Vec<EndpointId>, LinkError> {
++        let account = self.check(auth)?;
++
++        let mut map = self.devices.lock().expect("device table poisoned");
++        let ttl = self.cfg.presence_ttl();
++        map.retain(|_, d| d.last_poll.elapsed() < ttl);
++
++        let mut out: Vec<EndpointId> = map
++            .iter()
++            .filter(|(ep, d)| **ep != auth.endpoint && d.account.as_deref() == account.as_deref())
++            .map(|(ep, _)| ep.clone())
++            .collect();
++        out.sort();
++        Ok(out)
++    }
+ }
+ 
+ impl Relay {
+     /// 投一个信封，挂着等配对的答复。
+     ///
+     /// 手机用这条：一次 fetch 一个答案，页面里因此不需要任何「哪个 seq 对应
+     /// 哪个还没兑现的 Promise」的簿记——那份簿记要是放在页面里，就落在这个
+     /// 仓库里唯一跑不了测试的地方。
+     pub async fn ask(&self, req: &SendRequest) -> Result<Envelope, LinkError> {
+         let (tx, rx) = tokio::sync::oneshot::channel();
+@@ -612,20 +686,29 @@ async fn send_route(
+     Ok(StatusCode::NO_CONTENT)
+ }
+ 
+ async fn ask_route(
+     State(relay): State<Arc<Relay>>,
+     Json(req): Json<SendRequest>,
+ ) -> Result<Json<Envelope>, Rejected> {
+     Ok(Json(relay.ask(&req).await?))
+ }
+ 
++async fn peers_route(
++    State(relay): State<Arc<Relay>>,
++    Json(auth): Json<AuthFrame>,
++) -> Result<Json<PeersResponse>, Rejected> {
++    Ok(Json(PeersResponse {
++        online: relay.peers(&auth)?,
++    }))
++}
++
+ /// 中转挂哪些路由。
+ ///
+ /// **默认只有直播那一组，外加公开列表。** 配对信封那三条（`/link/*`）和
+ /// 手机网页（`/phone`）没有鉴权（见 [`must_be_loopback`]），以前全靠部署方
+ /// 在反代上写一条「只放行 `/live/*`」的白名单挡着——那是一条配置里的约定，
+ /// 换一份「全部转发」的反代配置它就没了，公网上的任何人就能冒充任何一台
+ /// 设备收发信封。现在不打开就根本不存在，安全不再取决于反代写没写对。
+ /// `/` 和 `GET /live/public` 是例外：公开列表本来就该谁都能读，两档都挂。
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Routes {
+@@ -640,21 +723,22 @@ pub enum Routes {
+ pub fn router(state: AppState, routes: Routes) -> Router {
+     let app = Router::new();
+     let app = match routes {
+         Routes::LiveOnly => app,
+         // 手机网页挂在 `/phone`，不再是 `/`——那个位置现在是公开列表页，
+         // 两档都挂（见下面 `.route("/", ...)`）。
+         Routes::WithLink => app
+             .route("/phone", get(page_route))
+             .route(PATH_POLL, post(poll_route))
+             .route(PATH_SEND, post(send_route))
+-            .route(PATH_ASK, post(ask_route)),
++            .route(PATH_ASK, post(ask_route))
++            .route(PATH_PEERS, post(peers_route)),
+     };
+     app
+         // 公开列表页和列表接口：谁都能读，两档都挂。
+         .route("/", get(public_page_route))
+         .route(dct_link::live::PATH_PUBLIC_LIST, get(live_public_list_route))
+         .route(
+             "/live/{id}/public",
+             axum::routing::put(live_publish_route)
+                 .delete(live_unpublish_route)
+                 // 跟 `PATH_START` 一样：请求体只有一个标题和一把密钥，
+@@ -773,61 +857,123 @@ pub fn must_be_loopback(addr: std::net::SocketAddr) -> Result<(), String> {
+     if addr.ip().is_loopback() {
+         return Ok(());
+     }
+     Err(format!(
+         "{addr} 不是环回地址。第一期的中转没有鉴权也没有加密，只能在 \
+          127.0.0.1 上跑；要对外提供服务，先做完任务 5（接 dc_classroom）\
+          和第二期（端到端加密）。"
+     ))
+ }
+ 
+-/// 中转的五种启动方式。
++/// 这个地址允不允许绑。带了 `--relay-keys`（令牌要验）就放行任何地址；
++/// 没带就退回 [`must_be_loopback`]。
++///
++/// 这条判断跟 `must_be_loopback` 分开、也写在库里，理由一样：`main` 没法测，
++/// 而「公网开口的前提是有 issuer 公钥」跟「第一期只能环回」是两条不同的
++/// 判断，`--with-link` 不带 `--relay-keys` 的话公网照样要拒。
++pub fn bind_check(
++    addr: std::net::SocketAddr,
++    relay_keys: Option<&std::path::Path>,
++) -> Result<(), String> {
++    if relay_keys.is_some() {
++        return Ok(());
++    }
++    must_be_loopback(addr)
++}
++
++/// 中转的七种启动方式。
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum Cli {
+     Serve {
+         addr: String,
+         with_link: bool,
+         publish_keys: Option<std::path::PathBuf>,
++        /// 中转信任的 issuer 公钥文件。带了它才验令牌，也才允许绑非环回
++        /// 地址——见 [`bind_check`]。
++        relay_keys: Option<std::path::PathBuf>,
+     },
+     KeyAdd {
+         name: String,
+         file: std::path::PathBuf,
+     },
+     KeyRevoke {
+         name: String,
+         file: std::path::PathBuf,
+     },
+     KeyList {
+         file: std::path::PathBuf,
+     },
+     Takedown {
+         id: String,
+         file: std::path::PathBuf,
+     },
++    /// `token keygen --out <dir>`：生成一对 issuer 钥匙，只给开发和本机
++    /// 端到端测试用——正式令牌由网关签（任务 4 的契约）。
++    TokenKeygen {
++        out: std::path::PathBuf,
++    },
++    /// `token mint --key <file> --account <a> --endpoint <e> --ttl <secs>`：
++    /// 用一把 issuer 钥匙签一个令牌，打印到标准输出。同上，只给开发用。
++    TokenMint {
++        key: std::path::PathBuf,
++        account: String,
++        endpoint: String,
++        ttl: u64,
++    },
+ }
+ 
+-/// 手写解析：五种形状，不值得为此引一个参数库。
++/// 手写解析：不值得为此引一个参数库。
+ pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
+-    fn flag_value(args: &[String], flag: &str) -> Result<Option<std::path::PathBuf>, String> {
++    fn flag_str<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+         match args.iter().position(|a| a == flag) {
+             None => Ok(None),
+             Some(i) => args
+                 .get(i + 1)
+                 .filter(|v| !v.starts_with("--"))
+-                .map(|v| Some(v.into()))
+-                .ok_or_else(|| format!("{flag} 后面要跟一个文件路径")),
++                .map(|v| Some(v.as_str()))
++                .ok_or_else(|| format!("{flag} 后面要跟一个值")),
+         }
+     }
++    fn flag_value(args: &[String], flag: &str) -> Result<Option<std::path::PathBuf>, String> {
++        Ok(flag_str(args, flag)?.map(std::path::PathBuf::from))
++    }
+     let need_file = |args: &[String]| {
+         flag_value(args, "--file")?.ok_or_else(|| "管理命令要写明 --file <密钥文件>".to_string())
+     };
+     match args.first().map(String::as_str) {
++        Some("token") => match args.get(1).map(String::as_str) {
++            Some("keygen") => Ok(Cli::TokenKeygen {
++                out: flag_value(args, "--out")?
++                    .ok_or_else(|| "token keygen 要写明 --out <目录>".to_string())?,
++            }),
++            Some("mint") => {
++                let key = flag_value(args, "--key")?
++                    .ok_or_else(|| "token mint 要写明 --key <issuer 钥匙文件>".to_string())?;
++                let account = flag_str(args, "--account")?
++                    .ok_or_else(|| "token mint 要写明 --account <账号>".to_string())?
++                    .to_string();
++                let endpoint = flag_str(args, "--endpoint")?
++                    .ok_or_else(|| "token mint 要写明 --endpoint <端点>".to_string())?
++                    .to_string();
++                let ttl = flag_str(args, "--ttl")?
++                    .ok_or_else(|| "token mint 要写明 --ttl <秒数>".to_string())?
++                    .parse::<u64>()
++                    .map_err(|_| "--ttl 后面要跟一个数字".to_string())?;
++                Ok(Cli::TokenMint {
++                    key,
++                    account,
++                    endpoint,
++                    ttl,
++                })
++            }
++            _ => Err("用法：dct-srv token keygen|mint ...".into()),
++        },
+         Some("key") => {
+             // `args.get(2)` 直接当名字用的话，`key add --file X`（漏了名字，
+             // `--file` 紧跟在 `add` 后面）会把 `--file` 当成密钥的名字，
+             // 而 `--file` 后面那个真正的文件路径反而没人管——过滤掉长得
+             // 像另一个 flag 的值，走到 `ok_or_else` 那句一样的「缺少名字」。
+             let name = || {
+                 args.get(2)
+                     .filter(|n| !n.starts_with("--"))
+                     .cloned()
+                     .ok_or_else(|| "缺少名字".to_string())
+@@ -849,48 +995,53 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
+         }
+         Some("takedown") => Ok(Cli::Takedown {
+             id: args
+                 .get(1)
+                 .cloned()
+                 .ok_or_else(|| "缺少房间号".to_string())?,
+             file: need_file(args)?,
+         }),
+         _ => {
+             let publish_keys = flag_value(args, "--publish-keys")?;
++            let relay_keys = flag_value(args, "--relay-keys")?;
++            let flags_with_values = ["--publish-keys", "--relay-keys"];
+             let mut skip_next = false;
+             let mut addr = None;
+             for a in args {
+                 if skip_next {
+                     skip_next = false;
+                     continue;
+                 }
+-                if a == "--publish-keys" {
++                if flags_with_values.contains(&a.as_str()) {
+                     skip_next = true;
+                 } else if !a.starts_with("--") && addr.is_none() {
+                     addr = Some(a.clone());
+                 }
+             }
+             Ok(Cli::Serve {
+                 addr: addr.unwrap_or_else(|| "127.0.0.1:8787".into()),
+                 with_link: args.iter().any(|a| a == "--with-link"),
+                 publish_keys,
++                relay_keys,
+             })
+         }
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use axum::body::Body;
+     use axum::http::Request;
+     use dct_link::EndpointKind;
++    use dct_mesh::relay_token::{issue, Claims};
++    use p256::ecdsa::SigningKey;
+     use tower::ServiceExt;
+ 
+     fn cfg(ms: u64) -> Config {
+         Config {
+             poll_timeout: Duration::from_millis(ms),
+             inbox: 4,
+         }
+     }
+ 
+     fn id(s: &str) -> EndpointId {
+@@ -975,21 +1126,21 @@ mod tests {
+ 
+     /// **不开口子的中转，配对信封那三条和手机网页根本不存在。** 这几条路由
+     /// 没有鉴权（见 `must_be_loopback`），以前全靠反代上那条「只放行
+     /// `/live/*`」的白名单挡着——换一份「全部转发」的反代配置，公网上的
+     /// 任何人就能冒充任何一台设备收发信封。现在不带 `--with-link` 起的中转
+     /// 自己就不答这几条路。**`/` 是例外**：它是公开列表页，本来就该谁都能
+     /// 看，两档都挂。
+     #[tokio::test]
+     async fn the_default_relay_does_not_answer_the_unauthenticated_routes() {
+         let (app, _live) = app_with_live();
+-        for path in [PATH_POLL, PATH_SEND, PATH_ASK, "/phone"] {
++        for path in [PATH_POLL, PATH_SEND, PATH_ASK, PATH_PEERS, "/phone"] {
+             let (status, _) = post(app.clone(), path, "{}").await;
+             assert_eq!(status, StatusCode::NOT_FOUND, "{path} 不该在默认中转上存在");
+         }
+         // `/` 是公开列表页，两档都挂。
+         let root = app
+             .clone()
+             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+             .await
+             .unwrap();
+         assert_eq!(root.status(), StatusCode::OK, "`/` 该在默认中转上打得开");
+@@ -1420,20 +1571,201 @@ mod tests {
+                         recipients: vec![],
+                     },
+                 })
+                 .unwrap();
+         }
+ 
+         assert_eq!(q1.await.unwrap().unwrap().payload, b"first");
+         assert_eq!(q2.await.unwrap().unwrap().payload, b"second");
+     }
+ 
++    // ——— 令牌鉴权、账号隔离、在线查询（任务 3）———
++
++    /// 一把假想的 issuer 钥匙：签名种子和它的公钥。跟
++    /// `dct_mesh::relay_token` 测试里同一个套路。
++    fn issuer(byte: u8) -> (SigningKey, [u8; 65]) {
++        let sk = SigningKey::from_slice(&[byte.max(1); 32]).unwrap();
++        let point = sk.verifying_key().to_encoded_point(false);
++        let mut pk = [0u8; 65];
++        pk.copy_from_slice(point.as_bytes());
++        (sk, pk)
++    }
++
++    /// 签一个还没过期的令牌（`exp` 是很远的未来，不会在测试跑的这几毫秒里过期）。
++    fn token_for(sk: &SigningKey, account: &str, endpoint: &str) -> String {
++        issue(
++            &Claims {
++                account: account.into(),
++                endpoint: endpoint.into(),
++                exp: 4_000_000_000,
++            },
++            sk,
++        )
++    }
++
++    /// 同一个 `AuthFrame`，只是把 `token` 换成给定的那个。
++    fn authed(who: &str, token: String) -> AuthFrame {
++        AuthFrame { token, ..auth(who) }
++    }
++
++    #[tokio::test]
++    async fn with_issuers_a_missing_or_forged_token_is_unauthorized() {
++        let (_sk, pk) = issuer(1);
++        let (forged_sk, _forged_pk) = issuer(2);
++        let relay = Relay::with_issuers(cfg(50), vec![pk]);
++
++        // `auth("b")` 默认带的是 `"t"`，压根不是这个格式的令牌。
++        assert_eq!(relay.poll(&auth("b")).await, Err(LinkError::Unauthorized));
++
++        // 另一个 issuer 签的——不在这个中转信任的名单里。
++        let forged = token_for(&forged_sk, "acct", "b");
++        assert_eq!(
++            relay.poll(&authed("b", forged)).await,
++            Err(LinkError::Unauthorized)
++        );
++    }
++
++    #[tokio::test]
++    async fn a_token_for_another_endpoint_is_not_yours() {
++        let (sk, pk) = issuer(1);
++        let relay = Relay::with_issuers(cfg(50), vec![pk]);
++        // 令牌验得过，但它是签给 "someone-else" 的，不是出示这令牌的 "b"。
++        let token = token_for(&sk, "acct", "someone-else");
++        assert_eq!(
++            relay.poll(&authed("b", token)).await,
++            Err(LinkError::NotYours)
++        );
++    }
++
++    #[tokio::test]
++    async fn an_expired_token_is_unauthorized() {
++        let (sk, pk) = issuer(1);
++        let relay = Relay::with_issuers(cfg(50), vec![pk]);
++        let expired = issue(
++            &Claims {
++                account: "acct".into(),
++                endpoint: "b".into(),
++                exp: 1,
++            },
++            &sk,
++        );
++        assert_eq!(
++            relay.poll(&authed("b", expired)).await,
++            Err(LinkError::Unauthorized)
++        );
++    }
++
++    #[tokio::test]
++    async fn envelopes_do_not_cross_accounts() {
++        let (sk, pk) = issuer(1);
++        let relay = Arc::new(Relay::with_issuers(cfg(200), vec![pk]));
++
++        // b 上线，账号是 acct-b。
++        let b_token = token_for(&sk, "acct-b", "b");
++        assert_eq!(relay.poll(&authed("b", b_token)).await, Ok(None));
++
++        // a 是另一个账号，发给 b：即便 b 在线，也不是它能碰的设备。
++        let a_token = token_for(&sk, "acct-a", "a");
++        let mut cross = letter("a", "b", b"x");
++        cross.auth = authed("a", a_token);
++        assert_eq!(relay.send(&cross), Err(LinkError::NotYours));
++    }
++
++    #[tokio::test]
++    async fn peers_lists_only_same_account_online_others() {
++        let (sk, pk) = issuer(1);
++        let relay = Arc::new(Relay::with_issuers(cfg(200), vec![pk]));
++
++        let a_token = token_for(&sk, "acct-a", "a");
++        let b_token = token_for(&sk, "acct-a", "b");
++        let c_token = token_for(&sk, "acct-other", "c");
++
++        assert_eq!(relay.poll(&authed("a", a_token.clone())).await, Ok(None));
++        assert_eq!(relay.poll(&authed("b", b_token)).await, Ok(None));
++        assert_eq!(relay.poll(&authed("c", c_token)).await, Ok(None));
++
++        // a 自己看到的名单：同账号、在线、不是自己——只有 b。c 是另一个账号，
++        // a 自己也不列进自己的名单。
++        assert_eq!(relay.peers(&authed("a", a_token)).unwrap(), vec![id("b")]);
++    }
++
++    /// 已有测试的前提：不带 issuers 的中转（`Relay::new`）不验令牌，
++    /// 任何字符串都当成合法凭据。
++    #[tokio::test]
++    async fn relay_new_without_issuers_still_accepts_anything() {
++        let relay = Arc::new(Relay::new(cfg(200)));
++        assert_eq!(relay.poll(&auth("b")).await, Ok(None));
++        assert!(relay.send(&letter("a", "b", b"x")).is_ok());
++    }
++
++    #[test]
++    fn public_bind_needs_relay_keys() {
++        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
++
++        // `--with-link` 不带 `--relay-keys`：解析没问题，但绑公网地址该被拒。
++        let cli = parse_cli(&a("0.0.0.0:8787 --with-link")).unwrap();
++        let Cli::Serve { relay_keys, .. } = &cli else {
++            panic!("{cli:?}")
++        };
++        assert!(relay_keys.is_none());
++        assert!(bind_check("0.0.0.0:8787".parse().unwrap(), relay_keys.as_deref()).is_err());
++
++        // 带了 `--relay-keys`：同一个地址该被放行。
++        let cli = parse_cli(&a("0.0.0.0:8787 --with-link --relay-keys /k.txt")).unwrap();
++        let Cli::Serve { relay_keys, .. } = &cli else {
++            panic!("{cli:?}")
++        };
++        assert_eq!(relay_keys.as_deref(), Some(std::path::Path::new("/k.txt")));
++        assert!(bind_check("0.0.0.0:8787".parse().unwrap(), relay_keys.as_deref()).is_ok());
++
++        // 环回地址不管带不带 `--relay-keys` 都该放行。
++        assert!(bind_check("127.0.0.1:8787".parse().unwrap(), None).is_ok());
++    }
++
++    /// **中转不认识 mesh 的信封格式，只认识 `relay_token`。** `dct-mesh` 的
++    /// `wire` 模块是设备之间点对点消息的线上形状，`seal` 模块的 `open` 是
++    /// 解密——两样中转都不该碰：它只转发不透明字节，见文件头 spec 决定一。
++    ///
++    /// 把禁词拆成两半拼，是因为这条测试本身也在 `crates/dct-srv/src` 里，
++    /// 会被自己扫到；原样写在这儿会让测试红得毫无意义（跟
++    /// `the_relay_never_looks_inside_a_frame_either` 同一个理由）。
++    #[test]
++    fn dct_srv_never_opens_mesh_payloads() {
++        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
++            for entry in std::fs::read_dir(dir).unwrap() {
++                let path = entry.unwrap().path();
++                if path.is_dir() {
++                    rs_files(&path, out);
++                } else if path.extension().is_some_and(|e| e == "rs") {
++                    out.push(path);
++                }
++            }
++        }
++
++        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
++        let mut files = Vec::new();
++        rs_files(&src_dir, &mut files);
++        assert!(!files.is_empty(), "扫描目录是空的，这条测试没有意义");
++
++        let banned = [concat!("dct_mesh", "::wire"), concat!("seal", "::open")];
++        for path in files {
++            let src = std::fs::read_to_string(&path).unwrap();
++            for name in banned {
++                assert!(
++                    !src.contains(name),
++                    "{name} 出现在 {}——中转开始认识 mesh 的 payload 了",
++                    path.display()
++                );
++            }
++        }
++    }
++
+     // ——— 接口这一层 ———
+ 
+     async fn post(app: Router, path: &str, body: &str) -> (StatusCode, String) {
+         let res = app
+             .oneshot(
+                 Request::builder()
+                     .method("POST")
+                     .uri(path)
+                     .header("content-type", "application/json")
+                     .body(Body::from(body.to_string()))
+@@ -1927,38 +2259,81 @@ mod tests {
+         ];
+         for name in banned {
+             assert!(
+                 !src.contains(name),
+                 "{name} 出现在中转里——它开始认识 dct 的协议了"
+             );
+         }
+     }
+ 
+     #[test]
+-    fn the_command_line_is_parsed_into_one_of_five_shapes() {
++    fn the_command_line_is_parsed_into_one_of_seven_shapes() {
+         let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+         assert_eq!(
+             parse_cli(&a("")).unwrap(),
+             Cli::Serve {
+                 addr: "127.0.0.1:8787".into(),
+                 with_link: false,
+-                publish_keys: None
++                publish_keys: None,
++                relay_keys: None,
+             }
+         );
+         assert_eq!(
+             parse_cli(&a("127.0.0.1:9000 --with-link --publish-keys /k.json")).unwrap(),
+             Cli::Serve {
+                 addr: "127.0.0.1:9000".into(),
+                 with_link: true,
+-                publish_keys: Some("/k.json".into())
++                publish_keys: Some("/k.json".into()),
++                relay_keys: None,
++            }
++        );
++        assert_eq!(
++            parse_cli(&a(
++                "127.0.0.1:9000 --with-link --relay-keys /r.txt --publish-keys /k.json"
++            ))
++            .unwrap(),
++            Cli::Serve {
++                addr: "127.0.0.1:9000".into(),
++                with_link: true,
++                publish_keys: Some("/k.json".into()),
++                relay_keys: Some("/r.txt".into()),
++            }
++        );
++        assert_eq!(
++            parse_cli(&a("token keygen --out /keys")).unwrap(),
++            Cli::TokenKeygen {
++                out: "/keys".into()
+             }
+         );
++        assert_eq!(
++            parse_cli(&a(
++                "token mint --key /k.key --account acct --endpoint c-abc --ttl 3600"
++            ))
++            .unwrap(),
++            Cli::TokenMint {
++                key: "/k.key".into(),
++                account: "acct".into(),
++                endpoint: "c-abc".into(),
++                ttl: 3600,
++            }
++        );
++        assert!(
++            parse_cli(&a("token keygen")).is_err(),
++            "token keygen 必须写明 --out"
++        );
++        assert!(
++            parse_cli(&a(
++                "token mint --key /k.key --account acct --endpoint c-abc"
++            ))
++            .is_err(),
++            "token mint 必须写明 --ttl"
++        );
+         assert_eq!(
+             parse_cli(&a("key add 姜老师 --file /k.json")).unwrap(),
+             Cli::KeyAdd {
+                 name: "姜老师".into(),
+                 file: "/k.json".into()
+             }
+         );
+         assert_eq!(
+             parse_cli(&a("key revoke a --file /k.json")).unwrap(),
+             Cli::KeyRevoke {
+diff --git a/crates/dct-srv/src/main.rs b/crates/dct-srv/src/main.rs
+index 7ca2e9e..9f3f4cb 100644
+--- a/crates/dct-srv/src/main.rs
++++ b/crates/dct-srv/src/main.rs
+@@ -1,19 +1,20 @@
+ //! 起中转。
+ //!
+-//! **第一期只监听环回地址，而且是硬性的。** 计划里那句「srv 只监听内网地址」
+-//! 是任务 7 的验收条件，但把它推迟到任务 7 才写是在赌中间这几天没人手滑：
+-//! 现在 `token` 根本没人验（任务 5 才接 dc_classroom），这个服务对公网开口
+-//! 的那一刻，任何人都能冒充任何一台设备收发信封。加密也还没有（第二期）。
++//! **第一期只监听环回地址，除非带了 `--relay-keys`。** 计划里那句「srv 只监听
++//! 内网地址」是任务 7 的验收条件，但把它推迟到任务 7 才写是在赌中间这几天
++//! 没人手滑：`token` 现在只有配了 issuer 公钥（`--relay-keys`）才会验
++//! （见 `Relay::with_issuers`），加密也还没有（第二期）。没有 `--relay-keys`
++//! 的中转对公网开口的那一刻，任何人都能冒充任何一台设备收发信封。
+ //!
+-//! 所以拒绝绑非环回地址的判断写在这里，不写在文档里。等任务 5 和第二期落地，
+-//! 再把它换成一个明确的、要人动手打开的开关。
++//! 所以「这个地址能不能绑」写成代码而不是文档里的一句话，并且写在库里而
++//! 不是这儿——`main` 没法测（`dct_srv::bind_check`）。
+ 
+ use std::sync::Arc;
+ 
+ use dct_srv::{Config, Live, Relay, Routes};
+ 
+ #[tokio::main]
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let args: Vec<String> = std::env::args().skip(1).collect();
+     let cli = dct_srv::parse_cli(&args)?;
+     let now = || {
+@@ -22,21 +23,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+             .map(|d| d.as_secs())
+             .unwrap_or(0)
+     };
+     let load_or_new = |file: &std::path::Path| {
+         if file.exists() {
+             dct_srv::keys::PublishKeys::load(file)
+         } else {
+             Ok(dct_srv::keys::PublishKeys::default())
+         }
+     };
+-    let (addr, routes, publish_keys) = match cli {
++    let (addr, routes, publish_keys, relay_keys) = match cli {
+         dct_srv::Cli::KeyAdd { name, file } => {
+             let mut k = load_or_new(&file)?;
+             let key = k.add(&name, now())?;
+             k.save(&file)?;
+             println!("{key}");
+             eprintln!("这把密钥只显示这一次。文件里只存了它的摘要。");
+             return Ok(());
+         }
+         dct_srv::Cli::KeyRevoke { name, file } => {
+             let mut k = dct_srv::keys::PublishKeys::load(&file)?;
+@@ -53,59 +54,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+             }
+             return Ok(());
+         }
+         dct_srv::Cli::Takedown { id, file } => {
+             let mut k = load_or_new(&file)?;
+             k.block(&id);
+             k.save(&file)?;
+             eprintln!("已下线「{id}」。运行中的中转最多 10 秒后生效。");
+             return Ok(());
+         }
++        dct_srv::Cli::TokenKeygen { out } => {
++            std::fs::create_dir_all(&out)?;
++            let (seed, pub_key) = dct_srv::issuer::generate();
++            dct_srv::issuer::write_issuer_files(&out, &seed, &pub_key)?;
++            eprintln!(
++                "写好了 {}/issuer.key（私钥，只在这台机器上留一份）和 {}/issuer.pub（公钥，\
++                 中转拿 --relay-keys 指过去）。这两个文件只给开发和本机端到端测试用——\
++                 正式令牌由网关签。",
++                out.display(),
++                out.display()
++            );
++            return Ok(());
++        }
++        dct_srv::Cli::TokenMint {
++            key,
++            account,
++            endpoint,
++            ttl,
++        } => {
++            let raw = std::fs::read_to_string(&key)
++                .map_err(|e| format!("读不了 {}：{e}", key.display()))?;
++            let signing_key = dct_srv::issuer::signing_key_from_seed_b64(&raw)?;
++            let token = dct_srv::issuer::mint(&signing_key, &account, &endpoint, ttl, now());
++            println!("{token}");
++            return Ok(());
++        }
+         dct_srv::Cli::Serve {
+             addr,
+             with_link,
+             publish_keys,
++            relay_keys,
+         } => (
+             addr,
+             if with_link {
+                 Routes::WithLink
+             } else {
+                 Routes::LiveOnly
+             },
+             publish_keys,
++            relay_keys,
+         ),
+     };
+     // 首次打开就坏的密钥文件：拒绝启动，而不是悄悄当成「没开公开功能」。
+     let publish_keys_path = publish_keys.clone();
+     let publish_keys = publish_keys.map(dct_srv::keys::KeyFile::open).transpose()?;
+ 
++    // 同理：relay-keys 文件读不出来就拒绝启动，不能悄悄当成「不验令牌」——
++    // 那样一份写坏的文件会把中转的鉴权静默关掉。
++    let relay = match &relay_keys {
++        Some(path) => {
++            let issuers = dct_srv::keys::load_relay_keys(path)?;
++            Arc::new(Relay::with_issuers(Config::default(), issuers))
++        }
++        None => Arc::new(Relay::new(Config::default())),
++    };
++
+     let listener = tokio::net::TcpListener::bind(&addr).await?;
+     let local = listener.local_addr()?;
+-    if let Err(why) = dct_srv::must_be_loopback(local) {
++    if let Err(why) = dct_srv::bind_check(local, relay_keys.as_deref()) {
+         // 已经绑上了才发现——那就关掉。宁可启动失败，也不要一个没鉴权的
+         // 中转在公网上多活一秒。
+         drop(listener);
+         return Err(why.into());
+     }
+ 
+     println!(
+-        "dct-srv 在 http://{local} 上，只收本机的连接{}{}",
++        "dct-srv 在 http://{local} 上{}{}{}",
++        if relay_keys.is_some() {
++            "，只收带着有效令牌的连接"
++        } else {
++            "，只收本机的连接"
++        },
+         if routes == Routes::WithLink {
+-            "（已打开没有鉴权的 /link/*，只许本机开发用）"
++            match &relay_keys {
++                Some(_) => "（已打开 /link/*）",
++                None => "（已打开没有鉴权的 /link/*，只许本机开发用）",
++            }
+         } else {
+             ""
+         },
+         match &publish_keys_path {
+             Some(p) => format!("；已开启公开直播（密钥文件：{}）", p.display()),
+             None => String::new(),
+         }
+     );
+-    dct_srv::serve(
+-        listener,
+-        Arc::new(Relay::new(Config::default())),
+-        Arc::new(Live::new()),
+-        routes,
+-        publish_keys,
+-    )
+-    .await?;
++    dct_srv::serve(listener, relay, Arc::new(Live::new()), routes, publish_keys).await?;
+     Ok(())
+ }

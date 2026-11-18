@@ -620,6 +620,7 @@ pub(crate) mod tests {
             activity: String::new(),
             is_agent: true,
             tag: String::new(),
+            last_active_ms: 0,
         }]);
         app.client = Some(crate::client::Client::connect(&app.socket).unwrap());
         app.view = View::Attached(1);

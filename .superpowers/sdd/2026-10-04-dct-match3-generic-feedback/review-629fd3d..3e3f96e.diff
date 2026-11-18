@@ -1,0 +1,914 @@
+# Review package: 629fd3d..HEAD
+
+## Commits
+3e3f96e feat(game): stall detection watches the goal number named by --goal-number instead of any number
+
+## Files changed
+ crates/dct-game/src/navigate.rs   |  10 +--
+ crates/dct-game/src/play.rs       |  35 ++++++----
+ crates/dct-game/src/play_tests.rs | 139 ++++++++++++++++++++++++++------------
+ src/game/cli.rs                   |  26 +++++--
+ src/game/skill.md                 |   2 +
+ src/main.rs                       |   2 +-
+ 6 files changed, 147 insertions(+), 67 deletions(-)
+
+## Diff
+diff --git a/crates/dct-game/src/navigate.rs b/crates/dct-game/src/navigate.rs
+index 79f37d5..5c10864 100644
+--- a/crates/dct-game/src/navigate.rs
++++ b/crates/dct-game/src/navigate.rs
+@@ -10,20 +10,22 @@ use serde_json::{json, Value};
+ pub struct NavOptions<'a> {
+     /// 整个命令一共最多走几步棋（不是每一局）。
+     pub max_steps: usize,
+     /// 整个命令最多点几次“开始 / 再来一次”；点一次「开始」或「再来一次」算一次；点了「再来一次」之后紧跟着的那个 Play 是同一次重来，不另算。
+     pub tries: usize,
+     pub dry_run: bool,
+     pub advisor: Option<&'a dyn Advisor>,
+     pub ask_always: bool,
+     pub ask_budget: usize,
+     pub goal: &'a str,
++    /// 目标数字是屏幕上第几个数字（从 0 数）；`None` = 不知道，不判断停滞。
++    pub goal_index: Option<usize>,
+ }
+ 
+ const AFTER_TAP_FIRST_MS: u64 = 400;
+ const POLL_MS: u64 = 300;
+ const CHANGE_GIVE_UP_MS: u64 = 8_000;
+ /// 整个命令里点按钮的总次数上限：防止两个弹窗互相弹来弹去停不下来。
+ const MAX_TAPS: usize = 40;
+ 
+ fn texts(seen: &Seen) -> Vec<String> {
+     seen.elements.iter().map(|e| e.text.clone()).collect()
+@@ -146,21 +148,21 @@ pub fn auto_next(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &NavO
+                     Some(g) => Ok(g),
+                     None => dco.read_grid(p),
+                 };
+                 match grid {
+                     Ok(g) if looks_like_board(&g) => {
+                         let remaining = o.max_steps.saturating_sub(steps);
+                         // 这个画面的字是以后“像棋盘”判断的证据。
+                         sink(nav_record(clock, &seen, "board", None, "entered"));
+                         expect_board = false;
+                         // after_board 不用在这里清：play 返回后要么 break，要么马上重新置 true，中间没人读它。
+-                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal }, sink);
++                        let s = play(dco, clock, p, &Options { max_steps: remaining, dry_run: o.dry_run, advisor: o.advisor, ask_always: o.ask_always, ask_budget: o.ask_budget, goal: o.goal, goal_index: o.goal_index }, sink);
+                         steps += s.steps;
+                         match s.stop {
+                             // 画面变了（结算页、弹窗）：回到上面重新看是什么。
+                             Stop::NoGrid(_) | Stop::ClassesChanged { .. } => {
+                                 // 一步都没走：这个画面从来不是我们玩过的棋盘，停，免得原地打转。
+                                 if s.steps == 0 {
+                                     sink(nav_record(clock, &seen, "unknown", None, "stopped"));
+                                     break Stop::UnknownScreen(texts(&seen));
+                                 }
+                                 // 步数刚好在一局结束时用完：看一眼是什么画面再停，什么都不点。
+@@ -364,21 +366,21 @@ mod tests {
+     fn profile() -> Profile {
+         Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows: 3, cols: 4, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: crate::choose::Weights::default(), level_pattern: None }
+     }
+ 
+     fn run(w: &mut World, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
+         run_with(w, 50, tries, dry)
+     }
+ 
+     fn run_with(w: &mut World, max_steps: usize, tries: usize, dry: bool) -> (Summary, Vec<Value>) {
+         let mut log = vec![];
+-        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++        let s = auto_next(w, &mut Clk(0), &profile(), &NavOptions { max_steps, tries, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+         (s, log)
+     }
+ 
+     fn assert_stopped_with_texts(log: &[Value]) {
+         let last = log.iter().rfind(|r| r["kind"] == "nav").unwrap();
+         assert_eq!(last["outcome"], "stopped");
+         assert!(!last["texts"].as_array().unwrap().is_empty());
+     }
+ 
+     fn text(t: &[&'static str]) -> Frame {
+@@ -512,21 +514,21 @@ mod tests {
+         let mut w = World::new(vec![text(&["Play"]), board(DEAD)]);
+         w.tap_error = Some(DcoError { code: "needs_ticket".into(), message: "x".into() });
+         let (s, _) = run(&mut w, 5, false);
+         assert_eq!(s.stop, Stop::Dco(DcoError { code: "needs_ticket".into(), message: "x".into() }));
+     }
+ 
+     #[test]
+     fn the_step_budget_is_shared_across_levels() {
+         let mut w = World::new(vec![board(A), board(A)]);
+         let mut log = vec![];
+-        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++        let s = auto_next(&mut w, &mut Clk(0), &profile(), &NavOptions { max_steps: 1, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+         assert_eq!(s.steps, 1);
+         assert_eq!(s.stop, Stop::StepsDone);
+     }
+ 
+     #[test]
+     fn dismissals_do_not_use_up_the_retry_budget() {
+         let mut w = World::new(vec![text(&["Not now"]), text(&["Got it"]), text(&["Daily Stamps", "Play"]), board(DEAD)]);
+         let (s, _) = run(&mut w, 1, false);
+         assert_eq!(s.stop, Stop::NoMoves);
+         assert_eq!(w.taps, ["Not now", "Got it", "Play"]);
+@@ -696,21 +698,21 @@ mod tests {
+ 
+     // ---- 画面上的关卡号标签 + 合格棋盘 = 棋盘（不过 OCR 分类） ----
+ 
+     const HUD: &[&str] = &["10", "1714/♥4", "39", "￥124"];
+ 
+     fn labelled() -> Profile {
+         Profile { level_pattern: Some(r"(\d{3,5})\s*/".into()), ..profile() }
+     }
+ 
+     fn run_profile(w: &mut World, p: &Profile) -> Summary {
+-        auto_next(w, &mut Clk(0), p, &NavOptions { max_steps: 50, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {})
++        auto_next(w, &mut Clk(0), p, &NavOptions { max_steps: 50, tries: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {})
+     }
+ 
+     #[test]
+     fn a_hud_with_the_level_label_and_a_valid_board_is_played_even_if_an_icon_reads_as_a_price() {
+         let mut w = World::new(vec![Frame::TextGrid(HUD.to_vec(), grid(A)), board(DEAD)]);
+         let s = run_profile(&mut w, &labelled());
+         assert_eq!(s.stop, Stop::NoMoves);
+         assert_eq!(w.swipes, 1);
+         assert!(w.taps.is_empty());
+     }
+diff --git a/crates/dct-game/src/play.rs b/crates/dct-game/src/play.rs
+index 36296ee..28fb009 100644
+--- a/crates/dct-game/src/play.rs
++++ b/crates/dct-game/src/play.rs
+@@ -53,23 +53,26 @@ pub(crate) fn numbers(seen: &Seen) -> Vec<u64> {
+                 return None;
+             }
+             t.parse::<u64>().ok()
+         })
+         .collect()
+ }
+ 
+ /// 连着这么多步目标数字都没下降，就算停滞。
+ pub const STALL_STEPS: usize = 6;
+ 
+-/// 个数相同、且至少有一个数变小才算「下降」。个数不同（OCR 漏读了一个）一律不算，也不算「没下降」。
+-pub(crate) fn decreased(before: &[u64], after: &[u64]) -> bool {
+-    before.len() == after.len() && before.iter().zip(after).any(|(b, a)| a < b)
++/// 目标那个数字下降了才算「下降」。两张清单个数不同（OCR 漏读了一个）、或者序号越界，都算「不知道」，返回 `None`。
++pub(crate) fn goal_dropped(before: &[u64], after: &[u64], goal: usize) -> Option<bool> {
++    if before.len() != after.len() || goal >= before.len() {
++        return None;
++    }
++    Some(after[goal] < before[goal])
+ }
+ 
+ fn read_numbers(dco: &mut dyn Dco, p: &Profile) -> Option<Vec<u64>> {
+     dco.see_text(p).ok().map(|s| numbers(&s))
+ }
+ 
+ pub trait Dco {
+     fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError>;
+     /// 坐标是窗口比例（0～1）。
+     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError>;
+@@ -99,20 +102,22 @@ pub const MAX_REFUSED_IN_A_ROW: usize = 5;
+ pub struct Options<'a> {
+     pub max_steps: usize,
+     pub dry_run: bool,
+     /// 规则没把握时问的那个。`None` = 不问（和以前一样）。
+     pub advisor: Option<&'a dyn Advisor>,
+     /// 每一步都问（`--ask-every-step`）；否则只在这盘棋上已有失败的步时才问。
+     pub ask_always: bool,
+     /// 这一次 `play()` 最多问几次。
+     pub ask_budget: usize,
+     pub goal: &'a str,
++    /// 目标数字是屏幕上第几个数字（从 0 数）；`None` = 不知道，不判断停滞。
++    pub goal_index: Option<usize>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum Stop {
+     /// 读不出棋盘（含：类别太多，多半是弹了窗）。
+     NoGrid(String),
+     /// 类别比开始时多出两个以上：多半这关结束了、弹了窗。
+     ClassesChanged { was: usize, now: usize },
+     NoMoves,
+     /// 连着两次划了没反应。
+@@ -433,63 +438,69 @@ pub fn play(dco: &mut dyn Dco, clock: &mut dyn Clock, p: &Profile, o: &Options<'
+         let t_settle = clock.now_ms();
+         let result = settle(dco, clock, p, &g);
+         rec["timing_ms"] = json!({ "read": read_ms, "choose": choose_ms, "swipe": swipe_ms, "settle": clock.now_ms().saturating_sub(t_settle) });
+         match result {
+             // 游戏动了一下又弹回原样（被笼子、锁住的糖），棋盘和划之前一样：算没反应：同一盘棋上不再重复选这一步。
+             Settle::Settled(next) if same(&next, &g) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(next.observation_id);
+                 let progress_after = read_numbers(dco, p);
+-                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
+-                    if b.len() == a.len() {
+-                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
++                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
++                    match goal_dropped(b, a, gi) {
++                        Some(true) => no_progress = 0,
++                        Some(false) => no_progress += 1,
++                        None => {}
+                     }
+                 }
+                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                 progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+                 locked.push(chosen.mv.a);
+                 locked.push(chosen.mv.b);
+                 if streak >= MAX_REFUSED_IN_A_ROW {
+                     break Stop::Stuck;
+                 }
+                 current = Some(next);
+             }
+             Settle::Settled(next) => {
+                 rec["outcome"] = json!("moved");
+                 rec["observed_changed"] = json!(changed_cells(&g, &next));
+                 rec["after_observation_id"] = json!(next.observation_id);
+                 let progress_after = read_numbers(dco, p);
+-                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
+-                    if b.len() == a.len() {
+-                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
++                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
++                    match goal_dropped(b, a, gi) {
++                        Some(true) => no_progress = 0,
++                        Some(false) => no_progress += 1,
++                        None => {}
+                     }
+                 }
+                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                 progress_prev = progress_after;
+                 sink(rec);
+                 streak = 0;
+                 failed.clear();
+                 locked.clear();
+                 current = Some(next);
+             }
+             Settle::NoChange(same_board) => {
+                 rec["outcome"] = json!("no_change");
+                 rec["observed_changed"] = json!(0);
+                 rec["after_observation_id"] = json!(same_board.observation_id);
+                 let progress_after = read_numbers(dco, p);
+-                if let (Some(b), Some(a)) = (&progress_prev, &progress_after) {
+-                    if b.len() == a.len() {
+-                        no_progress = if decreased(b, a) { 0 } else { no_progress + 1 };
++                if let (Some(gi), Some(b), Some(a)) = (o.goal_index, &progress_prev, &progress_after) {
++                    match goal_dropped(b, a, gi) {
++                        Some(true) => no_progress = 0,
++                        Some(false) => no_progress += 1,
++                        None => {}
+                     }
+                 }
+                 rec["progress"] = json!({ "before": progress_prev, "after": progress_after });
+                 progress_prev = progress_after;
+                 sink(rec);
+                 streak += 1;
+                 failed.push((chosen.mv, canonical(&g.cells)));
+                 locked.push(chosen.mv.a);
+                 locked.push(chosen.mv.b);
+                 if streak >= MAX_REFUSED_IN_A_ROW {
+diff --git a/crates/dct-game/src/play_tests.rs b/crates/dct-game/src/play_tests.rs
+index 48fde10..b17d67f 100644
+--- a/crates/dct-game/src/play_tests.rs
++++ b/crates/dct-game/src/play_tests.rs
+@@ -73,21 +73,21 @@ impl Clock for Clk {
+ }
+ /// 这些测试里的选步细节（哪一步排第一）是按 Candy Crush 的那套权重写的，所以用它，不用通用默认。
+ fn tuned() -> crate::choose::Weights {
+     crate::choose::Weights { striped: 6.0, wrapped: 8.0, bomb: 15.0, triggered: 5.0, ..Default::default() }
+ }
+ fn profile(rows: usize, cols: usize) -> Profile {
+     Profile { window: json!({"app": "x"}), region: [0.2, 0.3, 0.5, 0.4], rows, cols, extra: json!({}), fixed_rgb: vec![], match_de: 24.0, weights: tuned(), level_pattern: None }
+ }
+ fn run(d: &mut Fake, max: usize, dry: bool) -> (Summary, Vec<Value>) {
+     let mut log = vec![];
+-    let s = play(d, &mut Clk(0), &profile(3, 4), &Options { max_steps: max, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let s = play(d, &mut Clk(0), &profile(3, 4), &Options { max_steps: max, dry_run: dry, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     (s, log)
+ }
+ fn err(code: &str) -> DcoError {
+     DcoError { code: code.into(), message: format!("m-{code}") }
+ }
+ 
+ // 每个类别至少出现两次：只有一格的类别按设计算「认不出」，不能换。
+ const A: &[&[u16]] = &[&[1, 1, 2, 1], &[2, 3, 1, 3], &[3, 2, 3, 2]]; // 能走：(0,2) 和 (1,2) 对换，第 0 行四连
+ const DEAD: &[&[u16]] = &[&[1, 2, 3, 1], &[3, 1, 2, 3], &[2, 3, 1, 2]]; // 没有任何能走的步（每类都不止一格）
+ const MOVED: &[&[u16]] = DEAD;
+@@ -194,24 +194,24 @@ fn a_clock_that_goes_backwards_does_not_panic() {
+         fn now_ms(&self) -> u64 {
+             self.0.set(self.0.get() + 1);
+             if self.0.get().is_multiple_of(2) { self.1 } else { self.1 + 1_000_000 }
+         }
+         fn sleep_ms(&mut self, ms: u64) {
+             self.1 += ms;
+         }
+     }
+     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]);
+     let mut log = vec![];
+-    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     // 读盘到落定都过了一轮，没有 panic 就行；用一个会倒着走的钟再跑一遍无法落定的情形
+     let mut d = Fake::new(vec![Ok(grid(A))]);
+-    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++    let _ = play(&mut d, &mut Back(Default::default(), 0), &profile(3, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+ }
+ 
+ #[test]
+ fn candidate_features_are_nested_under_features() {
+     let mut d = Fake::new(vec![Ok(grid(A))]);
+     let (_, log) = run(&mut d, 10, true);
+     let c = &log[0]["candidates"][0];
+     for k in ["a", "b", "score", "features"] {
+         assert!(c.get(k).is_some(), "缺 {k}");
+     }
+@@ -485,21 +485,21 @@ fn grid_with_hole_rgb() -> GridRead {
+ type Swipe = ((f64, f64), (f64, f64));
+ fn swipe_cells(p: &Profile, s: &[Swipe]) -> Vec<(usize, usize)> {
+     let [x, y, w, h] = p.region;
+     let cell = |(px, py): (f64, f64)| (((py - y) / h * p.rows as f64).floor() as usize, ((px - x) / w * p.cols as f64).floor() as usize);
+     s.iter().flat_map(|&(f, t)| [cell(f), cell(t)]).collect()
+ }
+ 
+ fn play_holes(fixed_rgb: Vec<[u8; 3]>) -> (Profile, Vec<Swipe>) {
+     let p = Profile { fixed_rgb, ..profile(4, 4) };
+     let mut d = Fake::new(vec![Ok(grid_with_hole_rgb())]);
+-    play(&mut d, &mut Clk(0), &p, &Options { max_steps: 10, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++    play(&mut d, &mut Clk(0), &p, &Options { max_steps: 10, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+     (p, d.swipes)
+ }
+ 
+ #[test]
+ fn swipes_never_touch_a_cell_whose_colour_is_listed_as_fixed() {
+     let (p, swipes) = play_holes(vec![HOLE]);
+     assert!(!swipes.is_empty(), "除了洞还有别的走法，该划");
+     let fixed = [(0, 2), (3, 0), (3, 3)];
+     assert!(swipe_cells(&p, &swipes).iter().all(|c| !fixed.contains(c)), "{swipes:?}");
+ }
+@@ -515,21 +515,21 @@ fn without_the_fixed_list_the_same_grid_swipes_a_hole() {
+ 
+ fn r4(v: f64) -> f64 {
+     (v * 10000.0).round() / 10000.0
+ }
+ 
+ #[test]
+ fn the_record_carries_the_real_swipe_points_start_and_duration() {
+     let p = profile(3, 4);
+     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED))]);
+     let mut log = vec![];
+-    play(&mut d, &mut Clk(1000), &p, &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    play(&mut d, &mut Clk(1000), &p, &Options { max_steps: 1, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     let (f, t) = d.swipes[0];
+     let sw = &log[0]["swipe"];
+     assert_eq!(sw["from"], json!([r4(f.0), r4(f.1)]));
+     assert_eq!(sw["to"], json!([r4(t.0), r4(t.1)]));
+     // 端点就是选中那步两格的中心
+     let c = &log[0]["candidates"][log[0]["chosen"].as_u64().unwrap() as usize];
+     let (a, b) = (c["a"].as_array().unwrap(), c["b"].as_array().unwrap());
+     let [x, y, w, h] = p.region;
+     let ctr = |r: u64, c: u64| json!([r4(x + (c as f64 + 0.5) / 4.0 * w), r4(y + (r as f64 + 0.5) / 3.0 * h)]);
+     assert_eq!(sw["from"], ctr(a[0].as_u64().unwrap(), a[1].as_u64().unwrap()));
+@@ -591,21 +591,21 @@ fn a_changed_odd_flag_alone_is_not_a_changed_board() {
+ }
+ 
+ /// 2026-10-03 真机第 1714 关的顶行：蛋 蓝 红 蓝 蓝 绿 橙 绿 蛋。红和橙全盘各只有一个，
+ /// 唯一的走法是红和左边的蓝对换凑三蓝。配置列了「不是糖」的颜色就该走；没列就是旧规则，一格的类别不能换。
+ #[test]
+ fn a_one_cell_candy_may_move_once_the_profile_lists_the_not_candies() {
+     const ROW: &[&[u16]] = &[&[0, 1, 2, 1, 1, 3, 4, 3, 0]];
+     let go = |fixed_rgb: Vec<[u8; 3]>| {
+         let mut d = Fake::new(vec![Ok(grid(ROW))]);
+         let p = Profile { fixed_rgb, ..profile(1, 9) };
+-        let s = play(&mut d, &mut Clk(0), &p, &Options { max_steps: 1, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++        let s = play(&mut d, &mut Clk(0), &p, &Options { max_steps: 1, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+         s.stop
+     };
+     assert_ne!(go(vec![[196, 148, 101]]), Stop::NoMoves);
+     assert_eq!(go(vec![]), Stop::NoMoves);
+ }
+ 
+ // ---- “没步可走”和“画面变了”要停一下再读一遍才算数 ----
+ 
+ const DEAD2: &[&[u16]] = &[&[3, 3, 2, 2], &[2, 1, 1, 2], &[3, 1, 1, 3]]; // 另一种分组，同样没步可走
+ 
+@@ -616,21 +616,21 @@ fn no_moves_that_a_refill_fixes_is_not_the_end() {
+     let (s, log) = run(&mut d, 1, false);
+     assert_eq!(s.stop, Stop::StepsDone);
+     assert_eq!(d.swipes.len(), 1);
+     assert_eq!(log.len(), 1, "确认读不算一步，不写步骤记录");
+ }
+ 
+ #[test]
+ fn no_moves_confirmed_by_an_identical_second_read_stops_after_one_confirmation() {
+     let mut d = Fake::new(vec![Ok(grid(DEAD))]);
+     let mut clk = Clk(0);
+-    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+     assert_eq!(s.stop, Stop::NoMoves);
+     assert_eq!(d.reads_taken, 2);
+     assert_eq!(clk.0, 1_500);
+ }
+ 
+ #[test]
+ fn a_board_that_keeps_changing_without_a_move_stops_after_two_confirmations() {
+     let mut reads = vec![];
+     for i in 0..50 {
+         reads.push(Ok(grid(if i % 2 == 0 { DEAD } else { DEAD2 })));
+@@ -655,21 +655,21 @@ fn a_colour_jump_that_stays_on_the_reread_is_a_changed_screen() {
+     let five: &[&[u16]] = &[&[1, 4, 2, 5], &[2, 3, 1, 3], &[4, 5, 3, 1]];
+     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(five)), Ok(grid(five))]);
+     let (s, _) = run(&mut d, 10, false);
+     assert!(matches!(s.stop, Stop::ClassesChanged { was: 3, now: 5 }), "{:?}", s.stop);
+ }
+ 
+ #[test]
+ fn a_dry_run_does_not_pause_or_reread() {
+     let mut d = Fake::new(vec![Ok(grid(DEAD))]);
+     let mut clk = Clk(0);
+-    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |_| {});
++    let s = play(&mut d, &mut clk, &profile(3, 4), &Options { max_steps: 5, dry_run: true, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |_| {});
+     assert_eq!(s.stop, Stop::NoMoves);
+     assert_eq!(d.reads_taken, 1);
+     assert_eq!(clk.0, 0);
+ }
+ 
+ #[test]
+ fn a_swap_the_game_bounces_back_is_no_change() {
+     // 被笼子锁住的糖：划下去先动一下（读到 MOVED），又弹回 A 并落定。落定后和划之前一样，算没反应，连着两次就停。
+     let mut reads = vec![Ok(grid(A)), Ok(grid(MOVED))];
+     for _ in 0..400 {
+@@ -718,22 +718,25 @@ impl Advisor for Gone {
+     }
+ }
+ struct Down;
+ impl Advisor for Down {
+     fn pick(&self, _: &AskInput) -> Option<Advice> {
+         None
+     }
+ }
+ 
+ fn run_ask(d: &mut Fake, adv: Option<&dyn Advisor>, always: bool, budget: usize, steps: usize) -> (Summary, Vec<Value>) {
++    run_ask_goal(d, adv, always, budget, steps, None)
++}
++fn run_ask_goal(d: &mut Fake, adv: Option<&dyn Advisor>, always: bool, budget: usize, steps: usize, gi: Option<usize>) -> (Summary, Vec<Value>) {
+     let mut log = vec![];
+-    let o = Options { max_steps: steps, dry_run: false, advisor: adv, ask_always: always, ask_budget: budget, goal: "清冰" };
++    let o = Options { max_steps: steps, dry_run: false, advisor: adv, ask_always: always, ask_budget: budget, goal: "清冰", goal_index: gi };
+     let s = play(d, &mut Clk(0), &profile(3, 4), &o, &mut |v| log.push(v));
+     (s, log)
+ }
+ fn settled_script() -> Vec<Result<GridRead, DcoError>> {
+     vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED))]
+ }
+ 
+ #[test]
+ fn ask_always_lets_the_model_pick_among_candidates_and_records_it() {
+     // 先看规则自己会划哪一步
+@@ -774,21 +777,21 @@ fn a_failed_swap_triggers_the_model_and_is_listed_but_not_offered() {
+     let mut reads = vec![];
+     for _ in 0..40 {
+         reads.push(Ok(grid(MANY)));
+     }
+     let moved: &[&[u16]] = &[&[1, 1, 1, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3]];
+     reads.push(Ok(grid(moved)));
+     reads.push(Ok(grid(moved)));
+     let say = Say::new(Some(0));
+     let mut d = Fake::new(reads);
+     let mut log = vec![];
+-    let o = Options { max_steps: 2, dry_run: false, advisor: Some(&say), ask_always: false, ask_budget: 30, goal: "清冰" };
++    let o = Options { max_steps: 2, dry_run: false, advisor: Some(&say), ask_always: false, ask_budget: 30, goal: "清冰", goal_index: None };
+     let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &o, &mut |v| log.push(v));
+     assert!(say.calls.get() >= 1);
+     let seen = say.seen.borrow();
+     assert_eq!(seen[0].failed.len(), 1);
+     assert!(!seen[0].candidates.iter().any(|c| *c == seen[0].failed[0]));
+     assert_eq!(log[0]["decider"], "rules");
+     assert_eq!(log[1]["decider"], "model");
+     // 模型回的是「候选里的第 1 个」；要靠 offered 映射回 cands，不能直接当 cands 下标，否则又选回刚失败的那步
+     assert_ne!(log[1]["chosen"], log[0]["chosen"]);
+     assert_ne!(log[1]["swipe"]["from"], log[0]["swipe"]["from"]);
+@@ -888,21 +891,21 @@ fn a_choice_outside_the_offered_list_falls_back_to_rules_and_is_recorded() {
+ 
+ #[test]
+ fn after_a_refused_swap_no_later_candidate_touches_its_two_cells() {
+     // 一直读到同一张盘（没变化）：第一步被拒绝以后，第二步选的步不碰第一步的两个格子
+     let mut reads = vec![];
+     for _ in 0..80 {
+         reads.push(Ok(grid(MANY)));
+     }
+     let mut d = Fake::new(reads);
+     let mut log = vec![];
+-    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 5, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     let pos = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
+     assert!(log.len() >= 2, "{log:?}");
+     for i in 1..log.len() {
+         let (ai, bi) = (pos(&log[i], "a"), pos(&log[i], "b"));
+         for j in 0..i {
+             let (aj, bj) = (pos(&log[j], "a"), pos(&log[j], "b"));
+             for p in [&ai, &bi] {
+                 assert!(*p != aj && *p != bj, "第 {i} 步碰了被拒绝的格子（第 {j} 步）：{log:?}");
+             }
+         }
+@@ -920,58 +923,58 @@ const MANY: &[&[u16]] = &[
+ ];
+ 
+ #[test]
+ fn five_refusals_in_a_row_stop_the_run_not_two() {
+     let mut reads = vec![];
+     for _ in 0..400 {
+         reads.push(Ok(grid(MANY)));
+     }
+     let mut d = Fake::new(reads);
+     let mut log = vec![];
+-    let s = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 20, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let s = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 20, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     assert_eq!(s.stop, Stop::Stuck);
+     assert_eq!(d.swipes.len(), 5, "应该试满 5 次才停");
+ }
+ 
+ #[test]
+ fn a_move_that_works_unlocks_the_cells() {
+     // 第一步没反应（锁住它的两格），第二步（别处）成功 → 解除；第三步又可以碰第一步的格子
+     let mut reads = vec![];
+     for _ in 0..40 {
+         reads.push(Ok(grid(MANY)));
+     }
+     // 第二次划：变成另一张盘并落定
+     let moved: &[&[u16]] = &[&[1, 1, 1, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3], &[1, 1, 2, 1], &[3, 3, 4, 3]];
+     reads.push(Ok(grid(moved)));
+     reads.push(Ok(grid(moved)));
+     for _ in 0..400 {
+         reads.push(Ok(grid(MANY)));
+     }
+     let mut d = Fake::new(reads);
+     let mut log = vec![];
+-    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let _ = play(&mut d, &mut Clk(0), &profile(6, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
+     assert_eq!(&outcomes[..2], ["no_change", "moved"], "{outcomes:?}");
+ }
+ 
+ // 4x4：规则第一名之后，排在第一个「完全不碰」的候选前面，既有只和它共用 a 格的，也有只共用 b 格的候选
+ const OVERLAP: &[&[u16]] = &[&[2, 3, 4, 2], &[3, 3, 3, 4], &[3, 4, 3, 3], &[2, 1, 4, 4]];
+ 
+ #[test]
+ fn a_refused_swap_locks_both_of_its_cells_even_when_better_candidates_share_only_one() {
+     let mut reads = vec![];
+     for _ in 0..200 {
+         reads.push(Ok(grid(OVERLAP)));
+     }
+     let mut d = Fake::new(reads);
+     let mut log = vec![];
+-    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 2, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     assert!(log.len() >= 2, "{log:?}");
+     let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
+     let (a0, b0) = (cell(&log[0], "a"), cell(&log[0], "b"));
+     for k in ["a", "b"] {
+         let p = cell(&log[1], k);
+         assert!(p != a0 && p != b0, "第二步碰了被拒绝的格子：{log:?}");
+     }
+ }
+ 
+ #[test]
+@@ -981,21 +984,21 @@ fn a_move_that_works_unlocks_cells_that_the_only_remaining_move_needs() {
+     const TWO: &[&[u16]] = &[&[1, 1, 2, 1], &[3, 4, 3, 4], &[4, 3, 4, 3], &[5, 5, 6, 5]];
+     const AFTER: &[&[u16]] = &[&[1, 2, 1, 2], &[2, 1, 2, 1], &[3, 4, 3, 4], &[5, 5, 6, 5]];
+     let mut reads = vec![];
+     for _ in 0..40 {
+         reads.push(Ok(grid(TWO)));
+     }
+     reads.push(Ok(grid(AFTER)));
+     reads.push(Ok(grid(AFTER)));
+     let mut d = Fake::new(reads);
+     let mut log = vec![];
+-    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "" }, &mut |v| log.push(v));
++    let _ = play(&mut d, &mut Clk(0), &profile(4, 4), &Options { max_steps: 3, dry_run: false, advisor: None, ask_always: false, ask_budget: 0, goal: "", goal_index: None }, &mut |v| log.push(v));
+     let outcomes: Vec<&str> = log.iter().map(|l| l["outcome"].as_str().unwrap()).collect();
+     // 第三步：规则第一名就是那个碰被锁过的格子的步（没解锁的话它会被跳过）
+     let cell = |l: &Value, k: &str| l["candidates"][l["chosen"].as_u64().unwrap() as usize][k].clone();
+     let first_cells = [cell(&log[0], "a"), cell(&log[0], "b")];
+     assert!(outcomes.len() >= 3, "{outcomes:?}");
+     assert!(first_cells.contains(&cell(&log[2], "a")) || first_cells.contains(&cell(&log[2], "b")), "第三步该碰第一步的格子：{log:?}");
+     assert!(outcomes[0] == "no_change" && outcomes[1] == "moved", "{outcomes:?}");
+ }
+ 
+ fn grid_rgb(cells: &[&[u16]], rgbs: &[(u16, [u8; 3])]) -> GridRead {
+@@ -1074,65 +1077,111 @@ fn progress_is_null_when_the_dco_cannot_read_text() {
+ fn the_after_of_one_step_is_the_before_of_the_next() {
+     let mut d = Fake::new(vec![Ok(grid(A)), Ok(grid(MOVED)), Ok(grid(MOVED)), Ok(grid(A)), Ok(grid(A))]);
+     d.texts = vec![vec!["50"], vec!["49"], vec!["48"]].into();
+     let (_, log) = run(&mut d, 2, false);
+     assert!(log.len() >= 2);
+     assert_eq!(log[1]["progress"]["before"], json!([49]));
+     assert_eq!(log[1]["progress"]["after"], json!([48]));
+ }
+ 
+ #[test]
+-fn decreased_needs_same_length_and_a_smaller_number() {
+-    assert!(decreased(&[50, 30], &[49, 30]));
+-    assert!(!decreased(&[50, 30], &[50, 30]));
+-    assert!(!decreased(&[50, 30], &[51, 30]));
+-    assert!(!decreased(&[50, 30], &[49]));
++fn goal_dropped_needs_same_length_and_index_in_range() {
++    assert_eq!(goal_dropped(&[50, 30], &[49, 30], 0), Some(true));
++    assert_eq!(goal_dropped(&[50, 30], &[49, 30], 1), Some(false));
++    assert_eq!(goal_dropped(&[50, 30], &[50, 31], 1), Some(false));
++    assert_eq!(goal_dropped(&[50, 30], &[49], 0), None);
++    assert_eq!(goal_dropped(&[50, 30], &[49, 30], 2), None);
+ }
+ 
+-fn progress_texts(n: usize, flat: bool) -> VecDeque<Vec<&'static str>> {
+-    let mut v: Vec<Vec<&'static str>> = vec![vec!["50"]];
+-    for i in 0..n {
+-        v.push(if flat { vec!["50"] } else { vec![Box::leak(format!("{}", 49 - i).into_boxed_str())] });
+-    }
+-    v.into()
++fn lists(v: &[&[&'static str]]) -> VecDeque<Vec<&'static str>> {
++    v.iter().map(|x| x.to_vec()).collect()
+ }
+ 
+ fn stall_reads() -> Vec<Result<GridRead, DcoError>> {
+     let mut reads = vec![Ok(grid(A))];
+     for _ in 0..40 {
+         reads.push(Ok(grid(MOVED)));
+         reads.push(Ok(grid(MOVED)));
+         reads.push(Ok(grid(A)));
+         reads.push(Ok(grid(A)));
+     }
+     reads
+ }
+ 
+-#[test]
+-fn six_steps_without_the_number_dropping_is_a_stall_and_asks_the_model() {
++/// 初始读一次，之后每一步读一次。
++fn run_progress(texts: VecDeque<Vec<&'static str>>, gi: Option<usize>, steps: usize) -> (Vec<Value>, usize) {
+     let say = Say::new(Some(0));
+     let mut d = Fake::new(stall_reads());
+-    d.texts = progress_texts(8, true);
+-    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
+-    assert_eq!(log[5].get("stalled"), None, "before step 7 it is not a stall");
+-    assert!(say.calls.get() >= 1);
+-    assert!(log.iter().any(|l| l["stalled"] == true));
++    d.texts = texts;
++    let (_, log) = run_ask_goal(&mut d, Some(&say), false, 30, steps, gi);
++    (log, say.calls.get())
++}
++
++fn first_stalled(log: &[Value]) -> Option<usize> {
++    log.iter().position(|l| l["stalled"] == true)
++}
++
++fn flat(n: usize) -> Vec<&'static [&'static str]> {
++    vec![&["50"][..]; n]
+ }
+ 
+ #[test]
+-fn a_dropping_number_never_stalls() {
+-    let say = Say::new(Some(0));
+-    let mut d = Fake::new(stall_reads());
+-    d.texts = progress_texts(8, false);
+-    let (_, log) = run_ask(&mut d, Some(&say), false, 30, 8);
+-    assert_eq!(say.calls.get(), 0);
++fn six_flat_steps_make_the_seventh_a_stall_and_ask_the_model() {
++    let mut v = vec![&["50"][..]];
++    v.extend(flat(8));
++    let (log, asked) = run_progress(lists(&v), Some(0), 8);
++    assert_eq!(first_stalled(&log), Some(6));
++    assert!(asked >= 1);
++}
++
++#[test]
++fn without_a_goal_index_a_flat_run_never_stalls_or_asks() {
++    let mut v = vec![&["50"][..]];
++    v.extend(flat(8));
++    let (log, asked) = run_progress(lists(&v), None, 8);
++    assert_eq!(asked, 0);
+     assert!(log.iter().all(|l| l.get("stalled").is_none()));
+ }
+ 
+ #[test]
+-fn unreadable_numbers_neither_add_to_nor_clear_the_stall_count() {
+-    let say = Say::new(Some(0));
+-    let mut d = Fake::new(settled_script());
+-    let (s, log) = run_ask(&mut d, Some(&say), false, 30, 1);
+-    assert_eq!(s.stop, Stop::StepsDone);
+-    assert!(log[0].get("stalled").is_none());
++fn a_dropping_goal_number_never_stalls() {
++    let texts: Vec<Vec<&'static str>> = std::iter::once(vec!["50"]).chain((0..8).map(|i| vec![&*Box::leak(format!("{}", 49 - i).into_boxed_str())])).collect();
++    let (log, asked) = run_progress(texts.into(), Some(0), 8);
++    assert_eq!(asked, 0);
++    assert!(log.iter().all(|l| l.get("stalled").is_none()));
++}
++
++#[test]
++fn the_moves_left_counter_dropping_does_not_hide_a_stalled_goal() {
++    // 第 0 个数字是剩余步数（每步都降），第 1 个是目标（一直不变）
++    let ml: Vec<&'static str> = vec!["30", "29", "28", "27", "26", "25", "24", "23", "22"];
++    let v: Vec<Vec<&'static str>> = ml.iter().map(|m| vec![*m, "50"]).collect();
++    let (log, asked) = run_progress(v.clone().into(), Some(1), 8);
++    assert_eq!(first_stalled(&log), Some(6));
++    assert!(asked >= 1);
++    // 盯着剩余步数那个，就永远不停滞
++    let (log0, _) = run_progress(v.into(), Some(0), 8);
++    assert!(log0.iter().all(|l| l.get("stalled").is_none()));
++}
++
++#[test]
++fn a_drop_in_the_middle_restarts_the_count() {
++    // 初始 50；3 步不变；第 4 步降到 49；之后一直 49 不变
++    let mut v = vec![&["50"][..]];
++    v.extend(flat(3));
++    v.push(&["49"]);
++    v.extend(vec![&["49"][..]; 8]);
++    let (log, _) = run_progress(lists(&v), Some(0), 12);
++    // 降发生在第 4 步（下标 3）；之后要再连着 6 步不变，第 7 步（下标 3+6+1=10）才标停滞
++    assert_eq!(first_stalled(&log), Some(10));
++}
++
++#[test]
++fn an_unreadable_list_in_a_flat_run_neither_clears_nor_advances_the_count() {
++    let mut v = vec![&["50"][..]];
++    v.extend(flat(2));
++    v.push(&[]); // 这一步读不到（个数不同）
++    v.extend(flat(8));
++    let (log, _) = run_progress(lists(&v), Some(0), 10);
++    // 不带空档要在下标 6；空档同时让这一步的前后两次都对不上，共 2 步不算数
++    assert_eq!(first_stalled(&log), Some(8));
+ }
+diff --git a/src/game/cli.rs b/src/game/cli.rs
+index e4a7070..7db5d0b 100644
+--- a/src/game/cli.rs
++++ b/src/game/cli.rs
+@@ -1,50 +1,57 @@
+-//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N] [--ask-model] [--ask-every-step] [--goal 目标]`。
++//! `dct game play [--game 名字] [--steps N] [--dry-run] [--auto-next] [--tries N] [--ask-model] [--ask-every-step] [--goal 目标] [--goal-number N]`。
+ 
+-const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"]";
++const USAGE: &str = "用法：dct game play [--game candy-crush] [--steps 20] [--dry-run] [--auto-next] [--tries 5] [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"] [--goal-number 2]";
+ 
+ pub struct Args {
+     pub game: String,
+     pub steps: usize,
+     pub dry_run: bool,
+     /// 一局结束以后自己接着来（失败了重来、关安全的弹窗）。不带它就和以前一样：打完一关就停。
+     pub auto_next: bool,
+     /// 整个命令最多点几次“开始 / 再来一次”（每次都会用掉一条生命）。
+     pub tries: usize,
+     /// 启用大模型：划了没反应时问它选哪一步（没配大模型就只用规则）。
+     pub ask_model: bool,
+     /// 每一步都问大模型（隐含 `ask_model`）。
+     pub ask_every_step: bool,
+     /// 告诉大模型这一关要干什么。
+     pub goal: Option<String>,
++    /// 目标数字是屏幕上第几个数字（从 1 数）；不写就不判断停滞。
++    pub goal_number: Option<usize>,
+ }
+ 
+ pub fn parse(args: &[String]) -> Result<Args, String> {
+     if args.first().map(String::as_str) != Some("play") {
+         return Err(USAGE.into());
+     }
+-    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5, ask_model: false, ask_every_step: false, goal: None };
++    let mut a = Args { game: "candy-crush".into(), steps: 20, dry_run: false, auto_next: false, tries: 5, ask_model: false, ask_every_step: false, goal: None, goal_number: None };
+     let mut it = args[1..].iter();
+     while let Some(flag) = it.next() {
+         match flag.as_str() {
+             "--dry-run" => a.dry_run = true,
+             "--auto-next" => a.auto_next = true,
+             "--tries" => {
+                 let v = it.next().ok_or("--tries 后面要写次数")?;
+                 a.tries = v.parse().ok().filter(|n| (1..=20).contains(n)).ok_or("--tries 要在 1 到 20 之间")?;
+             }
+             "--ask-model" => a.ask_model = true,
+             "--ask-every-step" => {
+                 a.ask_every_step = true;
+                 a.ask_model = true;
+             }
+             "--goal" => a.goal = Some(it.next().ok_or("--goal 后面要写目标，比如 --goal \"清掉冰块\"")?.clone()),
++            "--goal-number" => {
++                const BAD: &str = "--goal-number 要写一个 1 到 20 的数字，比如 --goal-number 2 表示屏幕上第 2 个数字是目标";
++                let v = it.next().ok_or(BAD)?;
++                a.goal_number = Some(v.parse().ok().filter(|n| (1..=20).contains(n)).ok_or(BAD)?);
++            }
+             "--game" => a.game = it.next().ok_or("--game 后面要写游戏名")?.clone(),
+             "--steps" => {
+                 let v = it.next().ok_or("--steps 后面要写步数")?;
+                 a.steps = v.parse().ok().filter(|n| (1..=200).contains(n)).ok_or("--steps 要在 1 到 200 之间")?;
+             }
+             other => return Err(format!("不认识 {other}。{USAGE}")),
+         }
+     }
+     Ok(a)
+ }
+@@ -151,23 +158,23 @@ fn run_parsed(a: &Args) -> i32 {
+         if rec["kind"] == "nav" {
+             if let Some(line) = text::nav_line(&rec) {
+                 println!("{line}");
+             }
+         } else {
+             n += 1;
+             println!("{}", text::step_line(n, &rec));
+         }
+     };
+     let summary = if a.auto_next {
+-        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal }, &mut sink)
++        auto_next(&mut dco, &mut SystemClock, &loaded.profile, &NavOptions { max_steps: a.steps, tries: a.tries, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal, goal_index: a.goal_number.map(|n| n - 1) }, &mut sink)
+     } else {
+-        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal }, &mut sink)
++        play(&mut dco, &mut SystemClock, &loaded.profile, &Options { max_steps: a.steps, dry_run: a.dry_run, advisor: adv_ref, ask_always, ask_budget: 30, goal: &goal, goal_index: a.goal_number.map(|n| n - 1) }, &mut sink)
+     };
+     let (line, code) = text::stop_line(&summary.stop, summary.steps, log.path());
+     let _ = log.append(&json!({ "schema": 1, "run_id": run_id, "time_ms": SystemClock.now_ms(), "game": a.game, "stop": text::stop_code(&summary.stop), "steps": summary.steps }));
+     if code == 0 {
+         println!("{line}");
+     } else {
+         eprintln!("{line}");
+     }
+     code
+ }
+@@ -184,20 +191,29 @@ mod tests {
+         let d = parse(&["play".into()]).unwrap();
+         assert!(!d.ask_model && !d.ask_every_step);
+         // --ask-model 只在划了没反应时问；每一步都问要 --ask-every-step
+         assert!(!a.ask_every_step);
+         let e = parse(&["play".into(), "--ask-every-step".into()]).unwrap();
+         assert!(e.ask_every_step && e.ask_model);
+         assert_eq!(d.goal, None);
+         assert!(parse(&["play".into(), "--goal".into()]).is_err());
+     }
+ 
++    #[test]
++    fn parse_goal_number() {
++        assert_eq!(p(&["play", "--goal-number", "2"]).unwrap().goal_number, Some(2));
++        assert_eq!(p(&["play"]).unwrap().goal_number, None);
++        for bad in [&["play", "--goal-number", "0"][..], &["play", "--goal-number", "21"], &["play", "--goal-number", "x"], &["play", "--goal-number"]] {
++            assert!(p(bad).err().unwrap().contains("--goal-number 要写一个 1 到 20 的数字"));
++        }
++    }
++
+     fn p(v: &[&str]) -> Result<Args, String> {
+         parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+     }
+ 
+     #[test]
+     fn defaults() {
+         let a = p(&["play"]).unwrap();
+         assert_eq!((a.game.as_str(), a.steps, a.dry_run), ("candy-crush", 20, false));
+         assert_eq!((a.auto_next, a.tries), (false, 5));
+     }
+diff --git a/src/game/skill.md b/src/game/skill.md
+index da2224c..f78d8f6 100644
+--- a/src/game/skill.md
++++ b/src/game/skill.md
+@@ -40,20 +40,22 @@ description: 用户想让 AI 玩三消游戏（比如 Candy Crush）时使用。
+ - 弹窗只关「Close」「Not now」「No thanks」这一类安全的，其它一律不点；
+ - 遇到要花钱的画面、广告、生命用完、通关了、不认识的画面，就停下，什么都不点；
+ - 也会一边做一边印一行，例如「点了「Play」，开始新的一局」「这一局没过，点了「Try again」重来」。
+ 
+ 把这些话转述给用户。它停下以后，把最后一句话原样告诉用户（比如「生命用完了」「出现了广告，请你自己关掉」），由用户决定下一步。
+ 
+ ## 玩不动的时候
+ 
+ 规则选的步没反应时，可以加 `--ask-model`：卡住了才问大模型，让它从规则列出的几步里挑一步。想让它每一步都挑，加 `--ask-every-step`：每一步都问大模型（会慢一些，用来对比）。加 `--goal "清掉冰块"` 告诉它这一关要干什么。没配大模型、或者大模型没回应，也能玩，只是这次只用规则。
+ 
++连着好几步屏幕上的目标数字都没变小，就算「没有进展」，会记下来、说出来，也会去问大模型。要用 `--goal-number 2`（表示屏幕上第 2 个数字是目标）指明哪个数字是目标；不知道目标是哪个数字时不会判断停滞；用 --goal-number 指明。
++
+ ## 停
+ 
+ - 用户说「停」，马上中断这条命令。
+ - 命令自己停下时（没有能走的步、读不出棋盘、画面一直在动、连着两次没反应、dco 急停），把它印的最后一句话原样告诉用户。
+ - 不要自己去点屏幕补救，也不要换别的办法去操作游戏；让用户决定下一步。
+ 
+ ## 不要做
+ 
+ - 不要自己调用 dco 去点关卡按钮、道具、广告、付款。`--auto-next` 停下以后，也不要替它去点屏幕上的按钮、关广告或买东西。
+ - 不要同时开两条 `dct game play`。
+diff --git a/src/main.rs b/src/main.rs
+index 8e7de4e..61246ed 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -24,21 +24,21 @@ dct —— vibe coding 终端
+   dct install git  装一份便携 git（Windows）。dct 每轮对话前给项目拍快照
+                    靠它，没有它撤销是死的；同样只给 dct 自己用
+   dct restart      换掉在跑的守护进程（会断掉所有会话，-y 免问）；
+                    后台空着就直接起一个新的
+   dct llm check    把配置里那条 LLM 连接真的跑一次，看通不通
+   dct login        多电脑：用 DC 账号登录；第一台电脑顺手建「我的电脑」组
+   dct invite       老电脑上：出一个 6 位邀请码（10 分钟内有效，只能用一次）
+   dct join <邀请码> [--name 电脑名]
+                    新电脑上：用老电脑给的码加入（没登录会先自动登录）
+   dct game play [--game candy-crush] [--steps 20] [--dry-run]
+-                   [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"]
++                   [--ask-model] [--ask-every-step] [--goal \"清掉冰块\"] [--goal-number 2]
+                    让 dct 自己玩三消游戏（要先在 iPhone 镜像里打开一关；只支持 Mac）
+   dct game ask-bench <记录文件>... [--limit 40]
+                    拿以前记下的局面问大模型，看它比乱选强多少（不碰手机）
+   dct peers        看组里有哪些电脑、开着哪些会话
+   dct send <电脑名>/<会话名> \"<内容>\"
+                    给另一台电脑上的会话留一句话；会话名也可以写 #编号。
+                    那边空着就马上敲进去，忙就排队
+   dct peers remove <电脑名>           把一台电脑移出组
+   dct daemon       只跑守护进程，不开界面
+   dct gate         远程版那道门：守着一个端口，只放带对钥匙的人进去。

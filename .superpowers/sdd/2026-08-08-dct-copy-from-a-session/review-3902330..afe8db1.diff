@@ -1,0 +1,954 @@
+# Review package: 3902330..afe8db1
+
+## Commits
+afe8db1 docs: acknowledge terminal-dependent wheel behavior, per-frame mouse ownership
+fed2898 docs: the mouse stays yours unless the agent asked for it
+1e6a1b2 fix: copy-mode hint degrades to a short form on narrow terminals
+74f40d8 feat: the bar says plainly when the mouse belongs to the terminal
+23eb2b8 fix: reset copy_mode in create_session, not just enter_session
+dd5220f feat: F4 hands the mouse back to the terminal so you can select and copy
+b62d7cb fix: make the disconnect-preserves-scroll test actually able to fail
+441ae41 feat: only grab the mouse when the agent actually asked for it
+
+## Files changed
+ README.md        |  10 +-
+ README.zh-CN.md  |  10 +-
+ src/i18n.rs      |  42 +++++++-
+ src/ui/app.rs    |   8 ++
+ src/ui/attach.rs |  50 +++++++++
+ src/ui/mod.rs    | 316 ++++++++++++++++++++++++++++++++++++++++++++++++++++---
+ 6 files changed, 416 insertions(+), 20 deletions(-)
+
+## Diff
+diff --git a/README.md b/README.md
+index 04f5ae6..528eeae 100644
+--- a/README.md
++++ b/README.md
+@@ -116,23 +116,23 @@ The board is **grouped by project**. Sessions from the same project sit together
+ **Every project remembers its own last agent.** Press `n` in project A and you get claude, press `n` in project B and you get codex — and the bottom bar names which one you're about to get before you press anything (`n new claude`). A project that has never had a session just says `n new`, and pressing it opens the agent picker; so does a window too narrow to fit the name without pushing another key off the line.
+ 
+ The bottom bar is one line, and the keys that don't fit don't flicker in and out with the window width: whatever the bar can't hold lives one keypress away behind `?`, and that door (`? …`) is always the last thing on the line. That screen lists only the keys that actually do something right now — no `Tab` when there's only one project, no `x` when the group still has sessions in it.
+ 
+ The grid is read-only — arrows move focus, `F3` does the same as `→` (next tile, stopped sessions included), `Enter` zooms into the focused tile (the same attach view as `Enter` on the board), `g` goes back to the list, `?` opens the same all-keys screen, and `Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` all do exactly what they do on the board. Two differences: folding is list-only, because in the grid the left and right arrows move the focus; and the digits work with no number on screen, because tiles carry no numbering the way group headers do — `1` is still the first project.
+ 
+ `i` is the grid's own key, and the one thing the board has no equivalent for: it opens a one-line reply box on the focused tile, so you can answer an agent without leaving the overview. Type and press `Enter` to send. Press `Enter` on an empty box and it sends a bare Enter — that's how you approve a plan or say "carry on". `Ctrl+C` interrupts the agent instead. While the box is open the whole keyboard belongs to it.
+ 
+ Tiles are ordered by project, so one project's sessions stay next to each other, and every tile says which project it belongs to. Nothing you type there ever reaches an agent. Stopped sessions show a frozen last screen instead of nothing. More than nine sessions get more pages, with a page indicator. The grid doesn't scroll a tile's history — zoom in (`Enter`) for that.
+ 
+-Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3` and `Ctrl+Q` are the only three keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view.
++Inside a session every keystroke goes to the agent, `Esc` included — agents need it for their own popups. `F2`, `F3`, `F4` and `Ctrl+Q` are the only four keys `dct` keeps: `F2` and `Ctrl+Q` both back out to the board, `F3` jumps straight to the next running session without leaving the attach view, `F4` toggles copy mode (more on that below).
+ 
+-You can scroll back through what a session already printed — the wheel, or `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled off the top; that's a ceiling, not a promise. The wheel moves 3 lines a notch, a page moves a full screen minus two lines so you keep your place, and `End` jumps straight back down. Claude Code wants the mouse for its own scrolling, so there the wheel goes straight to Claude Code and `dct` stays out of it, no hint shown — you're scrolling its view, not `dct`'s. codex doesn't want the mouse, so `dct` scrolls what it kept instead. While you're up looking at old output, new lines don't drag your view down with them — the bottom bar counts how many are waiting and tells you how to get back. Type anything, or resize the window, and you're snapped back to the bottom.
++You can scroll back through what a session already printed, with `PageUp`/`PageDown`/`End`. `dct` keeps roughly the last 2000 lines that scrolled off the top; that's a ceiling, not a promise. A page moves a full screen minus two lines so you keep your place, and `End` jumps straight back down. The wheel only does something when the agent itself wants the mouse: Claude Code does, so there the wheel goes straight to Claude Code and `dct` stays out of it, no hint shown — you're scrolling its view, not `dct`'s. codex and plain command-line tools don't want the mouse, so `dct` doesn't capture it there either — the wheel no longer scrolls `dct`'s history, and depending on your terminal it may do nothing or send arrow keys straight to the agent; use `PageUp`/`PageDown`/`End` instead. While you're up looking at old output, new lines don't drag your view down with them — the bottom bar counts how many are waiting and tells you how to get back. Type anything, or resize the window, and you're snapped back to the bottom.
+ 
+ A session is stuck with the agent it was born with. There's no swapping Claude for Codex halfway through; the whole conversation lives inside that process. Press `N` and start another one.
+ 
+ ---
+ 
+ # Where this is going
+ 
+ **None of this is written yet.** It's here so the parts above make sense as a direction rather than a pile of features.
+ 
+ The point was never "use your terminal from anywhere." It's that **development keeps moving while you're not there**. You handle three things: state the goal, make the calls, accept the result. The understanding, writing, testing and fixing in between shouldn't need you watching.
+@@ -143,21 +143,25 @@ The point was never "use your terminal from anywhere." It's that **development k
+ - **Tasks replace sessions as the thing you deal with.** You say "fix the white screen after login on mobile" instead of first picking a PTY, an agent and a directory.
+ - **`dc_llm` stays resident doing the cheap work**: reading status, compacting context, classifying your replies, turning technical detail into a decision card you can read on a phone. The expensive frontier models get called only when there's actual code to write.
+ - **Done means the tests ran.** Detect the stack and the test command, run it, let the agent fix its own failures within a bounded number of rounds, and only hand it to you for acceptance once it passes.
+ 
+ ---
+ 
+ # Things that will annoy you
+ 
+ **The big one: the four vendor endpoints are copied out of public documentation and have never been tested with a real account.** A key can verify fine and the session still fail to start. Until somebody runs them with real credentials, treat Kimi, GLM, DeepSeek and Qwen API as unverified.
+ 
+-Scrolling back works now, but it cost you something: while you're inside a session, `dct` grabs the mouse, so your terminal's own click-and-drag text selection stops working there. In iTerm2 you hold Option to get it back; most terminals have some equivalent modifier. `dct` has no copy of its own yet. Back on the board the mouse is yours again.
++`dct` only takes the mouse when **the agent itself wants it**. Claude Code does (it uses the mouse to scroll its own screen); codex and plain command-line tools don't — in those sessions the mouse stays with the terminal as long as nothing running there asks for it, so click-and-drag text selection and copying work exactly as they always do. The cost is that the wheel no longer scrolls `dct`'s own history in those sessions; use `PageUp`/`PageDown`/`End` instead.
++
++To copy inside a session where the agent wants the mouse, press `F4` to enter copy mode: the mouse goes back to the terminal, the bottom bar says so, and pressing `F4` again leaves it once you're done copying. You can also use your terminal's own modifier (Option in iTerm2) without leaving the session at all.
++
++`dct` has no copy of its own — copying uses whatever your terminal already gives you.
+ 
+ Permissions are auto-accepted, which means an agent can write outside the project directory. **Those writes are outside the snapshot and undo won't bring them back.**
+ 
+ Two agents in one project will fight over the same files. Different projects, no problem.
+ 
+ `opencode` and `qwen` are in the list but neither has ever actually been run, so they have no screen patterns and their sessions just show `—`.
+ 
+ Only the first nine groups get a number. From the tenth project on, `Tab` is the only way there, one step at a time.
+ 
+ The interface comes in Chinese and English. `l` switches it, `DCT_LANG=en` overrides it for one run, and with neither it follows your system locale.
+diff --git a/README.zh-CN.md b/README.zh-CN.md
+index 611c3ba..0a6c767 100644
+--- a/README.zh-CN.md
++++ b/README.zh-CN.md
+@@ -116,23 +116,23 @@ cargo build --release
+ 每个项目**各自**记着上次用的 agent：在 A 项目按 `n` 开 claude、在 B 项目按 `n` 开 codex，底栏在你按之前就写着这一下会开哪个（`n 新建 claude`）。这个项目还一次会话都没开过，就只写 `n 新建`，按下去弹选择器；窗口窄到那个名字挤掉别的键时也只写 `n 新建`。
+ 
+ 底栏只有一行，装不下的键不会跟着窗口宽度忽隐忽现——上面这张表里挤不进去的那些，全在 `?` 后面那一屏，而 `? …` 这扇门永远在行尾。那一屏只列**此刻真的按得动**的键：只有一个项目时不写 `Tab`，组里还有会话时不写 `x`。
+ 
+ 格子只读——方向键移动焦点，`F3` 跟 `→` 效果一样（下一格，停掉的会话也算），`Enter` 放大进焦点那一格（跟看板上按 `Enter` 是同一个附加视图），`g` 回列表，`?` 打开同一张全部按键的表，`Tab`/`1`…`9`/`n`/`N`/`p`/`x`/`c`/`l`/`s`/`u`/`d`/`q` 在格子里的效果跟在看板上完全一样。只有两处不同：折叠是列表独有的，因为九宫格的左右键是移动焦点；数字键在这里屏幕上看不到号码——格子不像组头那样印着序号，但按下去照样是「第 N 个项目」，`1` 还是第一个。
+ 
+ `i` 是九宫格独有的那个键，也是看板上没有对应物的一件事：它在焦点那一格上开一个单行回复框，让你不用离开总览就回 agent 一句。打完按 `Enter` 送出去。框还空着时直接按 `Enter`，送出去的就是一个光秃秃的回车——批准一份计划、或者说「接着干」，用的就是这一下。`Ctrl+C` 则是打断它。框开着的时候键盘整个归框。
+ 
+ 格子按项目排好，同一个项目的会话挨在一起，每一格标着自己属于哪个项目。格子里敲的键一个字都不会送到 agent 那边。停掉的会话格子里留一张最后的画面，不是空的。会话超过九个就翻页，带页码提示。格子里翻不了历史，想往回看得先放大进去（`Enter`）。
+ 
+-进了会话，你敲的每个键都送给 agent，`Esc` 也一样，它们关自己的弹窗要用。`F2`、`F3`、`Ctrl+Q` 是 `dct` 唯一留下的三个键：`F2` 和 `Ctrl+Q` 都是退回看板，`F3` 不用退出就能直接跳到下一个还在跑的会话。
++进了会话，你敲的每个键都送给 agent，`Esc` 也一样，它们关自己的弹窗要用。`F2`、`F3`、`F4`、`Ctrl+Q` 是 `dct` 唯一留下的四个键：`F2` 和 `Ctrl+Q` 都是退回看板，`F3` 不用退出就能直接跳到下一个还在跑的会话，`F4` 切换复制模式（见下文）。
+ 
+-会话里之前打印过的内容能往回翻了——滚轮，或者 `PageUp`/`PageDown`/`End`。`dct` 大概留着最后 2000 行滚出屏幕的内容，这是个上限，不是承诺一行不少。滚轮一格 3 行，翻页是一屏减两行，留出两行接上上一屏，`End` 直接跳回底部。Claude Code 自己要抓鼠标去滚它自己的画面，这种情况下滚轮直接归它管，`dct` 不插手，也不提示——你滚的是它的画面，不是 `dct` 的。codex 不要鼠标，`dct` 就滚自己留的那份。往回看的时候新内容照样在后面涨，画面不会被拽着往下跳，底栏会数有几行新的在等着，也会告诉你怎么回去。打一个字，或者改一下窗口大小，立刻弹回底部。
++会话里之前打印过的内容能往回翻，用 `PageUp`/`PageDown`/`End`。`dct` 大概留着最后 2000 行滚出屏幕的内容，这是个上限，不是承诺一行不少。翻页是一屏减两行，留出两行接上上一屏，`End` 直接跳回底部。滚轮只在 agent 自己要鼠标时才有动静：Claude Code 会要，滚轮就直接归它管，`dct` 不插手，也不提示——你滚的是它的画面，不是 `dct` 的。codex、普通命令行不要鼠标，`dct` 也就不去抓它——滚轮不再翻 `dct` 的历史，至于滚轮本身会怎样，看你用的终端：有的什么反应都没有，有的会把它当成方向键直接送给 agent，稳妥的办法还是 `PageUp`/`PageDown`/`End`。往回看的时候新内容照样在后面涨，画面不会被拽着往下跳，底栏会数有几行新的在等着，也会告诉你怎么回去。打一个字，或者改一下窗口大小，立刻弹回底部。
+ 
+ 一个会话从生到死绑定一个 agent，中途换不了。整段对话都在那个进程里面，换 agent 等于换个脑子。想换就按 `N` 另开一个。
+ 
+ ---
+ 
+ # 方向
+ 
+ **下面这些一行代码都还没写。** 放在这儿是为了说清楚上面那些东西是冲着什么去的。
+ 
+ 真正想要的不是「在任何地方看终端」，而是**人不在，开发照样往前走**。你只管三件事：提目标、拍板、验收。中间的理解、写、测、修，不该需要你盯着。
+@@ -143,21 +143,25 @@ cargo build --release
+ - **任务取代会话成为主角。** 你说「修复移动端登录后白屏」，而不是先选 PTY、选 agent、选目录。
+ - **`dc_llm` 常驻干便宜的活**：判断状态、压缩上下文、归类你的回复、把技术细节写成手机上能读的决策卡片。贵的前沿模型只在真正写代码的时候才叫。
+ - **跑完测试才算完成。** 自动识别技术栈和测试命令，自动跑，失败了让 agent 在限定轮次内自己修，通过了才推给你验收。
+ 
+ ---
+ 
+ # 会踩到的坑
+ 
+ **最要紧的一条：那四家的端点地址是照公开文档抄的，从来没拿真账号试过。** 密钥有可能验证通过、会话照样起不来。在有人拿真凭据跑通之前，Kimi、GLM、DeepSeek、Qwen API 这四个就当没验证过。
+ 
+-往回滚屏能用了，但它是有代价的：进了会话之后 `dct` 会接管鼠标，终端自己那套拖动选中文字就在会话里失灵了。iTerm2 里按住 Option 能拿回来，别的终端一般也有对应的修饰键。`dct` 自己还没有复制功能。退回看板，鼠标就还给你了。
++`dct` 只在 **agent 自己要鼠标的时候**才接管它。Claude Code 会要（它自己用鼠标滚它那一屏），codex 和普通命令行不要——只要会话里跑着的东西没自己伸手要鼠标，鼠标就归终端，拖动选中文字、复制，跟平时完全一样。代价是那些会话里滚轮不再翻 `dct` 的历史，用 `PageUp`/`PageDown`/`End`。
++
++在 agent 要鼠标的会话里想复制，按 `F4` 进复制模式：鼠标临时还给终端，底栏会写着现在是这个状态，复制完再按一次 `F4` 回去。也可以用终端自己的修饰键（iTerm2 是按住 Option），不用退出会话。
++
++`dct` 自己没有复制功能——复制用的是你终端本来那一套。
+ 
+ 权限是全自动接受的，所以 agent 有可能写到项目目录外面去。**那部分改动不在快照范围内，撤销撤不回来。**
+ 
+ 同一个项目里开两个 agent，它们会抢同一批文件。跨项目就没事。
+ 
+ `opencode` 和 `qwen` 在列表里，但这两个一次都没真跑过，所以没给它们配屏幕匹配，会话状态一直是 `—`。
+ 
+ 号码只发给前九个组。第十个项目起没有号码，只能用 `Tab` 一个一个翻过去。
+ 
+ 界面有中文和英文两种。按 `l` 切，也可以用 `DCT_LANG=en` 临时压过一次；不设就跟着系统 locale 走。
+diff --git a/src/i18n.rs b/src/i18n.rs
+index 6295fdb..be3b37c 100644
+--- a/src/i18n.rs
++++ b/src/i18n.rs
+@@ -183,20 +183,25 @@ pub enum Key {
+     /// 组头上：这个项目的目录已经不在了
+     ProjectDirGone,
+     AllSessionsStopped,
+     WindowTooSmall,
+     Verifying,
+     PasteOrTypeKey,
+     NoOtherRunningSession,
+     NoSessionSelected,
+     DaemonUnreachable,
+     StaleData,
++    /// 复制模式下顶掉整条底栏右段的提示
++    CopyMode,
++    /// 同上，但给放不下长文案的窄终端用——必须放进 `ui::ACTION_MIN_COLS`，
++    /// 因为这是全屏唯一写着 F4（怎么退出复制模式）的地方，容不下被静默截断。
++    CopyModeShort,
+     // —— 会话状态（看板与九宫格的状态列）——
+     // —— dct ps / dct stop（普通终端里用，不开界面）——
+     NoDaemonRunning,
+     NoSessionsRunning,
+     NothingToPrune,
+     StatusWorking,
+     StatusAsking,
+     StatusIdle,
+     StatusStopped,
+     StatusFailed,
+@@ -519,20 +524,32 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
+             lang,
+             en: "This project still has sessions. Stop them first.",
+             zh: "这个项目还有会话，先停掉才能移除。"
+         ),
+ 
+         StaleData => t!(
+             lang,
+             en: "Cannot reach the dct service — what you see may be out of date",
+             zh: "守护进程连不上，界面数据可能已过期",
+         ),
++
++        CopyMode => t!(
++            lang,
++            en: "Copy mode · mouse released · F4 exits",
++            zh: "复制模式 · 鼠标已交还终端 · F4 退出"
++        ),
++
++        CopyModeShort => t!(
++            lang,
++            en: "Copy mode · F4 exits",
++            zh: "复制模式 · F4 退出"
++        ),
+     }
+ }
+ 
+ /// 底栏和「全部按键」浮层里的一条提示：**键名和说明分开存**。
+ ///
+ /// 分开不是为了好看：键名要加粗（加粗是 `Span` 一级的事），拼成一整个
+ /// 字符串之后再想切回来，只能靠猜哪个空格是分隔符——而 `Ctrl+C 打断`、
+ /// `方向键选格子`、`其余按键都发给 agent` 各有各的形状，猜不准就会加粗到
+ /// 说明的头一个词上去。
+ ///
+@@ -1256,20 +1273,22 @@ mod tests {
+             // 组得出话、英文里不许有汉字）从来没查过它。顺手补上：它正是九宫格
+             // 另一种空态用的那一条，跟刚加的 NoSessionsRunningPressN 挨着。
+             AllSessionsStopped,
+             WindowTooSmall,
+             Verifying,
+             PasteOrTypeKey,
+             NoOtherRunningSession,
+             NoSessionSelected,
+             DaemonUnreachable,
+             StaleData,
++            CopyMode,
++            CopyModeShort,
+             NoDaemonRunning,
+             NoSessionsRunning,
+             NothingToPrune,
+             StatusWorking,
+             StatusAsking,
+             StatusIdle,
+             StatusStopped,
+             StatusUnknown,
+             SecretsTitle,
+             SecretSet,
+@@ -1324,28 +1343,49 @@ mod tests {
+             }
+         }
+     }
+ 
+     /// `ALL_KEYS` 漏了谁，上面两条守卫就悄悄不管它了。用 `text()` 的穷尽 match
+     /// 反过来钉住这份清单：新增变体必须同时出现在这里，否则数目对不上。
+     #[test]
+     fn every_key_is_listed_for_the_guards() {
+         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
+         // 而是「词条表里到底有多少条」这个事实。
+-        assert_eq!(ALL_KEYS.len(), 96, "加了 Key 变体就要同步进 ALL_KEYS");
++        assert_eq!(ALL_KEYS.len(), 98, "加了 Key 变体就要同步进 ALL_KEYS");
+         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
+         seen.sort();
+         let before = seen.len();
+         seen.dedup();
+         assert_eq!(before, seen.len(), "ALL_KEYS 里有重复项");
+     }
+ 
++    /// `CopyModeShort` 是复制模式提示放不下长文案时的退路，必须两种语言
++    /// 都放得进 `ui::ACTION_MIN_COLS`——那是底栏右段唯一保证的宽度。这条提示
++    /// 又是全屏唯一写着 F4（怎么退出复制模式）的地方：退路本身放不下，
++    /// 用户就会卡在一个看不见也出不去的模式里，跟 `ESCAPE_HINT_COLS` 那条
++    /// 守卫（`src/ui/mod.rs` 的 `escape_hint_cols_fits_every_view`）防的是
++    /// 同一类事故。
++    #[test]
++    fn copy_mode_short_fits_the_action_floor_in_every_language() {
++        use unicode_width::UnicodeWidthStr;
++
++        for l in Lang::all() {
++            let short = text(Key::CopyModeShort, *l);
++            assert!(
++                short.width() <= crate::ui::ACTION_MIN_COLS as usize,
++                "{l:?} 下复制模式的短文案「{short}」宽 {} 列，放不进 ACTION_MIN_COLS = {}",
++                short.width(),
++                crate::ui::ACTION_MIN_COLS
++            );
++        }
++    }
++
+     /// 每一个错误码在两种语言下都要组得出话，而且英文里不许有汉字。
+     /// 这是 daemon 侧文案唯一的落点——漏一条，用户就会在英文界面上
+     /// 看到一句中文，而且没有任何编译期信号。
+     #[test]
+     fn every_error_code_composes_in_both_languages() {
+         use crate::proto::ErrorCode::*;
+         let codes = [
+             NoSuchProfile("kimi".into()),
+             DirNotFound("/w/a".into()),
+             NotAGitRepo("/w/a".into()),
+diff --git a/src/ui/app.rs b/src/ui/app.rs
+index 28d35a7..729c8c9 100644
+--- a/src/ui/app.rs
++++ b/src/ui/app.rs
+@@ -116,20 +116,27 @@ pub struct App {
+     /// 视图每 16ms 跑一轮；没有这份缓存的话，`run()` 会在**每一帧**都重发
+     /// `Request::Explanation`、重写一次 `app.message`——哪怕答案没变。
+     /// 别的地方（粘贴失败、Ctrl+C 打断……）在两帧之间设的消息，下一帧就被
+     /// 这句话原样盖掉，用户永远看不见。有了缓存，`app.message` 只在**第一次
+     /// 拿到答案的那一帧**被赋值一次，之后这个会话不再触碰它。
+     ///
+     /// 离开 `Failed`（哪怕只是这一帧的 `Screen` 还没追上）就把它忘掉：
+     /// 见 `mod.rs::run` 里配对的清空分支——这样同一个会话「恢复了、又坏了」
+     /// 会被当成一次新的失败重新问一遍，不会一直顶着上一次的旧话。
+     pub(crate) explained_failure: Option<(u32, String)>,
++    /// 用户按 `F4` 打开的复制模式：**临时**把鼠标交还给终端，好让人用
++    /// 终端自己的拖选去复制。
++    ///
++    /// 它是「此刻正在复制」的临时状态，不是配置——离开会话一律复位
++    /// （见 `attach::handle_key`）。跨会话粘着的话，用户会在另一个会话里
++    /// 发现鼠标莫名其妙不归 agent 管，而屏幕上没有任何东西解释为什么。
++    pub copy_mode: bool,
+ }
+ 
+ impl App {
+     /// 两个构造函数共用的字段初值——除了 `client` 之外的每一项，`new` 和
+     /// `new_disconnected` 必须给出完全一样的答案。拆出来是因为一旦两份
+     /// 分开抄，改 `new` 忘了同步改测试用的那份，测试就会在悄悄测一个跟
+     /// 生产环境不一样的初值，形同没测（这正是本函数存在的原因，见
+     /// `a_fresh_app_starts_on_the_board_with_nothing_stale`）。
+     fn new_inner(
+         client: Option<Client>,
+@@ -166,20 +173,21 @@ impl App {
+             // 每轮循环开头的 List 调用是唯一的真相来源，它总在当次
+             // term.draw 之前重新算一遍，所以这里给什么都会被立刻覆盖。
+             connected: true,
+             need_sessions: true,
+             verify_rx: None,
+             lang,
+             socket,
+             start_dir: default_dir,
+             quit: false,
+             explained_failure: None,
++            copy_mode: false,
+         }
+     }
+ 
+     pub fn new(
+         client: Client,
+         default_dir: PathBuf,
+         lang: crate::i18n::Lang,
+         socket: PathBuf,
+         view_mode: super::view::ViewMode,
+     ) -> App {
+diff --git a/src/ui/attach.rs b/src/ui/attach.rs
+index 2bfbc6d..be56968 100644
+--- a/src/ui/attach.rs
++++ b/src/ui/attach.rs
+@@ -135,20 +135,29 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+                 // 跟九宫格 Enter 放大走的是同一个函数（见
+                 // `mod.rs::point_cursor_at_session`），两处不各写一份。
+                 super::point_cursor_at_session(app, next);
+                 super::enter_session(app, next)
+             }
+             None => {
+                 app.message =
+                     crate::i18n::text(crate::i18n::Key::NoOtherRunningSession, app.lang).into()
+             }
+         }
++    } else if key.code == KeyCode::F(4) {
++        // F4 = 复制模式：临时把鼠标交还给终端，用终端自己的拖选去复制。
++        // 挑 F4 沿用 F2/F3 的理由：没有 CLI agent 在用 F 功能键，偷它不踩
++        // 任何人，也不用搞双击透传那种隐形状态。
++        //
++        // 这里只翻转状态，真正开关鼠标在主循环里统一做（见
++        // `mod.rs::wants_mouse_capture`）——在这儿直接 execute! 的话，
++        // 就有两处在写同一个终端状态，而它们对「现在开着没有」的记忆会分叉。
++        app.copy_mode = !app.copy_mode;
+     } else if let Some(action) = key_scroll(
+         &app.scroll,
+         &key,
+         // `app.screen` 是上一次 `Screen` 响应的行数，而那个行数正是 dct
+         // 最后一次通过 `Request::Resize` 告诉 agent 的高度——`screen_spans()`
+         // 按 vt100 的配置尺寸返回，永远是这个数（见 `pty.rs`）。用它当
+         // 「一屏多高」不需要另外在 `handle_key` 里穿一份终端尺寸进来。
+         app.screen.len() as u16,
+     ) {
+         // PageUp/PageDown/End 在「dct 自己攥着历史」时归 dct 管，直接在这里
+@@ -334,20 +343,61 @@ mod tests {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: "/tmp/a".into(),
+             state,
+             activity: String::new(),
+             is_agent: true,
+         }
+     }
+ 
++    fn attached_app() -> (App, tempfile::TempDir) {
++        let (mut app, d) = App::test_app();
++        app.view = View::Attached(1);
++        (app, d)
++    }
++
++    #[test]
++    fn f4_toggles_copy_mode_and_is_never_forwarded_to_the_agent() {
++        let (mut app, _d) = attached_app();
++        assert!(!app.copy_mode);
++
++        handle_key(&mut app, key(KeyCode::F(4))).unwrap();
++        assert!(app.copy_mode, "第一下打开");
++
++        handle_key(&mut app, key(KeyCode::F(4))).unwrap();
++        assert!(!app.copy_mode, "第二下关掉");
++
++        // F4 是 dct 自己吃掉的键，一个字节都不能落进 agent 的输入
++        assert_eq!(crate::ui::key_to_input(&key(KeyCode::F(4))), None);
++    }
++
++    /// 复制模式是「此刻正在复制」的临时状态，不是配置。**进会话时复位**——
++    /// 不管上一个会话是怎么离开的（F2、Ctrl+Q、agent 自己退出），下一个会话
++    /// 一定从「鼠标归 agent」开始。
++    ///
++    /// 在**进入**这一侧复位，而不是在三条离开的路上各写一次：`enter_session`
++    /// 只是「进」这一侧两个构造器之一（另一个是 `create_session`，见
++    /// `create_session_resets_copy_mode_for_a_freshly_created_session`），
++    /// 两处合起来才盖住所有会落到 `View::Attached` 的路径。而离开有三条路，
++    /// 其中 Ctrl+Q 那条走的是 `back_one_level`——一个所有视图共用的纯函数，
++    /// 为这一个字段改它的签名不值。
++    #[test]
++    fn entering_a_session_always_starts_outside_copy_mode() {
++        let (mut app, _d) = App::test_app();
++        app.copy_mode = true;
++
++        crate::ui::enter_session(&mut app, 1);
++
++        assert!(!app.copy_mode, "上一个会话的复制模式不能粘到下一个会话");
++    }
++
+     #[test]
+     fn f3_jumps_straight_to_the_next_running_session() {
+         // 不用先退回看板：从会话 1 按 F3 直接落在下一个在跑的会话上。
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![
+             session(1, SessionState::Working),
+             session(2, SessionState::Stopped),
+             session(3, SessionState::Idle),
+         ]);
+         app.view = View::Attached(1);
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 227b19a..ad34721 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -102,20 +102,56 @@ fn restore_terminal() {
+ /// 走终端自己的选中逻辑而不是这套协议，漏关会让用户退回看板之后连
+ /// 拖选文字复制都做不了。
+ fn mouse_capture_transition(was_attached: bool, is_attached: bool) -> Option<bool> {
+     if was_attached == is_attached {
+         None
+     } else {
+         Some(is_attached)
+     }
+ }
+ 
++/// 这一帧该不该抓鼠标。三个条件全真才抓。
++///
++/// 抽成纯函数的理由同 `mouse_capture_transition`：副作用（往 stdout 写转义
++/// 序列）没法单测，判断能测——而且判断错了两个方向都难受：漏关，用户在会话里
++/// 连拖选复制都做不了；漏开，agent 收不到它明明订阅了的鼠标事件。
++///
++/// `agent_subscribed` 来自 `App.scroll.agent_owns`，**不新开一条判据**。
++/// 那个字段的语义就是「agent 自己攥着鼠标」，跟这里问的是同一个事实；
++/// 各读各的，迟早会分叉成「dct 抓着鼠标却不肯滚」这种自相矛盾的状态。
++fn wants_mouse_capture(attached: bool, agent_subscribed: bool, copy_mode: bool) -> bool {
++    attached && agent_subscribed && !copy_mode
++}
++
++/// 这一轮 `Screen` 请求的结果决定下一帧的 `app.scroll`：拿到新画面就用
++/// 新的一份，请求失败（断连、或者这次干脆没拿到 `Response::Screen`）就
++/// 原样保留上一帧的值，不清空。
++///
++/// 断连不代表 agent 放弃了它订阅的鼠标协议，只代表这一轮没问到它现在的
++/// 状态——`agent_owns` 一旦被错误地复位成 `false`，`wants_mouse_capture`
++/// 就会在断连的每一帧里都把捕获关掉再开回来，那是往 stdout 反复写转义
++/// 序列，断连时这是最吵的一种失败。
++///
++/// 抽成纯函数是因为它现在能被真正测到：喂一个 `Err`，断言拿回来的还是
++/// 传进去的那个 `previous`——而不是像内联在 `run()` 里那样，测试只能
++/// 设置一个字段（`app.connected`）再重新算一遍同一个纯函数，两次调用
++/// 参数完全相同，永远不可能失败，也就什么都没测到。
++fn scroll_after_screen_call(
++    previous: crate::session::ScrollState,
++    result: &Result<Response>,
++) -> crate::session::ScrollState {
++    match result {
++        Ok(Response::Screen { scroll, .. }) => *scroll,
++        _ => previous,
++    }
++}
++
+ /// 兜底恢复终端状态。ratatui 的 `Terminal` 不会在 `Drop` 里自动退出 raw
+ /// mode / alternate screen；`run()` 的主循环里到处都是 `?`，一旦某次
+ /// `client.call`/`term.draw` 出错就会直接从函数返回，跳过写在循环末尾的清理代码，
+ /// 把用户的终端卡在 raw mode（回显、行缓冲全关）。这个 guard 保证不管是提前
+ /// `return`/`?`、正常 `break`，还是 panic 展开，`Drop` 都会跑一次。
+ ///
+ /// 它盖不住的只剩信号——那条交给 `spawn_signal_restore`。
+ struct TerminalGuard;
+ 
+ impl Drop for TerminalGuard {
+@@ -476,32 +512,36 @@ pub fn run(
+             if app.sent_size != Some((id, rows, cols))
+                 && rows > 0
+                 && cols > 0
+                 && app
+                     .client()
+                     .and_then(|c| c.call(Request::Resize { id, rows, cols }))
+                     .is_ok()
+             {
+                 app.sent_size = Some((id, rows, cols));
+             }
+-            match app.client().and_then(|c| c.call(Request::Screen { id })) {
++            let screen_result = app.client().and_then(|c| c.call(Request::Screen { id }));
++            // 按键和滚轮怎么分流、底栏那句提示写什么、这一帧该不该抓鼠标，
++            // 都看 `app.scroll` 这一份——每 16ms 跟着 `Screen` 一起刷新，
++            // 滞后最多一帧，够用了。独立于下面这个 match 先算好：请求失败
++            // 时这个 match 走的是 `_` 分支，不会碰 `scroll`，见
++            // `scroll_after_screen_call` 头上的注释。
++            app.scroll = scroll_after_screen_call(app.scroll, &screen_result);
++            match screen_result {
+                 Ok(Response::Screen {
+                     lines,
+                     cursor,
+                     state,
+-                    scroll,
++                    ..
+                 }) => {
+                     app.screen = lines;
+                     app.screen_cursor = cursor;
+-                    // 按键和滚轮怎么分流、底栏那句提示写什么，都看这一份——
+-                    // 每 16ms 跟着 `Screen` 一起刷新，滞后最多一帧，够用了。
+-                    app.scroll = scroll;
+                     app.connected = true;
+                     // agent 自己退出之后不能把用户留在这里：那是一张纯空白页
+                     // （agent 在 alternate screen 里画，退出时恢复的主屏从来
+                     // 没被写过），底栏还写着「其余按键都发给 agent」，而他敲的
+                     // 每个键都掉进一个死掉的 pty 里无声消失。
+                     if let Some(notice) = session_ended_notice(id, state, app.lang) {
+                         app.view = home_view(&app);
+                         // 回看板得重新拉一次 List：贴在会话里这一路都没拉，
+                         // 手里的 sessions 是进会话之前那份，缺的正是「这个
+                         // 会话已经没了」这条更新。
+@@ -545,28 +585,34 @@ pub fn run(
+                         // 这个会话不再是 Failed 了（恢复了）：把缓存忘掉。
+                         // 不忘的话，它下次再坏，`already_have` 会一直是
+                         // true，新的一次失败永远问不出新的解释。
+                         app.explained_failure = None;
+                     }
+                 }
+                 _ => app.connected = false,
+             }
+         }
+ 
+-        // 检查一次「在不在会话里」有没有变，而不是在每个能进/出 `View::Attached`
+-        // 的分支各开关一次——那样的分支太多、太容易漏（上面 `mouse_captured`
++        // 抓不抓鼠标不再只看「在不在会话里」：agent 没订阅鼠标的会话
++        // （codex、shell）里抓着它，唯一的效果是把终端的拖选复制废掉，
++        // 换来一个 PageUp/PageDown/End 已经能做的滚轮。
++        //
++        // 检查一次三个条件的合取有没有变，而不是在每个能改变它们的分支
++        // 各开关一次——那样的分支太多、太容易漏（上面 `mouse_captured`
+         // 声明处的注释列了几条）。放在 `term.draw` 之前是因为这一轮循环里
+         // 所有会改 `app.view` 的代码（`verify_rx` 收尾、`Screen` 探测发现
+         // 会话已结束……）到这里都已经跑完，此刻的 `app.view` 就是即将画出来
+-        // 的那一帧。
++        // 的那一帧；而且这一轮的 `Screen` 响应已经落进 `app.scroll` 了，
++        // `agent_owns` 就是这一帧的事实。
+         let is_attached = matches!(app.view, View::Attached(_));
+-        if let Some(enable) = mouse_capture_transition(mouse_captured, is_attached) {
++        let want = wants_mouse_capture(is_attached, app.scroll.agent_owns, app.copy_mode);
++        if let Some(enable) = mouse_capture_transition(mouse_captured, want) {
+             let _ = if enable {
+                 execute!(std::io::stdout(), EnableMouseCapture)
+             } else {
+                 execute!(std::io::stdout(), DisableMouseCapture)
+             };
+             mouse_captured = enable;
+         }
+ 
+         term.draw(|f| draw(f, &mut app))?;
+ 
+@@ -1207,37 +1253,59 @@ pub(crate) fn create_session(
+         })
+     });
+     // 只有真建成了才跟着记：守护进程侧也是这条规矩（`daemon.rs` 里
+     // `if r.is_ok()`），建失败的目录不该留下「上次用的是它」。
+     // `remember: false` 是「帮你装 CLI」那条路径开的 shell 会话，守护进程
+     // 不记，这里同样不能记——记了下次按 `n` 会掉进一个命令行。
+     if remember && matches!(r, Ok(Response::Created { .. })) {
+         app.profiles.insert(dir.to_string(), profile.to_string());
+         app.profiles_asked.insert(dir.to_string());
+     }
++    // 复制模式不能从上一个会话粘到这个新建的来——跟 `enter_session` 对应
++    // 位置的注释是同一件事：这里和 `enter_session` 一起，是「进」这一侧
++    // 仅有的两个入口，合起来才盖得住所有会落到 `View::Attached` 的路径
++    // （选择器建会话、密钥验证通过后建会话、`n`/`N` 快速建会话都经这里）。
++    // 不看 `r` 是否真的建成才复位：建失败时调用方本来就不会真的切进
++    // `View::Attached`，复位一次不占谁的便宜，也不用为了「只在成功时」
++    // 再包一层判断。
++    app.copy_mode = false;
+     r
+ }
+ 
+ /// 进一个会话。
+ ///
+ /// 这里**不再**改写任何「当前项目」——它不再是一个字段，而是光标所在的
+ /// 那个组。从别的组进一个会话时，光标本来就已经在那个组里了（不然那一行
+ /// 根本不会被选中），所以既没有什么可改，也没有什么可报告。
+ pub(crate) fn enter_session(app: &mut App, id: u32) {
+     // 会话标题要显示项目名
+     app.need_sessions = true;
+     app.view = View::Attached(id);
+     // 每次「进入」都当成一次全新的观察：`explained_failure` 缓存的是
+     // 「上一次贴在这个会话里时看到的解释」，如果这个会话在用户离开、
+     // 又回来之间恢复过、再坏过一次，缓存里那份还是上上次失败的旧话，
+     // 不清掉的话 `run()` 主循环会以为「问过了」，永远不会去问新的那次。
+     app.explained_failure = None;
++    // 上一个会话的复制模式不能粘到这一个来。**在「进入」这一侧复位**——
++    // 进 `View::Attached` 的路不止一条（看板 Enter、九宫格 Enter、F3 都走
++    // 这个函数，但选择器建会话、密钥验证通过后建会话、`n`/`N` 快速建会话
++    // 走的是 `create_session`，见 `run()` 里鼠标捕获那段注释）。真正撑住
++    // 「复位一次就漏不掉」的不是某一个函数是唯一入口，而是**进的这一侧
++    // 一共只有 `enter_session` 和 `create_session` 两个构造器，合起来盖住
++    // 所有会落到 `View::Attached` 的路径**——这里复位一次，`create_session`
++    // 里再复位一次，两处就覆盖完了。反过来，离开有三条路，其中 Ctrl+Q
++    // 那条走的是 `back_one_level`——一个所有视图共用的纯函数，为这一个
++    // 字段改它的签名不值，所以选在「进」而不是「出」的这几处写。
++    //
++    // 留在看板上的那个 `copy_mode` 是无害的：`wants_mouse_capture` 的第一个
++    // 条件就是「贴在会话里」，不在会话里时它压根不参与判断。
++    app.copy_mode = false;
+     // CONTROLLER RULING：进入会话视图一律落在底部，不管上次离开时翻到
+     // 哪儿了、也不管这一次算不算「换了个尺寸」。
+     //
+     // 原来落地在哪儿全看 `run()` 主循环里那条按 `sent_size` 判断要不要发
+     // `Request::Resize` 的分支——`SessionManager::resize` 顺手把 scroll 归了
+     // 零，于是「回不回底部」变成了一个跟尺寸缓存打不打得上的意外结果：
+     // 切到另一个会话再回来，id 变了，`sent_size` 不匹配，触发 Resize，
+     // 顺带回到底部；按 F2 回看板、什么都没点、又直接 Enter 回同一个会话，
+     // `sent_size` 还对得上，Resize 不发，人就诡异地卡在几十行之前翻到的
+     // 地方——同一个「回来看看」的意图，走两条路给两种结果。
+@@ -1810,21 +1878,25 @@ const ESCAPE_HINT_COLS: u16 = 19;
+ const PROJECT_COLS: u16 = 16;
+ 
+ /// 右段无论如何要留的列数。
+ ///
+ /// 28 = 英文那条滚动提示的完整宽度（`i18n::msg::scrolled_up`，
+ /// "↑ Scrolled up 40 line(s) · press End to jump back down" 缩短之后的版本）。
+ /// 它是右段里唯一「少一个字就没法用」的内容：按键表放不下的键在 `?` 后面
+ /// 找得回来，普通消息还能折行，只有这一句既折不了（整句都是单空格，
+ /// `wrap_help` 只认双空格断点）又必须读全——用户正翻在历史里，这句话是他
+ /// 回到底部的唯一说明。由 `the_way_back_survives_a_narrow_terminal` 盯着。
+-const ACTION_MIN_COLS: u16 = 28;
++///
++/// `pub(crate)`：`i18n.rs` 里 `CopyModeShort` 的守卫测试也要拿它当基准——
++/// 复制模式提示是右段另一条「少一个字就没法用」的内容（全屏唯一写着 F4
++/// 的地方），短文案必须放得进这同一条底线。
++pub(crate) const ACTION_MIN_COLS: u16 = 28;
+ 
+ /// 底栏三段各占多少列（`inner` 是去掉左右边框之后的可用宽度）。
+ ///
+ /// 抽成纯函数是因为这个数要用两遍：一遍算「右段折出几行」（底栏高度按它留），
+ /// 一遍真的切布局。两处各算一次的话，宽度算法一旦分叉，留的行和画的行就对
+ /// 不上，句尾会被静默吃掉。
+ ///
+ /// 让位顺序是**中段先让、左段永不让**：左段是用户卡住时唯一的出路，右段至少
+ /// 得留下那扇 `?` 门。注意这里让的是**终端太窄**，跟「消息/断连提示能不能盖
+ /// 掉中段」是两码事——后者的答案永远是不能，那件事由布局本身保证：消息只画
+@@ -1858,26 +1930,42 @@ fn draw(f: &mut Frame, app: &mut App) {
+     let (bar, style) = if !app.connected {
+         (
+             BarContent::Text(crate::i18n::text(crate::i18n::Key::StaleData, app.lang).to_string()),
+             Style::default().fg(Color::Red),
+         )
+     } else if app.message.text.is_empty() {
+         // 会话视图里，滚动提示是持续状态（「翻到哪儿了」「下面有新内容」），
+         // 按键表是「还能干什么」——两者抢的是同一行，而滚动提示更具体。
+         // 只在 `message` 为空这一支里问它：`message` 优先在外层 if/else
+         // 链上已经保证了（见函数头注释），这里不用重复判断。
+-        let scroll_hint = match &app.view {
++        // 复制模式压过滚动提示：这时候滚轮根本不归 dct 管，那条提示是错的。
++        // 压不过错误消息——外层 if/else 链已经保证了这一点。
++        let hint = match &app.view {
++            View::Attached(_) if app.copy_mode => {
++                // 底栏右段只保证 ACTION_MIN_COLS 列，而这条提示是全屏唯一
++                // 写着 F4 的地方——截掉尾巴等于把用户关在一个看不见也出不去
++                // 的模式里。长文案说清楚「为什么」（鼠标交还给了终端），量
++                // 得下就用；量不下换成放得进 ACTION_MIN_COLS 的短文案，两种
++                // 语言都保证放得下（`copy_mode_short_fits_the_action_floor_in_every_language`）。
++                let long = crate::i18n::text(crate::i18n::Key::CopyMode, app.lang);
++                let chosen = if widgets::display_width(long) <= help_cols {
++                    long
++                } else {
++                    crate::i18n::text(crate::i18n::Key::CopyModeShort, app.lang)
++                };
++                Some(chosen.to_string())
++            }
+             View::Attached(_) => attach::scroll_hint(&app.scroll, app.lang),
+             _ => None,
+         };
+-        match scroll_hint {
+-            Some(hint) => (BarContent::Text(hint), Style::default()),
++        match hint {
++            Some(h) => (BarContent::Text(h), Style::default()),
+             None => (BarContent::Keys(bar_keys(app, help_cols)), Style::default()),
+         }
+     } else if app.message.error {
+         (
+             BarContent::Text(app.message.text.clone()),
+             Style::default().fg(Color::Red),
+         )
+     } else {
+         (BarContent::Text(app.message.text.clone()), Style::default())
+     };
+@@ -2334,20 +2422,49 @@ mod tests {
+ 
+         let r = create_session(&mut app, &dir, "shell", false);
+         assert!(matches!(r, Ok(Response::Created { .. })), "{r:?}");
+ 
+         assert!(
+             app.profiles.is_empty() && app.profiles_asked.is_empty(),
+             "装 CLI 的那个 shell 会话不是用户选的 agent，不该被记住"
+         );
+     }
+ 
++    /// `create_session` 是「进」这一侧另一个构造器（另一个是 `enter_session`，
++    /// 见 `attach::tests::entering_a_session_always_starts_outside_copy_mode`）。
++    /// 选择器建会话、密钥验证通过后建会话、`n`/`N` 快速建会话都经这里落进
++    /// `View::Attached`，`enter_session` 一个都不会经过——如果这里不复位，
++    /// 从一个开着复制模式的会话按 F2 回看板、再按 `n` 新建一个会话，新会话
++    /// 会带着上一个会话的复制模式出生，鼠标捕获照样是关的，而用户不知道
++    /// 为什么鼠标点了没反应。
++    #[test]
++    fn create_session_resets_copy_mode_for_a_freshly_created_session() {
++        use crate::client::Client;
++
++        let (sock, _home) = start_daemon_for_test();
++        let work = tempfile::tempdir().unwrap();
++        let dir = work.path().display().to_string();
++        let mut app = App::new(
++            Client::connect(&sock).unwrap(),
++            work.path().to_path_buf(),
++            crate::i18n::Lang::Zh,
++            sock.clone(),
++            ViewMode::List,
++        );
++        app.copy_mode = true;
++
++        let r = create_session(&mut app, &dir, "shell", false);
++        assert!(matches!(r, Ok(Response::Created { .. })), "前提：{r:?}");
++
++        assert!(!app.copy_mode, "上一个会话的复制模式不能粘到新建的这一个上");
++    }
++
+     /// **建会话只有一个入口。** 三个调用点各记一次缓存的写法撑不住下一个
+     /// 调用点——新加一条建会话的路的人没有任何提示要去补那几行，而漏了之后
+     /// 底栏会安静地承诺一个 `n` 不会开出来的 agent。这条守卫把「别忘了」
+     /// 换成一个编译不过之外的、看得见的红。
+     #[test]
+     fn every_create_goes_through_the_one_helper_that_updates_the_cache() {
+         // 拼出来，免得这条测试自己的源码被下面的扫描数进去
+         let needle = concat!("Request::", "Create");
+         for (name, src) in [
+             ("pick.rs", include_str!("pick.rs")),
+@@ -3634,20 +3751,117 @@ mod tests {
+         term.draw(|f| draw(f, &mut app)).unwrap();
+         let c = buffer_text(term.backend().buffer())
+             .chars()
+             .filter(|c| !c.is_whitespace())
+             .collect::<String>();
+ 
+         assert!(c.contains("已切到某个项目"), "消息该赢，没显示出来：{c}");
+         assert!(!c.contains("按End回到底部"), "滚动提示不该盖过消息：{c}");
+     }
+ 
++    /// 模式看不见就是下一个隐形状态，而这个仓库刚花一整轮改造消灭掉那种东西。
++    #[test]
++    fn copy_mode_says_so_in_the_bar() {
++        use ratatui::backend::TestBackend;
++
++        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
++            let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
++            app.lang = lang;
++            app.copy_mode = true;
++            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
++            term.draw(|f| draw(f, &mut app)).unwrap();
++
++            let bar = bar_text(&term);
++            let hint = crate::i18n::text(crate::i18n::Key::CopyMode, lang);
++            assert!(
++                bar.contains(&hint.replace(' ', "")),
++                "{lang:?} 下底栏要写着复制模式：{bar}"
++            );
++        }
++    }
++
++    /// 优先级：错误消息 > 复制模式 > 滚动提示。
++    ///
++    /// 复制模式压过滚动提示，是因为在复制模式下滚轮根本不归 dct 管，
++    /// 那条提示这时候是错的；而错误消息压过复制模式，是因为出错是一次性的、
++    /// 不说就再也没机会说，复制模式则是个持续状态，下一帧还会写。
++    #[test]
++    fn an_error_beats_copy_mode_which_beats_the_scroll_hint() {
++        use ratatui::backend::TestBackend;
++
++        let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
++        app.copy_mode = true;
++        app.scroll = crate::session::ScrollState {
++            offset: 5,
++            max: 100,
++            ..Default::default()
++        };
++        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
++
++        term.draw(|f| draw(f, &mut app)).unwrap();
++        let hint = crate::i18n::text(crate::i18n::Key::CopyMode, app.lang);
++        assert!(
++            bar_text(&term).contains(&hint.replace(' ', "")),
++            "复制模式压过滚动提示"
++        );
++
++        app.message = Msg::err("出事了".into());
++        term.draw(|f| draw(f, &mut app)).unwrap();
++        assert!(bar_text(&term).contains("出事了"), "错误消息压过复制模式");
++    }
++
++    /// 80 是我们支持的最窄终端，右段只有 39 列，而 `wrap_help` 不拆单空格的
++    /// 句子——写长了不会折行，会被 `Paragraph` 悄悄切掉尾巴。两种语言都要
++    /// 在这个宽度下把复制模式的提示完整放出来，一个字都不能少。
++    #[test]
++    fn copy_mode_hint_survives_eighty_columns_in_both_languages() {
++        use ratatui::backend::TestBackend;
++
++        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
++            let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
++            app.lang = lang;
++            app.copy_mode = true;
++            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
++            term.draw(|f| draw(f, &mut app)).unwrap();
++
++            let bar = bar_text(&term);
++            let hint = crate::i18n::text(crate::i18n::Key::CopyMode, lang);
++            assert!(
++                bar.contains(&hint.replace(' ', "")),
++                "{lang:?} 在 80 列下要完整显示复制模式提示，不能被切掉尾巴：{bar}"
++            );
++        }
++    }
++
++    /// 60 是 `grid::MIN_COLS`，一个受支持的宽度、也是常见的 tmux 分屏宽度。
++    /// 这里右段只剩 `ACTION_MIN_COLS`（28）列，长文案放不下，必须换成短文案
++    /// ——而短文案本身也必须完整出现，不能被 `Paragraph` 悄悄切掉尾巴。
++    #[test]
++    fn copy_mode_short_hint_survives_sixty_columns_in_both_languages() {
++        use ratatui::backend::TestBackend;
++
++        for lang in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
++            let (mut app, _d) = app_with_one_agent_session(View::Attached(1));
++            app.lang = lang;
++            app.copy_mode = true;
++            let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
++            term.draw(|f| draw(f, &mut app)).unwrap();
++
++            let bar = bar_text(&term);
++            let short = crate::i18n::text(crate::i18n::Key::CopyModeShort, lang);
++            assert!(
++                bar.contains(&short.replace(' ', "")),
++                "{lang:?} 在 60 列下要完整显示复制模式的短文案：{bar}"
++            );
++        }
++    }
++
+     /// F6 回归测试：英文滚动提示走的是 `BarContent::Text`，`wrap_help`
+     /// 只在连续两个空格的地方才折行，而这句提示全是单空格，放不下就不是
+     /// 折行，是被 `Paragraph`（没挂 `.wrap()`）直接从右边截断。原来的
+     /// "↑ Scrolled up 40 line(s) · press End to jump back down" 有 54 列，
+     /// 底栏右段宽度是「终端总宽 − 23」，55 列的终端只有 32 列可用——刚好
+     /// 卡在「怎么回去」那半句中间，`End` 整个词被截没了：这个宽度算出的
+     /// 切点（`old[:32]`）落在 "press " 之后、"End" 之前，用户会看到自己
+     /// 正翻着历史，却读不到任何一个字告诉他怎么回去。缩短后的新版本
+     /// （28 列）在同样的宽度下完整放得下。
+     #[test]
+@@ -3681,11 +3895,87 @@ mod tests {
+     /// 动一下捕获」这个判断能测——`run()` 每帧都靠它决定要不要发
+     /// `EnableMouseCapture`/`DisableMouseCapture`，判断错了要么漏开
+     /// （滚轮/点击走了终端自己的逻辑）要么漏关（退回看板还拖选不了文字）。
+     #[test]
+     fn mouse_capture_toggles_only_on_a_real_transition() {
+         assert_eq!(mouse_capture_transition(false, false), None);
+         assert_eq!(mouse_capture_transition(true, true), None);
+         assert_eq!(mouse_capture_transition(false, true), Some(true));
+         assert_eq!(mouse_capture_transition(true, false), Some(false));
+     }
++
++    /// 三个条件的真值表，八种组合全列。
++    ///
++    /// 穷举而不是挑几个代表：这个函数错一格的后果是「用户在会话里复制不了」
++    /// 或者「agent 收不到它订阅的鼠标」，两种都不会 panic、不会报错，只会让人
++    /// 觉得工具坏了却说不清哪儿坏。八行断言比一句「应该没问题」便宜得多。
++    #[test]
++    fn mouse_is_captured_only_when_all_three_conditions_hold() {
++        // attached, agent_subscribed, copy_mode -> want
++        assert!(wants_mouse_capture(true, true, false));
++        assert!(!wants_mouse_capture(true, true, true), "复制模式一票否决");
++        assert!(
++            !wants_mouse_capture(true, false, false),
++            "agent 不要鼠标就别抓——抓了用户就白白丢了拖选复制"
++        );
++        assert!(!wants_mouse_capture(true, false, true));
++        assert!(!wants_mouse_capture(false, true, false), "看板上永远不抓");
++        assert!(!wants_mouse_capture(false, true, true));
++        assert!(!wants_mouse_capture(false, false, false));
++        assert!(!wants_mouse_capture(false, false, true));
++    }
++
++    /// 断连（或者这一轮压根没拿到 `Response::Screen`）时，`app.scroll`
++    /// 必须原样保留上一帧的值，不能被复位——复位会让 `wants_mouse_capture`
++    /// 在断连的每一帧里反复翻转捕获状态，那是往 stdout 反复写转义序列，
++    /// 断连时这是最吵的一种失败。
++    ///
++    /// 这里直接喂 `scroll_after_screen_call` 一个 `Err`，断言拿回来的就是
++    /// 传进去的 `previous`。早先这个位置放的是一个只会通过的假测试：它把
++    /// `app.connected` 设成 `false`——一个 `wants_mouse_capture` 根本不读
++    /// 的字段——然后拿完全相同的参数把同一个纯函数又调用了一遍；任何确定性
++    /// 函数在这种写法下都必然通过，哪怕 `run()` 的断连分支真被改成把
++    /// `app.scroll` 复位成 `Default`（这正是它宣称要防住的回归），那个
++    /// 测试也照样是绿的。抽出 `scroll_after_screen_call` 就是为了让这条
++    /// 属性能被真正测到：破坏它的实现（比如把 `_ => previous` 改成
++    /// `_ => crate::session::ScrollState::default()`），这个测试会红。
++    #[test]
++    fn a_failed_screen_call_does_not_flip_the_capture_state() {
++        let previous = crate::session::ScrollState {
++            agent_owns: true,
++            max: 10,
++            offset: 3,
++            ..Default::default()
++        };
++        let failed: Result<Response> = Err(anyhow::anyhow!("daemon unreachable"));
++
++        assert_eq!(scroll_after_screen_call(previous, &failed), previous);
++    }
++
++    /// 反过来：请求真的成功时，`scroll` 必须换成新的一份，不能沿用旧的。
++    /// 跟上一条测试各守一半——少了这一条，把 `scroll_after_screen_call`
++    /// 整个写成 `|previous, _| previous` 也能让「断连不翻转」那条测试通过。
++    #[test]
++    fn a_successful_screen_call_replaces_the_scroll_state() {
++        let previous = crate::session::ScrollState::default();
++        let fresh = crate::session::ScrollState {
++            agent_owns: true,
++            max: 10,
++            offset: 3,
++            ..Default::default()
++        };
++        let ok: Result<Response> = Ok(Response::Screen {
++            lines: Vec::new(),
++            cursor: (0, 0),
++            state: SessionState::Idle,
++            scroll: fresh,
++        });
++
++        assert_eq!(scroll_after_screen_call(previous, &ok), fresh);
++    }
++
++    #[test]
++    fn a_fresh_app_is_not_in_copy_mode() {
++        let (app, _d) = App::test_app();
++        assert!(!app.copy_mode);
++    }
+ }

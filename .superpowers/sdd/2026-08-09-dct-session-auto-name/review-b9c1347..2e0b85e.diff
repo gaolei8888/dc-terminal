@@ -1,0 +1,573 @@
+# Review package: b9c1347..2e0b85e
+
+## Commits
+2e0b85e docs: record the fix-3 brief and report for the board list coverage gap
+6f8b2ab test: cover the board list's name/activity column arithmetic
+
+## Files changed
+ .../fix-3-brief.md                                 |  76 ++++++
+ .../fix-3-report.md                                | 263 +++++++++++++++++++++
+ src/ui/board.rs                                    | 163 +++++++++++++
+ 3 files changed, 502 insertions(+)
+
+## Diff
+diff --git a/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-3-brief.md b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-3-brief.md
+new file mode 100644
+index 0000000..8d2a9f7
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-3-brief.md
+@@ -0,0 +1,76 @@
++# Fix 3 — 看板列表对这个功能零测试覆盖
++
++来源：`final-review-report.md` 的 Finding 6（Important，四条合并阻塞项之一）。
++**这是四条里最大的一个洞，而且盖的正是 README 首要宣传的那个界面。**
++
++**文件：** `src/ui/board.rs:211,214`。
++
++## 现状
++
++分支把看板的会话行从
++
++```
++pad_to(&s.profile, 10)  +  truncate(&s.activity, 76)
++```
++
++改成了
++
++```
++pad_to(&truncate(session_label(s), 15), 16)  +  truncate(&s.activity, 70)
++```
++
++也就是**从 activity 那里挪了 6 列给名字**。
++
++## 四个变异，一个测试都没红
++
++| 变异 | 结果 |
++|---|---|
++| `session_label(s)` → `s.profile`（**列表永远不显示名字**） | 无测试失败 |
++| 删掉 `truncate(…, 15)` | 无测试失败 |
++| 删掉 `pad_to(…, 16)` | 无测试失败 |
++| activity 的 `70` 改回 `76`（**列预算被破坏**） | 无测试失败 |
++
++README 明确承诺名字会出现在「会话列表」里。**没有任何东西钉住这一点**，
++分支重写的那套列算术也没有。
++
++## 算术本身是对的（不要改它，只要盖住它）
++
++`truncate(s, 15)` 返回**至多 15 个显示列**，或者在真的发生截断时**正好 16 列**
++（`…` 是在宽度检查**之后**追加的），所以 `pad_to(…, 16)` 得到的正好是 16，
++行总宽保持 `8 + 16 + 70` 不变。
++
++**这个推理已经过评审确认成立。** 本条任务是给它加守卫，不是改它。
++如果你在核对时发现这个推理有问题，**先在报告里说清楚再动手**，不要默默改掉。
++
++## 要改什么
++
++加看板行的测试：
++
++1. **一条断言名字被画出来、而 profile 没有**
++   —— 这条直接杀掉「`session_label(s)` → `s.profile`」那个变异
++2. **一条断言 24 字符的名字不会把 activity 列挤歪**
++   —— 这条杀掉截断、补齐、以及 70/76 那三个变异
++
++## 测试要求
++
++四个变异**每一个都要有测试杀掉它**。改完之后**逐个亲手验证**：
++把变异改进去、跑测试、确认变红、改回来。**这就是本条任务的验收标准。**
++
++`src/ui/board.rs:266` 已经有一个 `TestBackend` + `screen_text()` 的测试设施
++（读 `cell.symbol()`，只过滤空白），照它的样子写，不要另起一套。
++
++## 全局约束
++
++- **本简报里的算术来自评审报告，不是权威。** 动手前自己把
++  `truncate`、`pad_to`、`session_label`（都在 `src/ui/widgets.rs`）读一遍核对。
++  上一条修复里，简报的一个前提就是错的，是评审抓出来的。
++- 已知陷阱（上一轮 ledger 记的）：**那六个命名测试在负载下退化成「假绿」而不是
++  「假红」** —— 它们需要一个 tick 落进 0.2 秒的窗口，而轮询间隔是 50ms。
++  **新写的测试不要依赖同样的时序**，看板渲染测试应当是纯同步的。
++- **本条任务只加测试，不改产品代码**（除非核对时发现算术真有问题，
++  那种情况先报告）。
++- 每个用户能看到的字符串写给没编过程序的人。
++- key 处理分支里永远不要 `continue`（`board.rs` 顶上有这条注释）。
++- **不用 emoji 当图标。**
++- 提交信息用英文，**不要 AI 署名行**。
++- 收尾跑：`cargo test -- --test-threads=1`、`cargo fmt --check`、`cargo clippy --all-targets`。
+diff --git a/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-3-report.md b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-3-report.md
+new file mode 100644
+index 0000000..74a980b
+--- /dev/null
++++ b/.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-3-report.md
+@@ -0,0 +1,263 @@
++# Fix 3 report — board list gets test coverage for session naming
++
++Brief: `.superpowers/sdd/2026-08-09-dct-session-auto-name/fix-3-brief.md`
++Target: `src/ui/board.rs:211,214`, the session-row line built by
++`pad_to(&truncate(session_label(s), 15), 16) + truncate(&s.activity, 70)`.
++
++Scope discipline: only tests were added. No production code line changed
++(the four "mutations" below were introduced and reverted by hand during
++verification, never left in place).
++
++## Independent check of the brief's column arithmetic
++
++I read `truncate`, `pad_to`, and `session_label` in `src/ui/widgets.rs`
++(lines 127–204) directly before writing any test, per the brief's own
++instruction not to trust its arithmetic blindly.
++
++```rust
++pub(crate) fn truncate(s: &str, max: usize) -> String {
++    let mut w = 0;
++    let mut out = String::new();
++    for ch in s.chars() {
++        if ch.is_control() { continue; }
++        let cw = char_width(ch);
++        if w + cw > max {
++            out.push('…');
++            return out;
++        }
++        w += cw;
++        out.push(ch);
++    }
++    out
++}
++
++pub(crate) fn pad_to(s: &str, width: usize) -> String {
++    let mut out = s.to_string();
++    out.push_str(&" ".repeat(width.saturating_sub(display_width(s))));
++    out
++}
++```
++
++**The brief's summary is a simplification, not a bug.** It says
++`truncate(s, 15)` returns "at most 15 columns, or exactly 16 when
++truncation actually happens." That second half is only true when the
++running width `w` happens to reach exactly `max` (15) right before the
++character that triggers truncation — e.g. 15 one-column ASCII characters
++followed by more input. If the trigger fires earlier (for example a
++two-column CJK character pushes `w` from 14 straight past 15), `truncate`
++returns `w + 1 = 15` columns, not 16. I confirmed this with a scratch
++case: `truncate("A".repeat(14) + "一...", 15)` yields 15 display columns,
++not 16.
++
++This does **not** invalidate the brief's conclusion. The property that
++actually matters for the row layout is the *composition* of `truncate`
++and `pad_to`, not `truncate` alone:
++
++- `truncate(s, 15)` output width is always **≤ 16** (proof: without
++  truncation it's `display_width(s) ≤ 15`; with truncation it's
++  `w + 1` where `w ≤ 15`, so `≤ 16`).
++- `pad_to(x, 16)` pads any `x` with `display_width(x) < 16` up to
++  exactly 16, and is a no-op when `display_width(x) ≥ 16` (guarded by
++  `saturating_sub`).
++- Since `truncate`'s output is always ≤ 16, `pad_to(..., 16)` always
++  either pads it up to exactly 16, or leaves it at exactly 16 (the
++  boundary case). **The field is always exactly 16 columns after
++  `pad_to`, regardless of whether `truncate` alone produced 15 or 16.**
++
++So: arithmetic is correct, `pad_to` is not redundant in every truncation
++case (it can still be adding a column in the CJK-boundary case), and the
++brief's directive to guard the composed invariant rather than rewrite it
++stands. I did not change `truncate`, `pad_to`, or `session_label`.
++
++`session_label` (widgets.rs:198–204) is a plain "tag if non-empty, else
++profile" fallback — no surprises there.
++
++## Test harness note
++
++`board.rs:266`'s `screen_text()` helper strips all whitespace before
++comparing, which is exactly right for "did this text render" checks but
++structurally **cannot** detect a missing `pad_to` — removing padding only
++changes how many blank cells separate two pieces of content, and blank
++cells vanish under `screen_text`'s own whitespace filter. To kill that
++mutation I added two small helpers in the same test module:
++
++- `row_with(term, marker)` — same `TestBackend`/`buf.cell()` mechanics as
++  `screen_text`, but returns one row **unfiltered** (spaces preserved),
++  so column positions survive.
++- `cols_between(row, from_marker, to_marker)` — locates two ASCII markers
++  in that row and returns the **display width** (via
++  `unicode_width::UnicodeWidthStr::width`, not byte length) of the slice
++  between them. Byte length would be wrong here because `…` and CJK
++  characters are multi-byte in UTF-8 while being 1–2 display columns;
++  I hit this mismatch once while drafting the test and switched to
++  `UnicodeWidthStr` to fix it.
++
++Both helpers reuse the existing `TestBackend` + `term.draw()` +
++`buf.cell()` idiom; they don't introduce a second test infrastructure.
++
++## Tests added (`src/ui/board.rs`, in `mod tests`)
++
++1. `the_session_row_shows_the_name_not_the_profile`
++2. `a_short_name_is_padded_out_to_the_full_sixteen_columns`
++3. `an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget`
++4. `the_activity_column_still_truncates_at_seventy_not_seventy_six`
++
++All four are purely synchronous (`App::test_app()` → `set_sessions()` →
++`term.draw()`, no tick/sleep/poll), per the ledger's warning about the
++six existing naming tests that degrade to false greens under a 50 ms
++poll racing a 0.2 s window.
++
++## Mutation kill table
++
++Each mutation was introduced by hand with `Edit`, verified red with
++`cargo test --lib ui::board::tests::<name> -- --test-threads=1`, then
++reverted and verified `git diff` was byte-identical to before the
++mutation (clean revert, no drift) before moving to the next one.
++
++| # | Mutation | Test that kills it | Observed red output (assertion line) |
++|---|---|---|---|
++| 1 | `session_label(s)` → `s.profile` (list never shows the name) | `the_session_row_shows_the_name_not_the_profile` | `assertion failed: c.contains("改登录页文案")` — `会话行必须画出名字` — the tag never reached the screen because the name field rendered `s.profile` ("claude") instead. |
++| 2 | delete `truncate(…, 15)` | `an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget` | `assertion \`left == right\` failed` — `left: 20, right: 16` — the untruncated 20-column tag pushed the activity marker 4 columns further right than the 16-column budget allows. |
++| 3 | delete `pad_to(…, 16)` | `a_short_name_is_padded_out_to_the_full_sixteen_columns` | `assertion \`left == right\` failed` — `left: 4, right: 16` — a 4-column tag with no padding left the activity marker sitting right after it instead of at column 16. |
++| 4 | activity `70` → `76` | `the_activity_column_still_truncates_at_seventy_not_seventy_six` | `assertion failed: !c.contains("MARK")` — the `MARK` marker (columns 71–74 of the activity string) became visible once the truncate budget widened enough to include it. |
++
++Full transcripts of each red run are below (commands run from
++`/Users/lei/work/dc/dc-terminal`, `cargo` on PATH via `source
++"$HOME/.cargo/env"`).
++
++### Mutation 1 — `session_label(s)` → `&s.profile`
++
++```
++$ sed -i '' '211s/truncate(session_label(s), 15)/truncate(\&s.profile, 15)/' src/ui/board.rs
++$ cargo test --lib ui::board::tests::the_session_row_shows_the_name_not_the_profile -- --test-threads=1
++...
++test ui::board::tests::the_session_row_shows_the_name_not_the_profile ... FAILED
++thread '...' panicked at src/ui/board.rs:399:9:
++会话行必须画出名字：┌dct会话看板...││▶┃1▾proj/var/folders/4t/…claude×1││┃1空闲claude│││...
++test result: FAILED. 0 passed; 1 failed
++```
++Reverted (`cp` from a pre-mutation backup); `diff` against the backup was
++empty afterward.
++
++### Mutation 2 — delete `truncate(…, 15)`
++
++```
++$ # line 211 changed to: pad_to(session_label(s), 16)
++$ cargo test --lib ui::board::tests::an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget -- --test-threads=1
++...
++test ui::board::tests::an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget ... FAILED
++thread '...' panicked at src/ui/board.rs:458:9:
++assertion `left == right` failed: `LONGNAME…` 到 `ACTV_TAIL` 应该正好隔 16 列；删掉 `truncate` 的话整条 20 列的 tag 会原样画出来，这里会变成 20："│  ┃    1  空 闲     LONGNAMEXXXXXXXXXXXXACTV_TAIL ...│"
++  left: 20
++ right: 16
++test result: FAILED. 0 passed; 1 failed
++```
++Reverted; diff empty.
++
++### Mutation 3 — delete `pad_to(…, 16)`
++
++```
++$ # line 211 changed to: truncate(session_label(s), 15).to_string()
++$ cargo test --lib ui::board::tests::a_short_name_is_padded_out_to_the_full_sixteen_columns -- --test-threads=1
++...
++test ui::board::tests::a_short_name_is_padded_out_to_the_full_sixteen_columns ... FAILED
++thread '...' panicked at src/ui/board.rs:429:9:
++assertion `left == right` failed: `NAME` 到 `ACTV_TAIL` 应该正好隔 16 列（`pad_to` 补齐的宽度）；删掉 `pad_to` 的话这里会变成 4（tag 自己的宽度，一点没补）："│  ┃    1  空 闲     NAMEACTV_TAIL ...│"
++  left: 4
++ right: 16
++test result: FAILED. 0 passed; 1 failed
++```
++Reverted; diff empty.
++
++### Mutation 4 — activity `70` → `76`
++
++```
++$ # line 214 changed to: truncate(&s.activity, 76)
++$ cargo test --lib ui::board::tests::the_activity_column_still_truncates_at_seventy_not_seventy_six -- --test-threads=1
++...
++test ui::board::tests::the_activity_column_still_truncates_at_seventy_not_seventy_six ... FAILED
++thread '...' panicked at src/ui/board.rs:490:9:
++70 列预算下 MARK 连一个字都不该露出来；如果预算被改回 76，MARK 会整个冒出来：┌dct会话看板...││▶┃1▾proj/var/folders/4t/…claude×1││┃1空闲claudeAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMARK│││...
++test result: FAILED. 0 passed; 1 failed
++```
++Reverted; diff empty (`diff /tmp/board.rs.bak src/ui/board.rs` printed
++nothing after the final revert, confirming a clean return to the
++committed-to-be-committed source).
++
++All four mutations are dead. None survived.
++
++## Final verification commands and output tails
++
++Targeted board tests, real (unmutated) code:
++
++```
++$ cargo test --lib ui::board:: -- --test-threads=1
++running 19 tests
++test ui::board::tests::a_group_header_calls_out_how_many_sessions_failed ... ok
++test ui::board::tests::a_group_whose_folder_is_gone_says_so_instead_of_vanishing ... ok
++test ui::board::tests::a_long_cjk_project_name_never_pushes_the_failure_count_off_screen ... ok
++test ui::board::tests::a_short_name_is_padded_out_to_the_full_sixteen_columns ... ok
++test ui::board::tests::a_tag_with_control_bytes_never_reaches_the_rendered_buffer ... ok
++test ui::board::tests::an_empty_project_names_the_agent_it_last_used ... ok
++test ui::board::tests::an_empty_project_with_no_recorded_agent_says_only_what_it_knows ... ok
++test ui::board::tests::an_over_long_agent_name_is_cut_visibly_not_by_the_border ... ok
++test ui::board::tests::an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget ... ok
++test ui::board::tests::collapsing_a_group_hides_its_sessions_and_keeps_the_cursor_on_the_header ... ok
++test ui::board::tests::digits_go_straight_to_a_project_and_ignore_the_ones_that_are_not_there ... ok
++test ui::board::tests::enter_on_a_group_header_does_nothing ... ok
++test ui::board::tests::entering_a_session_never_announces_a_project_change ... ok
++test ui::board::tests::g_enters_the_grid_focused_on_the_selected_session ... ok
++test ui::board::tests::no_builtin_agent_name_is_wider_than_the_header_budget_allows ... ok
++test ui::board::tests::tab_jumps_to_the_next_project_and_wraps ... ok
++test ui::board::tests::the_activity_column_still_truncates_at_seventy_not_seventy_six ... ok
++test ui::board::tests::the_board_groups_every_session_under_its_own_project ... ok
++test ui::board::tests::the_session_row_shows_the_name_not_the_profile ... ok
++
++test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 679 filtered out; finished in 0.04s
++```
++
++Full suite, single-threaded (as required — the ledger's six naming tests
++are timing-sensitive under parallel load):
++
++```
++$ cargo test -- --test-threads=1
++...
++Running unittests src/lib.rs ...
++test result: ok. 698 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.13s
++...
++Running tests/grid_reply.rs (target/debug/deps/grid_reply-a0dfc86024059b18)
++running 2 tests
++test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.96s
++...
++[15 more integration-test binaries, all "test result: ok", 0 failed]
++$ echo $?
++0
++```
++17 `test result:` blocks total, all green, exit 0. `grid_reply.rs` — the
++one the ledger flagged as flaky under parallel load — passed cleanly
++here running serially; no re-run in isolation was needed.
++
++Formatting and lints:
++
++```
++$ cargo fmt --check
++(no output, exit 0)
++
++$ cargo clippy --all-targets
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
++(no warnings, exit 0)
++
++$ git diff --check -- src/ui/board.rs
++(no output, exit 0)
++```
++
++## Diff summary
++
++`src/ui/board.rs`: +163 lines, 0 deletions — test-only, matches the
++brief's "only add tests" constraint. No other file touched by this task.
++
++## Concerns
++
++None. All four named mutations are killed, the brief's arithmetic holds
++(with the one clarification above, which changes no conclusion), and the
++full suite plus fmt/clippy are clean.
+diff --git a/src/ui/board.rs b/src/ui/board.rs
+index 29bb814..302f464 100644
+--- a/src/ui/board.rs
++++ b/src/ui/board.rs
+@@ -268,20 +268,47 @@ mod tests {
+         let a = buf.area;
+         (0..a.height)
+             .flat_map(|y| (0..a.width).map(move |x| (x, y)))
+             .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+             .collect::<String>()
+             .chars()
+             .filter(|c| !c.is_whitespace())
+             .collect()
+     }
+ 
++    /// 找到屏幕上包含 `marker` 的那一行，**原样返回，不过滤空白**——跟
++    /// `screen_text` 反着来：那边为了好比对内容才把空白洗掉，这里恰恰是要
++    /// 保留 `pad_to` 补的空格和它们的列位置，不然量不出两个记号之间隔了
++    /// 几列。给下面几条守 `board.rs:211` 列算术的测试用。
++    fn row_with(term: &Terminal<TestBackend>, marker: &str) -> String {
++        let buf = term.backend().buffer();
++        let a = buf.area;
++        (0..a.height)
++            .map(|y| {
++                (0..a.width)
++                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
++                    .collect::<String>()
++            })
++            .find(|row| row.contains(marker))
++            .unwrap_or_else(|| panic!("没有任何一行画出了记号 {marker:?}"))
++    }
++
++    /// 两个记号之间（含 `from_marker` 自己）隔了几**列**。必须用显示宽度量，
++    /// 不能用字节数或字符数：`row.find` 给的是字节偏移，`…`/CJK 在 UTF-8
++    /// 里是多字节，字节差和真实列差对不上——这个坑不是抄来的，是写这几条
++    /// 测试时自己踩出来的。
++    fn cols_between(row: &str, from_marker: &str, to_marker: &str) -> usize {
++        let from = row.find(from_marker).unwrap();
++        let to = row.find(to_marker).unwrap();
++        unicode_width::UnicodeWidthStr::width(&row[from..to])
++    }
++
+     /// **核心回归测试，钉在渲染出的 buffer 这一层**（`fix-1-brief.md`
+     /// 明确要的层级——见 `fix-1-report.md` 里对第一轮 review 的回应）。
+     ///
+     /// `session::tests` 里同名意图的测试断言的是 `SessionInfo.tag`，那是
+     /// 渲染的**输入**，不是渲染的**结果**：`tag` 是 `#[serde(default)]`
+     /// 的 JSON 字段，跨守护进程↔界面的 socket 走（见 `SessionInfo::tag`
+     /// 自己的文档），一个连着**旧守护进程**的新界面——这是本仓库里
+     /// 记录在案、会反复发生的组合——会原样拿到旧守护进程从来没洗过的
+     /// `tag`。`session.rs` 那道 `sanitize` 过滤完全长在守护进程一侧，
+     /// 界面这边没有第二道防线；这条测试才是真正验证「就算界面拿到一个
+@@ -324,20 +351,156 @@ mod tests {
+         assert!(
+             !c.chars().any(|ch| ch.is_control()),
+             "控制字符穿透渲染，落进了 buffer：{c:?}"
+         );
+         assert!(
+             c.contains("[Afix"),
+             "标签清洗剩下的可见部分应该照样画在屏幕上，不能连内容一起被吞掉：{c:?}"
+         );
+     }
+ 
++    // 下面四条测的是 `board.rs:211` 那句 `pad_to(&truncate(session_label(s),
++    // 15), 16)` 自己——把 profile 那 10 列压到 6 列腾给名字之后，看板列表
++    // 对这套算术一条测试都没有（fix-3-brief.md，`final-review-report.md`
++    // Finding 6）。四个变异各配一条：
++    //   ① session_label(s) → s.profile         → the_session_row_shows_the_name_not_the_profile
++    //   ② 删掉 truncate(…, 15)                  → an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget
++    //   ③ 删掉 pad_to(…, 16)                    → a_short_name_is_padded_out_to_the_full_sixteen_columns
++    //   ④ activity 的 70 改回 76                → the_activity_column_still_truncates_at_seventy_not_seventy_six
++    // 算术本身（fix-3-brief.md 的核对）：`truncate(s, 15)` 在真的截断时输出
++    // 的宽度**不总是**正好 16——brief 里那句话只在「触发截断前累计宽度恰好
++    // 撞满 15」时成立（比如 15 个纯 ASCII 字符打头的输入）；如果触发点提前
++    // （例如宽字符让预算在 14 就跳空），输出可能只有 15 列。这不是产品代码的
++    // bug：`pad_to(…, 16)` 兜的就是这个差——不管 `truncate` 吐出 15 还是 16，
++    // `pad_to` 都会把它填满到 16，所以「这一列最终总是 16 列宽」这个不变量
++    // 依然成立，brief 的结论（算术是对的、只需要盖住它）没有问题，只是它对
++    // `truncate` 单独产出宽度的描述略有简化。下面四条测的正是这个组合后的
++    // 不变量，不依赖 `truncate` 单独的输出宽度是 15 还是 16。
++
++    /// **杀变异①**：`session_label(s)` 被换成 `s.profile`。
++    ///
++    /// 组头本来就会用 `s.profile` 报一句「这个项目里有几个 claude」
++    /// （`agent_counts()`，跟 tag 完全无关），所以单看「屏幕上有没有出现
++    /// `claude`」测不出这个变异——不管名字列画的是 tag 还是 profile，
++    /// `claude` 反正都会因为组头而出现一次。真正能分开两者的是**出现了
++    /// 几次**：名字列如果也被换成 profile，`claude` 就会在组头之外再多冒
++    /// 一次。
++    #[test]
++    fn the_session_row_shows_the_name_not_the_profile() {
++        let (mut app, dir) = App::test_app();
++        let proj = real_dir(&dir, "proj");
++        let mut s = sess(1, &proj);
++        s.tag = "改登录页文案".into(); // 6 个汉字 = 12 列，落在 15 列预算内，不会被截
++        app.set_sessions(vec![s]);
++
++        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
++        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++
++        let c = screen_text(&term);
++        assert!(c.contains("改登录页文案"), "会话行必须画出名字：{c}");
++        assert_eq!(
++            c.matches("claude").count(),
++            1,
++            "claude 只该在组头的 agent 统计里出现一次；如果名字列被换回 s.profile，\
++             这里会变成 2：{c}"
++        );
++    }
++
++    /// **杀变异③**：`pad_to(…, 16)` 被删掉。
++    ///
++    /// 名字比 15 列窄时 `truncate` 根本不会触发省略号，输出原样就是 tag
++    /// 本身——这时候把这一列撑到 16 列全靠 `pad_to`。`screen_text` 会把
++    /// 空白过滤掉，补没补空格从它的输出里看不出来；这里改用 `row_with` 保留
++    /// 原始列位置，直接量「名字」到「activity」之间隔了几列。
++    #[test]
++    fn a_short_name_is_padded_out_to_the_full_sixteen_columns() {
++        let (mut app, dir) = App::test_app();
++        let proj = real_dir(&dir, "proj");
++        let mut s = sess(1, &proj);
++        s.tag = "NAME".into(); // 4 列，纯 ASCII——不会触发截断，量起来没有歧义
++        s.activity = "ACTV_TAIL".into();
++        app.set_sessions(vec![s]);
++
++        // 200 列：给 activity 留足空间，不让右边框在这条测试里掺和进来——
++        // 这条测的是 `pad_to` 补没补，不是右边框裁没裁。
++        let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
++        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++
++        let row = row_with(&term, "ACTV_TAIL");
++        assert_eq!(
++            cols_between(&row, "NAME", "ACTV_TAIL"),
++            16,
++            "`NAME` 到 `ACTV_TAIL` 应该正好隔 16 列（`pad_to` 补齐的宽度）；\
++             删掉 `pad_to` 的话这里会变成 4（tag 自己的宽度，一点没补）：{row:?}"
++        );
++    }
++
++    /// **杀变异②**：`truncate(…, 15)` 被删掉。
++    ///
++    /// tag 给到 20 列（全 ASCII，量起来没有 CJK 的歧义）。真按 15 列截的话，
++    /// 触发点正好撞在预算撑满的那一刻（15 个单列字符），输出是「15 个字符 +
++    /// 一个省略号」= 16 列，`pad_to` 这时候是空操作。删掉 `truncate` 之后
++    /// 整条 tag（20 列）原样画出来，`pad_to` 的目标 16 又补不了负数，名字列
++    /// 直接涨到 20 列——`LONGNAME` 记号到 `ACTV_TAIL` 记号之间的列数就是能不能
++    /// 抓住这个变异的地方。
++    #[test]
++    fn an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget() {
++        let (mut app, dir) = App::test_app();
++        let proj = real_dir(&dir, "proj");
++        let mut s = sess(1, &proj);
++        s.tag = format!("LONGNAME{}", "X".repeat(12)); // 20 列
++        s.activity = "ACTV_TAIL".into();
++        app.set_sessions(vec![s]);
++
++        let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
++        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++
++        let row = row_with(&term, "ACTV_TAIL");
++        assert_eq!(
++            cols_between(&row, "LONGNAME", "ACTV_TAIL"),
++            16,
++            "`LONGNAME…` 到 `ACTV_TAIL` 应该正好隔 16 列；删掉 `truncate` 的话\
++             整条 20 列的 tag 会原样画出来，这里会变成 20：{row:?}"
++        );
++    }
++
++    /// **杀变异④**：activity 的截断预算从 70 被改回 76。
++    ///
++    /// 造一条 74 列长的 activity（70 个 `A` 紧跟着记号 `MARK`）：预算是 70
++    /// 的话，第 71 列就会撞上截断，`MARK` 连一个字都露不出来；预算一旦变成
++    /// 76，前 74 列全放得下，`MARK` 会整个冒出来。「`MARK` 在不在屏幕上」
++    /// 直接就是「预算是不是 70」的答案，不用量列。
++    #[test]
++    fn the_activity_column_still_truncates_at_seventy_not_seventy_six() {
++        let (mut app, dir) = App::test_app();
++        let proj = real_dir(&dir, "proj");
++        let mut s = sess(1, &proj);
++        s.activity = format!("{}MARK", "A".repeat(70));
++        app.set_sessions(vec![s]);
++
++        // 200 列：activity 自己的 70 列预算不该被右边框提前掐断，
++        // 这条测的是 `truncate` 里的数字，不是终端宽度。
++        let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
++        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
++
++        let c = screen_text(&term);
++        assert!(
++            c.contains(&"A".repeat(70)),
++            "70 个 A 应该都画出来了，不然下面「MARK 不在」的断言就是空的：{c}"
++        );
++        assert!(
++            !c.contains("MARK"),
++            "70 列预算下 MARK 连一个字都不该露出来；如果预算被改回 76，\
++             MARK 会整个冒出来：{c}"
++        );
++    }
++
+     /// 用户报的症状一：底栏写着「当前项目：dc-terminal」，看板却列着
+     /// dc_desktop 的会话。答案不再是「把别的项目藏起来」，而是**分组**：
+     /// 两个项目都在屏幕上，各自的会话待在自己的组头底下，谁属于谁一眼可见。
+     #[test]
+     fn the_board_groups_every_session_under_its_own_project() {
+         let (mut app, dir) = App::test_app();
+         // 组头上的 agent 统计只在目录真的还在时才画（不在就换成
+         // 「目录不在了」），所以这两个项目必须是磁盘上真实存在的目录。
+         let one = real_dir(&dir, "dc-terminal");
+         let two = real_dir(&dir, "dc_desktop");

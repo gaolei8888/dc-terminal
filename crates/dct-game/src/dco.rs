@@ -1,9 +1,72 @@
 //! 连本机 dco 的客户端在 `dct-dco`；这里只把它接到三消要的 `Dco` 上。
 use crate::board::GridRead;
-use crate::play::{Dco, DcoError, Profile, Seen};
+use crate::play::{
+    Dco, DcoError, Profile, Region, Seen, SwipeOutcome, SwipeSettle, TapAt, TapSettleReq,
+    SETTLE_QUIET_MS, SETTLE_TIMEOUT_MS, TAP_AT_MAX_AVOID,
+};
 use crate::screen::Element;
 pub use dct_dco::{DcoClient, IO_TIMEOUT};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::time::Duration;
+
+/// show_status 的说明条最多这么多个字符（不是字节）。
+const STATUS_TEXT_MAX_CHARS: usize = 16;
+
+/// 带 settle 的 swipe 等回复的时长：要比 dco 自己最多等的 `SETTLE_TIMEOUT_MS` 还长，否则会把还在等的划动当成失败。
+fn settle_timeout(c: &DcoClient, normal: Duration) -> Duration {
+    c.settle_call_timeout
+        .unwrap_or_else(|| normal.max(Duration::from_millis(SETTLE_TIMEOUT_MS as u64 + 4000)))
+}
+
+fn err(code: &str, message: impl Into<String>) -> DcoError {
+    DcoError {
+        code: code.into(),
+        message: message.into(),
+        run_id: None,
+    }
+}
+
+/// `{changed, change, settled, timed_out, settled_ms}`；缺 changed / settled 的当没有。
+fn parse_settle(s: &Value) -> Option<SwipeSettle> {
+    Some(SwipeSettle {
+        changed: s["changed"].as_bool()?,
+        change: s["change"].as_f64().unwrap_or(0.0),
+        settled: s["settled"].as_bool()?,
+        timed_out: s["timed_out"].as_bool().unwrap_or(false),
+        settled_ms: s["settled_ms"].as_u64(),
+    })
+}
+
+fn unsupported_tap_at() -> DcoError {
+    err("unsupported", "这个 dco 还不会按位置点")
+}
+
+fn bp(v: f64) -> u16 {
+    (v * 10000.0).round().clamp(0.0, 10000.0) as u16
+}
+
+/// 元素在窗口里的位置（万分比）：优先用 dco 给的 `frac`（0～1），否则用 `bounds` 除以窗口大小。
+fn frac_of(e: &Value, size: &Value) -> Option<[u16; 4]> {
+    if let Some(f) = e.get("frac").filter(|f| f.is_object()) {
+        return Some([
+            bp(f["x"].as_f64()?),
+            bp(f["y"].as_f64()?),
+            bp(f["w"].as_f64()?),
+            bp(f["h"].as_f64()?),
+        ]);
+    }
+    let b = e.get("bounds").filter(|b| b.is_object())?;
+    let (w, h) = (
+        size["w"].as_f64().filter(|w| *w > 0.0)?,
+        size["h"].as_f64().filter(|h| *h > 0.0)?,
+    );
+    Some([
+        bp(b["x"].as_f64()? / w),
+        bp(b["y"].as_f64()? / h),
+        bp(b["w"].as_f64()? / w),
+        bp(b["h"].as_f64()? / h),
+    ])
+}
 
 impl Dco for DcoClient {
     fn read_grid(&mut self, p: &Profile) -> Result<GridRead, DcoError> {
@@ -18,24 +81,98 @@ impl Dco for DcoClient {
             }
         }
         let body = self.call("read_grid", args)?;
-        serde_json::from_value(body).map_err(|e| DcoError { code: "dco_error".into(), message: format!("dco 的棋盘回复读不懂：{e}"), run_id: None })
+        serde_json::from_value(body)
+            .map_err(|e| err("dco_error", format!("dco 的棋盘回复读不懂：{e}")))
     }
 
     fn swipe(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> Result<(), DcoError> {
-        self.call("swipe", json!({
-            "window": p.window,
-            "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
-        }))
+        self.call(
+            "swipe",
+            json!({
+                "window": p.window,
+                "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
+            }),
+        )
         .map(|_| ())
     }
 
+    fn swipe_settle(&mut self, p: &Profile, from: (f64, f64), to: (f64, f64)) -> SwipeOutcome {
+        if self.no_swipe_settle {
+            return match self.swipe(p, from, to) {
+                Err(e) => SwipeOutcome::NotSwiped(e),
+                Ok(()) => {
+                    SwipeOutcome::SwipedNoSettle(err("unsupported", "这个 dco 不会等屏幕稳定"))
+                }
+            };
+        }
+        let [x, y, w, h] = p.region;
+        let normal = self.timeout();
+        self.set_timeout(settle_timeout(self, normal));
+        let res = self.call("swipe", json!({
+            "window": p.window,
+            "from": { "x": from.0, "y": from.1 }, "to": { "x": to.0, "y": to.1 },
+            "settle": { "quiet_ms": SETTLE_QUIET_MS, "timeout_ms": SETTLE_TIMEOUT_MS, "region": { "x": x, "y": y, "w": w, "h": h } },
+        }));
+        self.set_timeout(normal);
+        let body = match res {
+            Ok(b) => b,
+            // 请求已经写出去了，划动很可能已经发生：不能说「没划」，否则调用方会再划一次。
+            // 其他传输错误（断线等）分不清是写出前还是写出后，保持 NotSwiped。
+            Err(e) if e.code == "dco_timeout" => return SwipeOutcome::SwipedNoSettle(e),
+            Err(e) => return SwipeOutcome::NotSwiped(e),
+        };
+        // 到这里划动已经发生；下面任何一种“没拿到报告”都不许再划。
+        let s = &body["settle"];
+        if !s.is_object() {
+            // 旧 dco 不认 settle 参数，只划了。以后别再带。
+            self.no_swipe_settle = true;
+            return SwipeOutcome::SwipedNoSettle(err("unsupported", "这个 dco 不会等屏幕稳定"));
+        }
+        if s["error"].is_object() {
+            let e = &s["error"];
+            return SwipeOutcome::SwipedNoSettle(err(
+                e["code"].as_str().unwrap_or("dco_error"),
+                e["message"].as_str().unwrap_or("等屏幕稳定时出错"),
+            ));
+        }
+        // 缺 changed / settled 的报告不能当「弹回原样」用。
+        let (Some(changed), Some(settled)) = (s["changed"].as_bool(), s["settled"].as_bool())
+        else {
+            return SwipeOutcome::SwipedNoSettle(err("bad_settle", "dco 回的稳定报告读不懂"));
+        };
+        SwipeOutcome::Settled(SwipeSettle {
+            changed,
+            change: s["change"].as_f64().unwrap_or(0.0),
+            settled,
+            timed_out: s["timed_out"].as_bool().unwrap_or(false),
+            settled_ms: s["settled_ms"].as_u64(),
+        })
+    }
+
     fn see_text(&mut self, p: &Profile) -> Result<Seen, DcoError> {
-        let body = self.call("see", json!({ "window": p.window, "source": "ocr" }))?;
+        if self.no_see_text {
+            return Err(err("unsupported", "这个 dco 不会认画面上的字"));
+        }
+        let body = match self.call("see", json!({ "window": p.window, "source": "ocr" })) {
+            Ok(b) => b,
+            Err(e) => {
+                if e.code == "dco_too_old" || e.code == "dco_timeout" {
+                    self.no_see_text = true;
+                }
+                return Err(e);
+            }
+        };
         let elements = body["elements"]
             .as_array()
             .map(|a| {
                 a.iter()
-                    .filter_map(|e| Some(Element { id: e["id"].as_str()?.to_string(), text: e["text"].as_str().unwrap_or("").to_string() }))
+                    .filter_map(|e| {
+                        Some(Element {
+                            id: e["id"].as_str()?.to_string(),
+                            text: e["text"].as_str().unwrap_or("").to_string(),
+                            frac: frac_of(e, &body["window"]["size"]),
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -47,18 +184,103 @@ impl Dco for DcoClient {
     }
 
     fn show_status(&mut self, state: &str) {
-        if self.no_show_status {
+        self.show_status_with(state, None, None);
+    }
+
+    fn show_status_with(&mut self, state: &str, text: Option<&str>, theme: Option<&str>) {
+        if self.no_show_status || self.unsupported_states.contains(state) {
             return;
         }
+        let mut args = json!({ "state": state });
+        if let Some(t) = text {
+            args["text"] = json!(t.chars().take(STATUS_TEXT_MAX_CHARS).collect::<String>());
+        }
+        if let Some(t) = theme {
+            args["theme"] = json!(t);
+        }
         // 结果不重要。旧 dco 没这个工具、或者超时，都别再试：超时一次就是 10 秒，每步一次游戏就拖死了。
-        if let Err(e) = self.call("show_status", json!({ "state": state })) {
+        // 只有这个状态 / 参数不被认（bad_request）：只记住这个状态，别的状态（think / look）照发。
+        if let Err(e) = self.call("show_status", args) {
             if e.code == "dco_too_old" || e.code == "dco_timeout" {
                 self.no_show_status = true;
+            } else if e.code == "bad_request" {
+                self.unsupported_states.insert(state.to_string());
             }
         }
     }
 
+    fn capture(&mut self, p: &Profile) -> Result<Vec<u8>, DcoError> {
+        use base64::Engine;
+        let reply = self.call_full(
+            "see",
+            json!({ "window": p.window, "source": "ocr", "include_image": true }),
+        )?;
+        let data = reply
+            .image_png_base64
+            .ok_or_else(|| err("no_image", "dco 没有给截图"))?;
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|_| err("no_image", "dco 给的截图读不懂"))
+    }
+
+    fn tap_at(
+        &mut self,
+        p: &Profile,
+        x_bp: u16,
+        y_bp: u16,
+        avoid: &[Region],
+        settle: Option<&TapSettleReq>,
+    ) -> Result<TapAt, DcoError> {
+        if self.no_tap_at {
+            return Err(unsupported_tap_at());
+        }
+        let app = p.window["app"].as_str().unwrap_or("");
+        let windows = self.call("list_windows", json!({}))?;
+        let window_id = windows["windows"]
+            .as_array()
+            .and_then(|a| a.iter().find(|w| w["app"].as_str() == Some(app)))
+            .map(|w| w["window_id"].clone())
+            .filter(|id| !id.is_null())
+            .ok_or_else(|| err("window_not_found", "找不到要点的窗口"))?;
+        let avoid: Vec<Value> = avoid
+            .iter()
+            .take(TAP_AT_MAX_AVOID)
+            .map(|r| json!({ "x_bp": r.x_bp, "y_bp": r.y_bp, "w_bp": r.w_bp, "h_bp": r.h_bp }))
+            .collect();
+        let mut args = json!({ "window": { "window_id": window_id }, "x_bp": x_bp, "y_bp": y_bp, "avoid": avoid });
+        let normal = self.timeout();
+        if let Some(r) = settle {
+            args["settle"] = json!({ "quiet_ms": r.quiet_ms, "timeout_ms": r.timeout_ms, "region": { "x": r.region[0], "y": r.region[1], "w": r.region[2], "h": r.region[3] } });
+            // 等屏幕稳定要花几秒：这一次的读超时放长，用完还原。
+            self.set_timeout(
+                settle_timeout(self, normal).max(Duration::from_millis(r.timeout_ms as u64 + 4000)),
+            );
+        }
+        let res = self.call("tap_at", args);
+        self.set_timeout(normal);
+        match res {
+            Ok(b) => Ok(TapAt {
+                kind: b["tapped"]["kind"].as_str().unwrap_or("").to_string(),
+                text: b["tapped"]["text"].as_str().unwrap_or("").to_string(),
+                // 旧 dco 不认 settle 就没有这个对象：不是错误，也不算「不支持 tap_at」。
+                settle: parse_settle(&b["settle"]),
+            }),
+            Err(e)
+                if e.code == "dco_too_old"
+                    || (e.code == "bad_request" && e.message.contains("unknown tool")) =>
+            {
+                self.no_tap_at = true;
+                Err(unsupported_tap_at())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn tap(&mut self, snapshot_id: &str, element_id: &str) -> Result<(), DcoError> {
-        self.call("tap", json!({ "snapshot_id": snapshot_id, "element_id": element_id })).map(|_| ())
+        self.call(
+            "tap",
+            json!({ "snapshot_id": snapshot_id, "element_id": element_id }),
+        )
+        .map(|_| ())
     }
 }

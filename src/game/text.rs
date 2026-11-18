@@ -45,6 +45,15 @@ pub fn step_line(step: usize, rec: &Value) -> String {
             }
         }
     }
+    if let Some(n) = rec["goal_found"].as_u64() {
+        s += &format!("；我认为屏幕上第 {n} 个数字是这一关的目标");
+    }
+    if rec["stalled"].as_bool() == Some(true) {
+        s += "；这几步看起来没有进展";
+    }
+    if rec["decider"] == "model" {
+        s += "（大模型选的）";
+    }
     s
 }
 
@@ -59,6 +68,7 @@ pub fn stop_code(stop: &Stop) -> &'static str {
         Stop::StepsDone => "steps_done",
         Stop::DryRun => "dry_run",
         Stop::Dco(_) => "dco",
+        Stop::PrivateScreen => "private_screen",
         Stop::Won => "won",
         Stop::LevelEnded => "level_ended",
         Stop::LivesOut => "lives_out",
@@ -117,6 +127,7 @@ pub fn stop_line(stop: &Stop, steps: usize, log: &Path) -> (String, i32) {
         Stop::Stuck => (format!("停了：划了几次画面都没有变化。请看一眼屏幕上是不是弹出了什么。{tail}"), 1),
         Stop::StillMoving => (format!("停了：等了 8 秒画面还在动。{tail}"), 1),
         Stop::Dco(e) => (format!("停了：{} {tail}", dco_error(e)), 1),
+        Stop::PrivateScreen => ("这个画面看起来是私人内容，我没有读它，也不会操作。请切回游戏再运行。".into(), 0),
         Stop::Won => (format!("通关了。下一关的棋盘位置不一样，要先重新认棋盘，所以先停在这里。{tail}"), 0),
         Stop::LevelEnded => (
             format!("这一局结束了，我看不出是通关还是没过，为了不乱点先停在这里。要接着玩，请你自己点 Play。{tail}"),
@@ -154,6 +165,12 @@ mod tests {
             r[k] = v.clone();
         }
         r
+    }
+
+    #[test]
+    fn a_step_picked_by_the_model_says_so() {
+        assert!(step_line(1, &rec(json!({"decider": "model"}))).contains("大模型选的"));
+        assert!(!step_line(1, &rec(json!({"decider": "rules"}))).contains("大模型选的"));
     }
 
     #[test]
@@ -296,6 +313,14 @@ mod tests {
     }
 
     #[test]
+    fn a_private_screen_stop_is_plain_chinese_exit_zero() {
+        let (line, code) = stop_line(&Stop::PrivateScreen, 0, Path::new("/x"));
+        assert_eq!(line, "这个画面看起来是私人内容，我没有读它，也不会操作。请切回游戏再运行。");
+        assert_eq!(code, 0);
+        assert_eq!(stop_code(&Stop::PrivateScreen), "private_screen");
+    }
+
+    #[test]
     fn an_unknown_screen_with_no_words_says_nothing_was_read() {
         let (line, _) = stop_line(&Stop::UnknownScreen(vec!["  ".into()]), 0, Path::new("/x"));
         assert!(line.contains("画面上没有读到字。") && !line.contains("画面上的字"), "{line}");
@@ -311,5 +336,21 @@ mod tests {
         for s in [Stop::Money, Stop::Ad] {
             assert!(stop_line(&s, 3, Path::new("/x")).0.contains("没有点任何东西"));
         }
+    }
+
+    #[test]
+    fn step_line_says_so_when_stalled() {
+        let rec = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved","stalled":true});
+        assert!(step_line(1, &rec).contains("这几步看起来没有进展"));
+        let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
+        assert!(!step_line(1, &rec2).contains("没有进展"));
+    }
+
+    #[test]
+    fn step_line_says_which_number_was_taken_as_the_goal() {
+        let rec = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved","goal_found":2});
+        assert!(step_line(1, &rec).contains("我认为屏幕上第 2 个数字是这一关的目标"));
+        let rec2 = serde_json::json!({"candidates":[{"a":[0,0],"b":[0,1],"features":{"cleared":3}}],"chosen":0,"outcome":"moved"});
+        assert!(!step_line(1, &rec2).contains("目标"));
     }
 }

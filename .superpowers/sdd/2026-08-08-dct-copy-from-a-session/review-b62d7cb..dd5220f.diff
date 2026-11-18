@@ -1,0 +1,139 @@
+# Review package: b62d7cb..dd5220f
+
+## Commits
+dd5220f feat: F4 hands the mouse back to the terminal so you can select and copy
+
+## Files changed
+ src/ui/attach.rs | 48 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/ui/mod.rs    |  9 +++++++++
+ 2 files changed, 57 insertions(+)
+
+## Diff
+diff --git a/src/ui/attach.rs b/src/ui/attach.rs
+index 2bfbc6d..8bded2b 100644
+--- a/src/ui/attach.rs
++++ b/src/ui/attach.rs
+@@ -135,20 +135,29 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+                 // 跟九宫格 Enter 放大走的是同一个函数（见
+                 // `mod.rs::point_cursor_at_session`），两处不各写一份。
+                 super::point_cursor_at_session(app, next);
+                 super::enter_session(app, next)
+             }
+             None => {
+                 app.message =
+                     crate::i18n::text(crate::i18n::Key::NoOtherRunningSession, app.lang).into()
+             }
+         }
++    } else if key.code == KeyCode::F(4) {
++        // F4 = 复制模式：临时把鼠标交还给终端，用终端自己的拖选去复制。
++        // 挑 F4 沿用 F2/F3 的理由：没有 CLI agent 在用 F 功能键，偷它不踩
++        // 任何人，也不用搞双击透传那种隐形状态。
++        //
++        // 这里只翻转状态，真正开关鼠标在主循环里统一做（见
++        // `mod.rs::wants_mouse_capture`）——在这儿直接 execute! 的话，
++        // 就有两处在写同一个终端状态，而它们对「现在开着没有」的记忆会分叉。
++        app.copy_mode = !app.copy_mode;
+     } else if let Some(action) = key_scroll(
+         &app.scroll,
+         &key,
+         // `app.screen` 是上一次 `Screen` 响应的行数，而那个行数正是 dct
+         // 最后一次通过 `Request::Resize` 告诉 agent 的高度——`screen_spans()`
+         // 按 vt100 的配置尺寸返回，永远是这个数（见 `pty.rs`）。用它当
+         // 「一屏多高」不需要另外在 `handle_key` 里穿一份终端尺寸进来。
+         app.screen.len() as u16,
+     ) {
+         // PageUp/PageDown/End 在「dct 自己攥着历史」时归 dct 管，直接在这里
+@@ -334,20 +343,59 @@ mod tests {
+         SessionInfo {
+             id,
+             profile: "claude".into(),
+             dir: "/tmp/a".into(),
+             state,
+             activity: String::new(),
+             is_agent: true,
+         }
+     }
+ 
++    fn attached_app() -> (App, tempfile::TempDir) {
++        let (mut app, d) = App::test_app();
++        app.view = View::Attached(1);
++        (app, d)
++    }
++
++    #[test]
++    fn f4_toggles_copy_mode_and_is_never_forwarded_to_the_agent() {
++        let (mut app, _d) = attached_app();
++        assert!(!app.copy_mode);
++
++        handle_key(&mut app, key(KeyCode::F(4))).unwrap();
++        assert!(app.copy_mode, "第一下打开");
++
++        handle_key(&mut app, key(KeyCode::F(4))).unwrap();
++        assert!(!app.copy_mode, "第二下关掉");
++
++        // F4 是 dct 自己吃掉的键，一个字节都不能落进 agent 的输入
++        assert_eq!(crate::ui::key_to_input(&key(KeyCode::F(4))), None);
++    }
++
++    /// 复制模式是「此刻正在复制」的临时状态，不是配置。**进会话时复位**——
++    /// 不管上一个会话是怎么离开的（F2、Ctrl+Q、agent 自己退出），下一个会话
++    /// 一定从「鼠标归 agent」开始。
++    ///
++    /// 在**进入**这一侧复位，而不是在三条离开的路上各写一次：`enter_session`
++    /// 是所有进会话路径的唯一漏斗（看板 Enter、九宫格 Enter、F3 都走它），
++    /// 而离开有三条路，其中 Ctrl+Q 那条走的是 `back_one_level`——一个所有视图
++    /// 共用的纯函数，为这一个字段改它的签名不值。漏斗上写一次，结构上就漏不掉。
++    #[test]
++    fn entering_a_session_always_starts_outside_copy_mode() {
++        let (mut app, _d) = App::test_app();
++        app.copy_mode = true;
++
++        crate::ui::enter_session(&mut app, 1);
++
++        assert!(!app.copy_mode, "上一个会话的复制模式不能粘到下一个会话");
++    }
++
+     #[test]
+     fn f3_jumps_straight_to_the_next_running_session() {
+         // 不用先退回看板：从会话 1 按 F3 直接落在下一个在跑的会话上。
+         let (mut app, _dir) = App::test_app();
+         app.set_sessions(vec![
+             session(1, SessionState::Working),
+             session(2, SessionState::Stopped),
+             session(3, SessionState::Idle),
+         ]);
+         app.view = View::Attached(1);
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index 734f9a9..eeba580 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -1270,20 +1270,29 @@ pub(crate) fn create_session(
+ /// 根本不会被选中），所以既没有什么可改，也没有什么可报告。
+ pub(crate) fn enter_session(app: &mut App, id: u32) {
+     // 会话标题要显示项目名
+     app.need_sessions = true;
+     app.view = View::Attached(id);
+     // 每次「进入」都当成一次全新的观察：`explained_failure` 缓存的是
+     // 「上一次贴在这个会话里时看到的解释」，如果这个会话在用户离开、
+     // 又回来之间恢复过、再坏过一次，缓存里那份还是上上次失败的旧话，
+     // 不清掉的话 `run()` 主循环会以为「问过了」，永远不会去问新的那次。
+     app.explained_failure = None;
++    // 上一个会话的复制模式不能粘到这一个来。**在「进入」这一侧复位**，
++    // 不在三条离开的路上各写一次：`enter_session` 是所有进会话路径的唯一
++    // 漏斗（看板 Enter、九宫格 Enter、F3 都走它），而离开有三条路，其中
++    // Ctrl+Q 那条走的是 `back_one_level`——一个所有视图共用的纯函数，
++    // 为这一个字段改它的签名不值。漏斗上写一次，结构上就漏不掉。
++    //
++    // 留在看板上的那个 `copy_mode` 是无害的：`wants_mouse_capture` 的第一个
++    // 条件就是「贴在会话里」，不在会话里时它压根不参与判断。
++    app.copy_mode = false;
+     // CONTROLLER RULING：进入会话视图一律落在底部，不管上次离开时翻到
+     // 哪儿了、也不管这一次算不算「换了个尺寸」。
+     //
+     // 原来落地在哪儿全看 `run()` 主循环里那条按 `sent_size` 判断要不要发
+     // `Request::Resize` 的分支——`SessionManager::resize` 顺手把 scroll 归了
+     // 零，于是「回不回底部」变成了一个跟尺寸缓存打不打得上的意外结果：
+     // 切到另一个会话再回来，id 变了，`sent_size` 不匹配，触发 Resize，
+     // 顺带回到底部；按 F2 回看板、什么都没点、又直接 Enter 回同一个会话，
+     // `sent_size` 还对得上，Resize 不发，人就诡异地卡在几十行之前翻到的
+     // 地方——同一个「回来看看」的意图，走两条路给两种结果。

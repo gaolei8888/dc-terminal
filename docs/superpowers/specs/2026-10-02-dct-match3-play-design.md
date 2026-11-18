@@ -51,11 +51,15 @@ AI 自动校准、dcv 的游戏资料（`dcv games`）、开关卡和道具检�
 **特征**：`cleared`（第一下消几颗）、`cascade`（连锁消几颗）、`striped` / `wrapped` / `bomb`（做出几颗）、`triggered`（引爆几颗）、
 `special_swap`（两颗特殊糖互换）、`lowest_row`（消掉的最低一行）。
 
-**打分**（常量，第一轮拍的，写明出处，以后按记录调）：
+**打分**：权重来自棋盘配置里的 `[weights]`（过渡期的本地数据；长期归属是 dcv，2026-10-03 用户定的：dct 代码保持通用，游戏相关的数值是数据，不是代码常量）。
+通用默认是 cleared 1 + cascade 0.5 + low_row 1，所有特殊糖的权重（striped / wrapped / bomb / triggered / special_swap）都是 0：
 
 ```
-score = cleared + 0.5·cascade + 6·striped + 8·wrapped + 15·bomb + 5·triggered + 20·special_swap + (lowest_row + 1) / rows
+score = cleared·w + cascade·w + striped·w + wrapped·w + bomb·w + triggered·w + special_swap·w + (lowest_row + 1) / rows · low_row
 ```
+
+两颗特殊糖互换却连不成线，只有 `special_swap > 0` 才算合法步；默认不走。`odd`（特殊糖标记）会跟着提示光晕和掉落动画闪，
+所以不拿它判断棋盘有没有变——落定只比较格子的分组。
 
 同分时按固定顺序挑：最低的行优先，再左边的列优先，再横向交换优先。同一盘每次选得一样。
 
@@ -79,12 +83,13 @@ dct game play [--game candy-crush] [--steps 20] [--dry-run]
 
 「一步 1 秒以内」量的是 1～3 段（读、选、划），不含等游戏动画。
 
-每步选步之前 dct 给 dco 发 `show_status think`，选完发 `look`（让屏幕上的小章鱼跟着“想”“看”；试走也发，不发 `wait`），回错一律忽略。发的时间在计时之外，不算进 `choose`。老 dco 可能没有这个工具（回 unknown tool）：遇到一次就记下，这条连接上不再发；超时同理，免得每步白等 10 秒。
+`show_status` 的 think / look 只留给慢的（模型）决策；规则选步约 1 ms，不发任何状态（章鱼没法“想”这么短，停住的状态还会拖慢动画）。每步记录带 `swipe {from, to, started_ms, duration_ms}`（from / to 是窗口的 0–1 比例，4 位小数；试走没有这个字段，被拒的划也有），章鱼叠加层的事件日志拿它跟 dct 真做的对账。老 dco 没有这个工具时的处理（遇到 unknown tool 记下、这条连接不再发）仍适用于以后的慢决策路径。
 
 **停下的条件**（每条都用一句人话说清楚为什么停）：
 - 读不出棋盘（`not_a_grid`），或者类别数比开始时多出两个以上——多半是这关结束了、弹了窗。只数至少有两格的类别；只有一格的类别（彩色炸弹、条纹糖被读成自己的颜色）忽略不数；多出一个被数的类别可以容忍（两个同种特殊糖果可能凑成两格的类别）；变少从不停。
   多一个允许：彩色炸弹是一格的类别，会让类别数加一；类别变少不停（颜色在棋盘上消光了很正常）；
 - 没有能走的步；
+- 以上“没有能走的步”和“画面变了（类别数多出来）”都要停 1.5 秒、再读一遍确认才算数：出口还在一个个往下补糖，特效清完一大片时颜色数也会暂时跳高，马上读到的常是中间状态。再读盘面变了或有步了就接着玩（“没步”最多连确认 2 次）；试走不停不重读；
 - 走满 `--steps`；
 - dco 回 `halted` / `paused` / `screen_locked`，或者 dco 没在运行；
 - 用户按 Ctrl-C（agent 那边就是用户让它停）；这时不会写「停下原因」那一行，已经走过的每一步都已落盘。

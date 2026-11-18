@@ -1,0 +1,597 @@
+# Review package: 06399b4..3e9b896
+
+## Commits
+3e9b896 feat(procedure): approve a procedure's tiers with Touch ID and sign tickets for it
+
+## Files changed
+ src/lib.rs        |   1 +
+ src/main.rs       |   1 +
+ src/procedures.rs | 527 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 529 insertions(+)
+
+## Diff
+diff --git a/src/lib.rs b/src/lib.rs
+index ffaa0fe..2e69d9c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,20 +11,21 @@ pub mod i18n;
+ pub mod journal;
+ pub mod keys;
+ pub mod last_sessions;
+ pub mod link;
+ pub mod live;
+ pub mod llm;
+ pub mod llm_optin;
+ pub mod pair;
+ pub mod pair_apply;
+ pub mod pair_http;
++pub mod procedures;
+ pub mod profile;
+ pub mod projects;
+ pub mod proto;
+ pub mod pty;
+ pub mod qr;
+ pub mod runtime;
+ pub mod secrets;
+ pub mod session;
+ pub mod settings;
+ pub mod student_projects;
+diff --git a/src/main.rs b/src/main.rs
+index 73343ec..f6e8afe 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -96,20 +96,21 @@ fn main() -> Result<()> {
+                 dct::cli::Restarted::StartFresh => {
+                     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                         run_ui()
+                     } else {
+                         start_daemon_headless(&exe)
+                     }
+                 }
+             }
+         }
+         Some("keys") => std::process::exit(dct::keys::run_cli(&args[1..])),
++        Some("procedure") => std::process::exit(dct::procedures::run_cli(&args[1..])),
+         // `llm check` 不连守护进程：它验的是 dct 自己直接打模型那条独立
+         // 通路，跟会话、pty 都无关。
+         Some("llm") if args.get(1).map(|s| s.as_str()) == Some("check") => {
+             std::process::exit(dct::cli::llm_check(cli_lang()))
+         }
+         Some("--help") | Some("-h") => {
+             println!("{HELP}");
+             Ok(())
+         }
+         // 装好之后能问出「我装的是哪一版」，这是排查的第一句话。在这之前
+diff --git a/src/procedures.rs b/src/procedures.rs
+new file mode 100644
+index 0000000..e18cca7
+--- /dev/null
++++ b/src/procedures.rs
+@@ -0,0 +1,527 @@
++//! 流程的批准和出票（设计第 2、4 节）。流程从 dcv 来，批准记录和钥匙在 dct，
++//! 票交给 dco。这里只做「批准」「出票」两件事；动作卡片、排程、连 dco 在后面的计划里。
++use crate::keys::{platform_enclave, KeyStore, SecureEnclave};
++use anyhow::{anyhow, bail, Context, Result};
++use dct_brain::approval::{sign_approval, verify_approval, Approval, SignedApproval, APPROVAL_VERSION};
++use dct_brain::sign::{sign_one, SignedTicket};
++use dct_brain::steps::{steps_sha256, Step};
++use dct_brain::ticket::{params_sha256, Subject, Ticket, TICKET_VERSION};
++use dct_brain::tier::{tier_for_step, SignerRole, Tier};
++use std::collections::{BTreeMap, BTreeSet};
++use std::path::PathBuf;
++
++pub trait Dcv {
++    fn show(&self, full_name: &str) -> Result<serde_json::Value>;
++    /// 返回 dcv 记下的 `approved_body`。
++    fn approve(&self, full_name: &str) -> Result<String>;
++}
++
++pub struct RealDcv;
++
++fn run_dcv(args: &[&str]) -> Result<serde_json::Value> {
++    let mut c = std::process::Command::new("dcv");
++    c.args(args);
++    crate::sys::proc::no_console(&mut c);
++    let out = c.output().context("找不到 dcv 命令")?;
++    if !out.status.success() {
++        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
++    }
++    serde_json::from_slice(&out.stdout).context("dcv 的回复读不懂")
++}
++
++impl Dcv for RealDcv {
++    fn show(&self, full_name: &str) -> Result<serde_json::Value> {
++        run_dcv(&["show", full_name, "--json"])
++    }
++    fn approve(&self, full_name: &str) -> Result<String> {
++        let v = run_dcv(&["approve", full_name, "--json"])?;
++        v["approved_body"].as_str().map(String::from).ok_or_else(|| anyhow!("dcv 没有回 approved_body"))
++    }
++}
++
++pub struct Shown {
++    pub full_name: String,
++    pub params: Vec<String>,
++    pub steps: Vec<Step>,
++    pub body_sha256: String,
++    pub executable: bool,
++    pub why_not: Option<String>,
++}
++
++impl Shown {
++    pub fn parse(full_name: &str, v: &serde_json::Value) -> Result<Shown> {
++        if v["kind"] != "procedure" {
++            bail!("{full_name} 不是流程");
++        }
++        let params = v["params"]
++            .as_array()
++            .ok_or_else(|| anyhow!("dcv 回复缺 params"))?
++            .iter()
++            .map(|p| p.as_str().map(String::from).ok_or_else(|| anyhow!("参数名不是字符串")))
++            .collect::<Result<Vec<_>>>()?;
++        let steps = v["steps"]
++            .as_array()
++            .ok_or_else(|| anyhow!("dcv 回复缺 steps"))?
++            .iter()
++            .map(|s| {
++                Ok(Step {
++                    n: s["n"].as_u64().ok_or_else(|| anyhow!("步骤缺 n"))? as u32,
++                    action: s["action"].as_str().ok_or_else(|| anyhow!("步骤缺 action"))?.to_string(),
++                    arg: s["arg"].as_str().unwrap_or("").to_string(),
++                    done_when: s["done_when"]["arg"].as_str().map(String::from),
++                })
++            })
++            .collect::<Result<Vec<_>>>()?;
++        Ok(Shown {
++            full_name: full_name.to_string(),
++            params,
++            steps,
++            body_sha256: v["body_sha256"].as_str().ok_or_else(|| anyhow!("dcv 回复缺 body_sha256"))?.to_string(),
++            executable: v["executable"].as_bool().unwrap_or(false),
++            why_not: v["why_not"].as_str().map(String::from),
++        })
++    }
++}
++
++pub struct Approvals {
++    dir: PathBuf,
++}
++
++impl Approvals {
++    pub fn at(dir: PathBuf) -> Self {
++        Approvals { dir }
++    }
++
++    pub fn default_dir() -> PathBuf {
++        crate::proto::socket_path()
++            .parent()
++            .map(|p| p.join("approvals"))
++            .unwrap_or_else(|| PathBuf::from("approvals"))
++    }
++
++    fn path(&self, steps_sha256: &str) -> PathBuf {
++        self.dir.join(format!("{}.json", steps_sha256.trim_start_matches("sha256:")))
++    }
++
++    pub fn save(&self, sa: &SignedApproval) -> Result<()> {
++        std::fs::create_dir_all(&self.dir)?;
++        std::fs::write(self.path(&sa.approval.steps_sha256), serde_json::to_vec_pretty(sa)?)?;
++        Ok(())
++    }
++
++    pub fn load(&self, steps_sha256: &str) -> Result<Option<SignedApproval>> {
++        match std::fs::read(self.path(steps_sha256)) {
++            Ok(b) => Ok(Some(serde_json::from_slice(&b).context("批准记录坏了")?)),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
++            Err(e) => Err(e.into()),
++        }
++    }
++}
++
++fn tier_zh(t: Tier) -> &'static str {
++    match t {
++        Tier::Read => "只读",
++        Tier::SelfOnly => "只影响自己",
++        Tier::Physical => "物理动作",
++        Tier::Content => "对外",
++        Tier::Money => "动钱",
++    }
++}
++
++/// Touch ID 弹窗里的人话：点名每一步对外或动钱的动作，其余一句带过。
++fn approval_reason(name: &str, steps: &[Step], tiers: &[Tier]) -> String {
++    let strict: Vec<String> = steps
++        .iter()
++        .zip(tiers)
++        .filter(|(_, t)| **t >= Tier::Content)
++        .map(|(s, t)| format!("第 {} 步「{}」是{}", s.n, s.arg, tier_zh(*t)))
++        .collect();
++    if strict.is_empty() {
++        format!("批准流程 {name}：每一步都只影响自己")
++    } else {
++        format!("批准流程 {name}：{}，其余只影响自己", strict.join("，"))
++    }
++}
++
++pub fn approve(
++    dcv: &dyn Dcv,
++    keys: &KeyStore,
++    se: &dyn SecureEnclave,
++    approvals: &Approvals,
++    full_name: &str,
++    overrides: &[(u32, Tier)],
++    now: u64,
++) -> Result<SignedApproval> {
++    let shown = Shown::parse(full_name, &dcv.show(full_name)?)?;
++    let steps_sha = steps_sha256(&shown.params, &shown.steps);
++    let mut tiers: Vec<Tier> = shown.steps.iter().map(|s| tier_for_step(&s.action, &s.arg)).collect();
++    for (n, t) in overrides {
++        let i = shown
++            .steps
++            .iter()
++            .position(|s| s.n == *n)
++            .ok_or_else(|| anyhow!("这条流程没有第 {n} 步"))?;
++        tiers[i] = *t;
++    }
++    let approval = Approval {
++        v: APPROVAL_VERSION,
++        procedure: full_name.to_string(),
++        steps_sha256: steps_sha,
++        body_sha256: shown.body_sha256.clone(),
++        step_tiers: tiers.clone(),
++        approved_at: now,
++    };
++    // 先按指纹，再去 dcv 里确认：用户取消就什么都不留下。
++    let user = keys.signer(SignerRole::User, se)?;
++    let signed = sign_approval(approval, &user, &approval_reason(full_name, &shown.steps, &tiers))
++        .map_err(|e| anyhow!("{e}"))?;
++    let approved_body = dcv.approve(full_name)?;
++    if approved_body != shown.body_sha256 {
++        bail!("流程在确认的过程中被改过了（看到的是 {}，dcv 确认的是 {approved_body}），这次不算，请重新看一遍再批准", shown.body_sha256);
++    }
++    approvals.save(&signed)?;
++    Ok(signed)
++}
++
++fn random_nonce() -> Result<String> {
++    let mut b = [0u8; 16];
++    getrandom::getrandom(&mut b).map_err(|e| anyhow!("取不到随机数：{e}"))?;
++    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
++}
++
++#[allow(clippy::too_many_arguments)]
++pub fn ticket(
++    dcv: &dyn Dcv,
++    keys: &KeyStore,
++    se: &dyn SecureEnclave,
++    approvals: &Approvals,
++    full_name: &str,
++    device: &str,
++    params: BTreeMap<String, String>,
++    start_in: u64,
++    window: u64,
++    now: u64,
++) -> Result<SignedTicket> {
++    let shown = Shown::parse(full_name, &dcv.show(full_name)?)?;
++    if !shown.executable {
++        bail!("这条流程现在不能执行：{}", shown.why_not.as_deref().unwrap_or("dcv 没说原因"));
++    }
++    let declared: BTreeSet<&str> = shown.params.iter().map(String::as_str).collect();
++    let given: BTreeSet<&str> = params.keys().map(String::as_str).collect();
++    if declared != given {
++        bail!("参数对不上：流程要的是 {declared:?}，给的是 {given:?}");
++    }
++    let steps_sha = steps_sha256(&shown.params, &shown.steps);
++    let not_approved = || anyhow!("这条流程还没批准，或者改过了，先运行 dct procedure approve {full_name}");
++    let sa = approvals.load(&steps_sha)?.ok_or_else(not_approved)?;
++    verify_approval(&sa, &keys.trusted()?, full_name, &steps_sha).map_err(|_| not_approved())?;
++    let tier = sa.approval.run_tier();
++    let earliest = now + start_in;
++    let t = Ticket {
++        v: TICKET_VERSION,
++        nonce: random_nonce()?,
++        device: device.to_string(),
++        tier,
++        subject: Subject::Procedure {
++            name: full_name.to_string(),
++            steps_sha256: steps_sha,
++            body_sha256: shown.body_sha256,
++        },
++        params_sha256: params_sha256(&params),
++        earliest,
++        expires: earliest + window,
++    };
++    let role = match tier.required_signer() {
++        Some(SignerRole::User) => SignerRole::User,
++        _ => SignerRole::Auto,
++    };
++    let signer = keys.signer(role, se)?;
++    let strict: Vec<String> = shown
++        .steps
++        .iter()
++        .zip(&sa.approval.step_tiers)
++        .filter(|(_, t)| **t >= Tier::Content)
++        .map(|(s, _)| format!("第 {} 步", s.n))
++        .collect();
++    let reason = format!("执行流程 {full_name}（{}对外）", strict.join("、"));
++    sign_one(t, &signer, &reason).map_err(|e| anyhow!("{e}"))
++}
++
++fn now_secs() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or(0)
++}
++
++fn parse_tier(s: &str) -> Result<Tier> {
++    serde_json::from_value(serde_json::Value::String(s.to_string()))
++        .map_err(|_| anyhow!("不认识的档位 {s}（可用：read self physical content money）"))
++}
++
++/// `dct procedure approve <库:名字> [--tier N=档位]...`
++/// `dct procedure ticket <库:名字> --device <设备> [--param 名=值]... [--in 秒] [--window 秒]`
++pub fn run_cli(args: &[String]) -> i32 {
++    let r = (|| -> Result<()> {
++        let (cmd, name) = match (args.first(), args.get(1)) {
++            (Some(c), Some(n)) => (c.as_str(), n.as_str()),
++            _ => bail!("用法：dct procedure approve|ticket <库:名字> ..."),
++        };
++        let keys = KeyStore::at(KeyStore::default_dir());
++        let se = platform_enclave();
++        let approvals = Approvals::at(Approvals::default_dir());
++        let mut overrides = Vec::new();
++        let mut params = BTreeMap::new();
++        let (mut device, mut start_in, mut window) = (None, 0u64, 600u64);
++        let mut it = args[2..].iter();
++        while let Some(flag) = it.next() {
++            let val = it.next().ok_or_else(|| anyhow!("{flag} 后面缺值"))?;
++            match flag.as_str() {
++                "--tier" => {
++                    let (n, t) = val.split_once('=').ok_or_else(|| anyhow!("--tier 要写成 步号=档位"))?;
++                    overrides.push((n.parse().context("步号不是数字")?, parse_tier(t)?));
++                }
++                "--param" => {
++                    let (k, v) = val.split_once('=').ok_or_else(|| anyhow!("--param 要写成 名=值"))?;
++                    params.insert(k.to_string(), v.to_string());
++                }
++                "--device" => device = Some(val.clone()),
++                "--in" => start_in = val.parse().context("--in 不是秒数")?,
++                "--window" => window = val.parse().context("--window 不是秒数")?,
++                f => bail!("不认识的选项 {f}"),
++            }
++        }
++        match cmd {
++            "approve" => {
++                let sa = approve(&RealDcv, &keys, se.as_ref(), &approvals, name, &overrides, now_secs())?;
++                for (i, t) in sa.approval.step_tiers.iter().enumerate() {
++                    println!("第 {} 步：{}", i + 1, tier_zh(*t));
++                }
++                println!("已批准 {name}");
++            }
++            "ticket" => {
++                let device = device.ok_or_else(|| anyhow!("出票要写 --device"))?;
++                let st = ticket(&RealDcv, &keys, se.as_ref(), &approvals, name, &device, params, start_in, window, now_secs())?;
++                println!("{}", serde_json::to_string_pretty(&st)?);
++            }
++            c => bail!("不认识的子命令 {c}"),
++        }
++        Ok(())
++    })();
++    match r {
++        Ok(()) => 0,
++        Err(e) => {
++            eprintln!("{e}");
++            1
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::keys::{KeyStore, SecureEnclave};
++    use dct_brain::sign::soft::SoftSigner;
++    use dct_brain::sign::{SignError, Signer};
++    use serde_json::json;
++    use std::cell::{Cell, RefCell};
++
++    struct FakeEnclave {
++        next: Cell<u8>,
++        cancel_user: Cell<bool>,
++        reasons: RefCell<Vec<String>>,
++    }
++    impl FakeEnclave {
++        fn new() -> Self {
++            FakeEnclave { next: Cell::new(1), cancel_user: Cell::new(false), reasons: RefCell::new(vec![]) }
++        }
++        fn soft(blob: &[u8]) -> SoftSigner {
++            SoftSigner::from_seed(if blob[1] == 1 { SignerRole::User } else { SignerRole::Auto }, blob[0])
++        }
++    }
++    impl SecureEnclave for FakeEnclave {
++        fn available(&self) -> bool {
++            true
++        }
++        fn create(&self, biometric: bool) -> Result<(Vec<u8>, [u8; 65]), SignError> {
++            let blob = vec![self.next.get(), biometric as u8];
++            self.next.set(self.next.get() + 1);
++            Ok((blob.clone(), Self::soft(&blob).public_key()))
++        }
++        fn sign(&self, blob: &[u8], msg: &[u8], reason: &str) -> Result<[u8; 64], SignError> {
++            if blob[1] == 1 {
++                self.reasons.borrow_mut().push(reason.to_string());
++                if self.cancel_user.get() {
++                    return Err(SignError::Cancelled);
++                }
++            }
++            Self::soft(blob).sign(msg, reason)
++        }
++    }
++
++    struct FakeDcv {
++        show: RefCell<serde_json::Value>,
++        approved_body: RefCell<String>,
++        approve_calls: Cell<u32>,
++    }
++    impl Dcv for FakeDcv {
++        fn show(&self, _: &str) -> Result<serde_json::Value> {
++            Ok(self.show.borrow().clone())
++        }
++        fn approve(&self, _: &str) -> Result<String> {
++            self.approve_calls.set(self.approve_calls.get() + 1);
++            Ok(self.approved_body.borrow().clone())
++        }
++    }
++
++    fn edit_bio(executable: bool) -> serde_json::Value {
++        json!({
++            "kind": "procedure", "name": "edit-bio", "params": ["bio"],
++            "steps": [
++                {"n": 1, "action": "open_app", "arg": "TikTok", "done_when": null},
++                {"n": 2, "action": "navigate_by_intent", "arg": "我的 → 编辑资料 → 简介", "done_when": null},
++                {"n": 3, "action": "type_param", "arg": "bio", "done_when": {"action": "verify_text", "arg": "简介栏显示 {bio}"}},
++                {"n": 4, "action": "tap_by_intent", "arg": "保存", "done_when": null}
++            ],
++            "body_sha256": format!("sha256:{}", "ab".repeat(32)),
++            "executable": executable, "why_not": if executable { serde_json::Value::Null } else { json!("还没确认") },
++            "schema": 1
++        })
++    }
++
++    struct World {
++        _d: tempfile::TempDir,
++        dcv: FakeDcv,
++        keys: KeyStore,
++        se: FakeEnclave,
++        approvals: Approvals,
++    }
++
++    fn world() -> World {
++        let d = tempfile::tempdir().unwrap();
++        let keys = KeyStore::at(d.path().join("keys"));
++        let se = FakeEnclave::new();
++        keys.init(&se).unwrap();
++        World {
++            dcv: FakeDcv {
++                show: RefCell::new(edit_bio(false)),
++                approved_body: RefCell::new(format!("sha256:{}", "ab".repeat(32))),
++                approve_calls: Cell::new(0),
++            },
++            approvals: Approvals::at(d.path().join("approvals")),
++            keys,
++            se,
++            _d: d,
++        }
++    }
++
++    const STEPS_A: &str = "sha256:4d1077af6efac1184e410d23b0b7b120fd42f29d7dade3304ef2041ca10b565c";
++
++    #[test]
++    fn show_output_parses_into_the_steps_dcv_fingerprints() {
++        let s = Shown::parse("social:edit-bio", &edit_bio(true)).unwrap();
++        assert_eq!(steps_sha256(&s.params, &s.steps), STEPS_A);
++        assert!(s.executable);
++    }
++
++    #[test]
++    fn approving_proposes_tiers_asks_for_touch_id_then_marks_dcv() {
++        let w = world();
++        let sa = approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
++        assert_eq!(
++            sa.approval.step_tiers,
++            vec![Tier::SelfOnly, Tier::SelfOnly, Tier::SelfOnly, Tier::Content]
++        );
++        assert_eq!(sa.approval.steps_sha256, STEPS_A);
++        assert_eq!(w.dcv.approve_calls.get(), 1);
++        let reasons = w.se.reasons.borrow();
++        assert!(reasons[0].contains("social:edit-bio") && reasons[0].contains("保存"), "{reasons:?}");
++        assert!(w.approvals.load(STEPS_A).unwrap().is_some());
++    }
++
++    #[test]
++    fn the_user_can_change_a_proposed_tier() {
++        let w = world();
++        let sa = approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[(4, Tier::Money)], 1000).unwrap();
++        assert_eq!(sa.approval.step_tiers[3], Tier::Money);
++    }
++
++    #[test]
++    fn cancelling_touch_id_approves_nothing() {
++        let w = world();
++        w.se.cancel_user.set(true);
++        assert!(approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).is_err());
++        assert_eq!(w.dcv.approve_calls.get(), 0, "没按指纹就不该去 dcv 里确认");
++        assert!(w.approvals.load(STEPS_A).unwrap().is_none());
++    }
++
++    #[test]
++    fn a_procedure_changed_between_show_and_approve_is_not_saved() {
++        let w = world();
++        *w.dcv.approved_body.borrow_mut() = "sha256:changed".into();
++        assert!(approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).is_err());
++        assert!(w.approvals.load(STEPS_A).unwrap().is_none());
++    }
++
++    #[test]
++    fn a_ticket_for_an_approved_outward_procedure_is_signed_by_the_user() {
++        let w = world();
++        approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
++        *w.dcv.show.borrow_mut() = edit_bio(true);
++        let params = BTreeMap::from([("bio".to_string(), "Founder, Learning Tech.".to_string())]);
++        let st = ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", params, 0, 600, 2000).unwrap();
++        assert_eq!(st.ticket.tier, Tier::Content);
++        assert_eq!(st.ticket.earliest, 2000);
++        assert_eq!(st.ticket.expires, 2600);
++        assert_eq!(st.ticket.nonce.len(), 32);
++        assert_eq!(dct_brain::sign::verify(&st, &w.keys.trusted().unwrap(), "mac-lei", 2000), Ok(()));
++        assert!(w.se.reasons.borrow().last().unwrap().contains("执行流程"));
++    }
++
++    #[test]
++    fn a_self_only_procedure_gets_an_automatic_ticket_without_touch_id() {
++        let w = world();
++        approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[(4, Tier::SelfOnly)], 1000).unwrap();
++        let before = w.se.reasons.borrow().len();
++        *w.dcv.show.borrow_mut() = edit_bio(true);
++        let params = BTreeMap::from([("bio".to_string(), "x".to_string())]);
++        let st = ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", params, 0, 600, 2000).unwrap();
++        assert_eq!(st.ticket.tier, Tier::SelfOnly);
++        assert_eq!(w.se.reasons.borrow().len(), before, "只影响自己的票不该弹 Touch ID");
++    }
++
++    #[test]
++    fn tickets_are_refused_without_an_approval_or_with_wrong_params() {
++        let w = world();
++        *w.dcv.show.borrow_mut() = edit_bio(true);
++        let good = BTreeMap::from([("bio".to_string(), "x".to_string())]);
++        assert!(ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", good.clone(), 0, 600, 2000).is_err());
++        *w.dcv.show.borrow_mut() = edit_bio(false);
++        approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
++        *w.dcv.show.borrow_mut() = edit_bio(true);
++        let extra = BTreeMap::from([("bio".to_string(), "x".to_string()), ("x".to_string(), "y".to_string())]);
++        assert!(ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", extra, 0, 600, 2000).is_err());
++        assert!(ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", BTreeMap::new(), 0, 600, 2000).is_err());
++    }
++
++    #[test]
++    fn a_non_executable_procedure_gets_no_ticket() {
++        let w = world();
++        approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
++        *w.dcv.show.borrow_mut() = edit_bio(false);
++        let params = BTreeMap::from([("bio".to_string(), "x".to_string())]);
++        let e = ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", params, 0, 600, 2000).unwrap_err();
++        assert!(e.to_string().contains("还没确认"), "{e}");
++    }
++
++    #[test]
++    fn a_tampered_approval_file_is_not_trusted() {
++        let w = world();
++        let mut sa = approve(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", &[], 1000).unwrap();
++        sa.approval.step_tiers[3] = Tier::SelfOnly;
++        w.approvals.save(&sa).unwrap();
++        *w.dcv.show.borrow_mut() = edit_bio(true);
++        let params = BTreeMap::from([("bio".to_string(), "x".to_string())]);
++        assert!(ticket(&w.dcv, &w.keys, &w.se, &w.approvals, "social:edit-bio", "mac-lei", params, 0, 600, 2000).is_err());
++    }
++}
