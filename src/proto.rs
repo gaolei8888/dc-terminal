@@ -1471,7 +1471,7 @@ pub enum KeepEntryProblem {
     KeepNotAnArray,
 }
 
-/// 常驻会话为什么没能起来、或者为什么停止重启它。
+/// 常驻会话为什么没能起来、或者为什么一直在停。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KeptSessionReason {
     /// 配置里的目录不存在了
@@ -1480,7 +1480,8 @@ pub enum KeptSessionReason {
     ProfileGone,
     /// 启动失败
     StartFailed,
-    /// 反复崩溃，不再自动重启
+    /// 开起来又很快停了，连着好几次。看守照样会重开，只是每次等得更久
+    /// （最多 5 分钟一次），并不放弃
     CrashLooping,
     /// 名字和另一个会话撞了
     NameClash,

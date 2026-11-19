@@ -2834,8 +2834,8 @@ pub mod msg {
                     ),
                     crate::proto::KeptSessionReason::CrashLooping => t!(
                         lang,
-                        en: "it keeps stopping, so it will not be restarted again",
-                        zh: "它一直在停，不再自动重开了",
+                        en: "it keeps stopping; dct keeps restarting it, waiting longer each time (up to 5 minutes)",
+                        zh: "它一直在停；dct 会继续重开，每次多等一会儿（最多等 5 分钟）",
                     ),
                     crate::proto::KeptSessionReason::NameClash => t!(
                         lang,
