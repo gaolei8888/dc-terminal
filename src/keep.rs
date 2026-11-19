@@ -81,6 +81,15 @@ pub fn parse(src: &str, home: &Path) -> (Vec<Keep>, Vec<WarningCode>) {
             warnings.push(invalid(index, KeepEntryProblem::MissingField("dir".into())));
             continue;
         };
+        // 展开 `~` 之后还不是完整路径，就不收：相对路径会按后台自己所在的
+        // 文件夹去找，要么报「目录不在」让人摸不着头脑，要么开到别处去
+        let dir = expand(&dir, home);
+        // 看「从根上写起」而不是 `is_absolute`：Windows 上 `/w` 不算 absolute
+        // （没写盘符），可它指的是当前盘的根，不是后台所在的文件夹，照收
+        if !dir.has_root() {
+            warnings.push(invalid(index, KeepEntryProblem::DirNotAbsolute));
+            continue;
+        }
         if out.iter().any(|k| k.name == name) {
             warnings.push(invalid(index, KeepEntryProblem::DuplicateName(name)));
             continue;
@@ -88,7 +97,7 @@ pub fn parse(src: &str, home: &Path) -> (Vec<Keep>, Vec<WarningCode>) {
         out.push(Keep {
             name,
             profile,
-            dir: expand(&dir, home),
+            dir,
         });
     }
     (out, warnings)
@@ -389,6 +398,23 @@ dir = "/w/b"
             problem(&w[0]),
             (1, &KeepEntryProblem::MissingField("profile".into()))
         );
+    }
+
+    #[test]
+    fn a_relative_dir_is_rejected_and_the_rest_survive() {
+        // 不是完整路径也不是 `~` 开头：会按后台自己所在的文件夹去找，
+        // 要么报「目录不在」让人摸不着头脑，要么开到别处去
+        let src = "[[keep]]\nname = \"a\"\nprofile = \"p\"\ndir = \"tutor\"\n\
+             [[keep]]\nname = \"b\"\nprofile = \"p\"\ndir = \"./x\"\n\
+             [[keep]]\nname = \"c\"\nprofile = \"p\"\ndir = \"~tutor\"\n\
+             [[keep]]\nname = \"d\"\nprofile = \"p\"\ndir = \"/w\"\n";
+        let (k, w) = parse(src, &home());
+        assert_eq!(k.len(), 1);
+        assert_eq!(k[0].name, "d");
+        assert_eq!(w.len(), 3);
+        for (i, w) in w.iter().enumerate() {
+            assert_eq!(problem(w), (i + 1, &KeepEntryProblem::DirNotAbsolute));
+        }
     }
 
     #[test]

@@ -2802,6 +2802,11 @@ pub mod msg {
                         en: format!("the name “{n}” is already used by an earlier entry"),
                         zh: format!("名字「{n}」前面已经用过了"),
                     ),
+                    crate::proto::KeepEntryProblem::DirNotAbsolute => t!(
+                        lang,
+                        en: "the folder must be a full path or start with ~/".to_string(),
+                        zh: "文件夹要写完整路径或 ~/ 开头".to_string(),
+                    ),
                     crate::proto::KeepEntryProblem::NotATable
                     | crate::proto::KeepEntryProblem::KeepNotAnArray => t!(
                         lang,
@@ -3883,6 +3888,10 @@ mod tests {
             KeepEntryInvalid {
                 index: 2,
                 reason: crate::proto::KeepEntryProblem::NotATable,
+            },
+            KeepEntryInvalid {
+                index: 1,
+                reason: crate::proto::KeepEntryProblem::DirNotAbsolute,
             },
             KeepEntryInvalid {
                 index: 0,

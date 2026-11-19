@@ -1466,6 +1466,9 @@ pub enum KeepEntryProblem {
     DuplicateName(String),
     /// 这一条根本不是一张表（比如 `keep = [1, 2]` 里的 `1`）
     NotATable,
+    /// `dir` 既不是完整路径也不是 `~` / `~/…` 开头。相对路径会按后台自己
+    /// 所在的文件夹去找，用户想的从来不是那里。
+    DirNotAbsolute,
     /// `keep` 本身不是数组（比如 `keep = 3`）。这时没有「第几条」，`index` 填 0，
     /// 渲染时不提序号。
     KeepNotAnArray,
