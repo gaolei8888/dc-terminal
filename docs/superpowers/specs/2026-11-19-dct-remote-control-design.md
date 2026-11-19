@@ -1,0 +1,151 @@
+# dct 远程操作（第一期）：在一台电脑上操作另一台电脑上的会话 —— 设计
+
+**状态：** 2026-11-19 对话里逐条确认的范围；写文档时查代码补的部分标「（我的决定）」。
+**起因：** 用户 2026-11-19：「两台跑 dct 的电脑能通过远程 internet 互联」「换电脑但希望同步工作」「希望用多台电脑合作做大型项目，也会有别人的电脑参与」。
+
+**关联：**
+- `2026-09-28-dct-multi-machine-design.md`：组、名单、电脑钥匙、留言。本期全部建在它上面。
+- `2026-11-19-dct-asking-state-design.md`：「等你回答」状态；远程会话一样显示。
+
+---
+
+## 为什么
+
+用户换电脑后要接着干同样的活：代码和 agent 留在原来那台，在新电脑上**跟在本机一样**操作它们。更远的目标是多台电脑（以后包括别人的）分工做大项目——本期是这件事的地基：一块看板看得见、操作得了所有电脑上的 agent。
+
+## 用户已定的
+
+| 问题 | 决定 |
+|---|---|
+| 换电脑指什么 | 远程操作（代码和 agent 留在原机），不是搬迁 |
+| 操作到什么程度 | 跟在本机一样：远程会话出现在看板上，Enter 进去看实时画面，每个键都发过去，F2 回来 |
+| 谁能操作 | 被操作的电脑自己开开关「允许我的其他电脑远程操作」，默认关；只认同账号的电脑；被连着时看板常亮提示，一个键断开 |
+| 延迟 | 不管。走现有 dataclue.cn 中转，不改中转、不加服务器 |
+| 别人的电脑 | 第二期（要改中转，单独设计）。本期授权判断按「谁·哪个项目·能做什么」的形状写，只启用「我自己的电脑·全部」一种 |
+| 应用 UI 共享 | 以后：网页应用端口转发是第二/三期；桌面窗口共享先用现成远程桌面工具 |
+
+## 目标 / 非目标 / 反目标
+
+**目标**
+- 打开 dct，同组其他电脑（开了开关的）上的会话按电脑名出现在看板上。
+- 进远程会话：画面、按键、滚轮、鼠标、F3/F8 轮转、复制模式、F5 粘贴文字——跟本机一样能用。
+- 远程开新会话（在那台电脑已有的项目里）、停、撤销、看 diff。
+- 被操作的那台看得见「谁在操作」，一个键踢掉。
+
+**非目标（本期不做）**
+- 跨账号 / 别人的电脑；按人按项目分权（只留形状）。
+- 中转加实时长连接；直连（Tailscale 等）。
+- 端口转发、窗口共享。
+- 远程改密钥、配对手机、开网页、直播、组管理（邀请/移除）、重启守护进程。
+- 远程会话进九宫格之外的新视图。
+
+**反目标（做出来但这样就算失败）**
+- 远程那台没开开关，却能被操作。
+- 远程调用卡住本机看板（本机会话也跟着卡）。
+- 远程会话的按键丢失或乱序（打出来的字跟敲的不一样）。
+- 被操作的电脑上的人不知道自己正被操作。
+
+## 约束（查代码得出）
+
+- **传输：** `Net::ask(to, payload, timeout)`（`src/mesh/net.rs:23`）经中转 `/link/ask`，一问一答，payload ≤ 1MB（`dct_link::MAX_PAYLOAD`），中转按同账号路由。实测本机到中转一次请求 ≈0.5s。
+- **加密与身份：** 留言走 `Payload::Sealed` + `seal::open(…, &roster, env.from)`（`src/mesh/mod.rs:408`）：对方必须在当前签名名单里，按 `(from,id)` 去重，`sent_at` 在 ±10 分钟窗口内。远程调用沿用同一套。
+- **收件入口唯一：** 电脑信封只从 `Mesh::on_envelope` 进（`src/mesh/mod.rs:260`），`step` 在 mesh 锁里只做验证和决定，真正干活（敲字）挪到锁外——远程调用照此办理。
+- **安全边界长在被保护的东西旁边：** `daemon::handle` 已经用 `web: Option<…>` 让「从 HTTP 来的请求」物理上拿不到 `Web*` 开关（`src/daemon.rs:1695` 起的注释）。远程来源同理，见下。
+- **看板每 16ms 同步调一次 `Screen`**（`src/ui/mod.rs:998`），九宫格批量 `Screens`。远程一次 0.5s，不能放在这条同步路径上。
+- **名单成员没有账号字段**（`dct_mesh::roster::Member`）。同账号目前由「中转只在同账号内路由 + 加组要同账号」保证。
+
+## 方案取舍
+
+1. **（采用）把看板↔守护进程那套 `Request/Response` 原样经加密信封转发给对方守护进程。** 本机看板只跟本机守护进程说话；本机守护进程替它 `ask` 对方。现成的进会话、九宫格、F2/F3、复制、粘贴几乎都复用。代价：每个请求一个来回，画面 1–2 帧/秒。
+2. 拼直播推流（画面）+ 留言（按键），不改协议：直播流不是端到端加密；留言为一问一答设计，接不了端口转发。否决。
+3. 把对方整个 dct 界面搬过来（类 SSH）：对方看板盖住你的看板，F2 归谁打架，达不到「跟在本机一样」。否决。
+
+## 设计
+
+### 1. 线上格式
+
+`dct_mesh::seal::Kind` 加两种：`RemoteCall`、`RemoteReply`。`Message.body` 是 JSON：
+
+- `RemoteCall`：`{"req": <proto::Request 的 JSON>}`
+- `RemoteReply`：`{"resp": <proto::Response 的 JSON>}`
+
+走 `Net::ask`，答复就是同一次 ask 的回信（跟邀请码那几步一样），不走轮询。超时用 `CALL_TIMEOUT`（8s）。`to_session` 留空——会话 id 在 `req` 里。
+
+**不丢、不重（我的决定）：** 超时不代表对方没执行——对方可能已经敲进去了、`Create` 可能已经建好了（它要先拍 git 快照，可能超过 8s）。所以 `RemoteCall` 的 body 再带一个 `seq`（每台操作方电脑一条递增序号），被操作方按操作方电脑记「已执行到第几号」和最后几条的答复：
+- 收到已执行过的 `seq` → 不再执行，原样回上次的答复；
+- 重试一律用**新信封、同一个 `seq`**（新信封绕开留言那张去重表，同一个 `seq` 保证只执行一次）；
+- 远程调用的去重另起一张表，不挤留言那张（`Seen` 上限 1024）。
+
+### 2. 授权：一张表，本期一行
+
+新模块 `src/mesh/remote.rs`：
+
+```rust
+pub enum Capability { View, Operate, Manage }
+/// 谁（发件电脑 endpoint）、哪个项目目录（None = 全部）、能做什么。
+pub struct Grant { pub who: String, pub project: Option<PathBuf>, pub caps: Vec<Capability> }
+pub fn allowed(req: &Request, grants: &[Grant], from: &str, project_of: impl Fn(u32) -> Option<PathBuf>) -> bool
+```
+
+本期 `grants` 只由开关生成：开关开 → 名单上除自己以外每台电脑一条 `{who, project: None, caps: [View, Operate, Manage]}`；关 → 空表，一切拒绝。第二期往这张表里加别人、加项目范围，判定函数不变。
+
+请求 → 能力（白名单；**不在表里的一律拒绝**，新加的 `Request` 默认远程不可用）：
+
+| 能力 | 请求 |
+|---|---|
+| View | `Hello` `List` `Screen` `Screens` `Explanation` `Projects` `Profiles` |
+| Operate | `Input` `Submit` `Key` `Mouse` `Scroll` `Resize` |
+| Manage | `Create`（`dir` 必须是那台电脑 `Projects` 里已有的项目）`Stop` `Undo` `Diff` `LastProfile` |
+
+明确不给：`Kill` `Prune` `SetSecret` `DeleteSecret` `VerifySecret` `Pair*` `Phone*` `Web*` `Live*` `Mesh*` `Drain*` `PinProject` `UnpinProject`。（我的决定：`Kill` 不给——远程看不清对方状态时强杀代价大；`Pin*` 是本机看板偏好。）
+
+### 3. 被操作的一方（守护进程）
+
+- `Mesh::step` 收到 `Kind::RemoteCall`：验完名单/去重/窗口后，开关关 → 立刻回 `RemoteReply` 带 `ErrorCode::RemoteControlOff`；开 → 带出 `Step::Remote(call)`，锁外执行。
+- 执行入口：`deliver::Inbox` 加 `fn remote_call(&self, from: &str, req: Request) -> Response`，守护进程实现它：先 `remote::allowed`，再调 `daemon::handle`。`handle` 加参数 `origin: Origin`（`Local | Http | Remote { from }`），**`Origin::Remote` 时 `handle` 内部再按白名单拒一次**（第二道，防将来有人绕过 `remote_call` 直接调 `handle`）。现有 `web: Option` 的语义并入 `Origin::Http`（我的决定；不并也行，但两个参数说同一件事会分叉）。
+- **不挤占别的流量（我的决定）：** 现在一台电脑收信封是一条线程一条一条处理（`Link::run`，`src/link.rs:316`），留言、状态查询、手机都排在这条线上。远程调用不在这条线上执行：`step` 验完就交给每台操作方电脑各一条的工作线程（按 `seq` 保序），收件线程立刻回去取下一封；工作线程做完再把答复回给那次 ask。同一操作方的队列里，`Operate`（按键）排在 `View`（取画面）前面；队列积压时丢掉旧的取画面请求，只留最新一条。「每秒 1–2 帧」不是承诺，是线路允许时的上限。
+- **在场记录（我的决定）：** 只有**真在用**才算：取某个会话的画面（`Screen`/`Screens`）或任何 Operate/Manage 请求。看板为了显示远程分组每 3 秒取一次 `List`，**不算**——否则对方只要开着 dct，这边就永远亮着提示，人很快就不看了。10 秒内有过 → 算「正在远程操作」，`dct status --json` 加 `remote_viewers: [电脑名]`。提示画在看板顶栏，**也画在会话里的底栏**（本机的人最可能正在会话里打字，和远程同时敲）。
+- **踢掉：** 看板上一个键（我的决定：`K`，看板和九宫格都认）= 把开关关掉，并在顶栏提示「已断开 Mac，远程操作已关」。重开在设置页。
+- **开关：** 设置页一项「允许我的其他电脑远程操作」，默认关，存 `~/.dct/config.toml` 的 `[mesh] allow_remote_control`。改它只能从本机（`Origin::Local`）。
+
+### 4. 操作的一方（看板）
+
+- 新请求 `Request::RemoteCall { peer: String, req: Box<Request> }` → 本机守护进程把它封成信封 `ask` 对方，把对方的 `Response` 原样回来；对方不在线 / 超时 / 拒绝 → `ErrorCode::RemoteUnavailable { peer }` 或对方给的错误码。
+- **不阻塞界面：** 看板不在主循环里同步调远程。每个「正在看」的远程目标一个后台线程（`src/ui/remote_feed.rs`）：
+  - 画面：循环 `RemoteCall{Screen}`（九宫格用 `Screens`），结果放进缓存，主循环每帧读缓存；画面角上显示「n 秒前」当缓存超过 2 秒。
+  - 按键：进一个有序队列，后台线程按序发 `Input`/`Key`/`Mouse`/`Scroll`。**连续的普通字符合并成一次 `Input`**（减少来回），控制键各自一条。发失败的保留在队首、带着原来的 `seq` 重试（见第 1 节，对方执行过的不会再执行），顺序不乱；连续失败 3 次在底栏报「发往 Mac 的按键没送到」并清空队列（我的决定：清空比稍后一股脑打进去安全）。`Create`/`Undo`/`Stop` 同样带 `seq` 重试，不会因为第一次超时建出两个会话。
+  - 会话列表：每 3 秒一次 `RemoteCall{List}`，失败就把那台电脑的分组标成「离线」，不把会话从看板上抹掉。
+- **看板分组：** 远程会话按电脑名分组（组名「Mac」，项目路径显示在行里），排在本机分组之后。会话 id 在界面内部记成 `(peer, id)`，本机是 `(None, id)`；所有现在用 `u32` 指代会话的界面状态改成这个键（`SessionKey`）。
+- **尺寸：** 进入远程会话照常发 `Resize`（我的决定：换电脑时原机通常没人看，跟 tmux「最后一个连上的说了算」一致；原机上的人会看到画面重排一次）。
+- **F3/F8 轮转、九宫格、`i` 回复框、`s/u/d`、`n`：** 都按 `SessionKey` 工作；`n` 在远程分组上 = 在那台电脑上开，项目选择列表来自对方 `Projects`。
+- **F5 粘贴图片：** 远程会话只粘文字（图片要传文件，本期不做），按 F5 时底栏说明。
+
+### 5. 错误码与文案
+
+`proto::ErrorCode` 加 `RemoteControlOff`（「Mac 没开远程操作」）、`RemoteUnavailable { peer }`（「连不上 Mac」）、`RemoteForbidden`（「Mac 不允许远程做这件事」）。中英文都进 `i18n`。
+
+### 6. 协议版本
+
+`proto` 的协议号 +1（`Kind` 和 `Request` 都加了变体）。老守护进程收到 `RemoteCall` 解不开 → 走现有 `undecodable` 丢弃 → 本机这边超时报 `RemoteUnavailable`。不额外做版本协商（我的决定）。
+
+## 测试要点
+
+- `remote::allowed`：白名单逐条；开关关全拒；不在名单的发件人拒；`Create` 的 `dir` 不在对方项目里拒。
+- `Origin::Remote` 进 `handle` 时白名单外的请求被拒（第二道）。
+- `FakeHub` 上两台 `Mesh`：A `RemoteCall{List}` → B 回会话列表；B 关开关 → `RemoteControlOff`；重放同一信封 → 第二次被去重丢掉。
+- 按键队列：普通字符合并、控制键不合并、失败重试保序、连续失败清空并报错。
+- 远程目标慢（假 `Net` 每次睡 1s）时，本机看板主循环每帧耗时不超过 50ms。
+- 在场记录：10 秒窗口进出；只有 `List` 的不算；`K` 关开关并清在场。
+- 同一 `seq` 发两次（模拟超时后重试）：只执行一次，两次答复相同；`Create` 只建一个会话。
+- 远程调用慢（假执行睡 3s）时，同时到的一条留言照常送达，不排在它后面。
+- 答复超过 1MB（大 `Diff`、九格 `Screens`）：拆分或截断并说明，不静默失败。
+
+## 留给实现者
+
+- 答复超过 1MB 时拆还是截。
+- 看板到本机守护进程的超时（5s）短于远程超时（8s）：`RemoteCall` 请求要用 `call_within` 放宽。
+- `Instance` 是否进 View 白名单。
+- 没开远程操作的电脑在看板上怎么显示（灰掉的分组 + 一句「没开远程操作」即可）。
+- 后台线程的具体节奏（画面取多快、空闲时是否放慢）。
+- `SessionKey` 迁移的切分方式。
+- 「n 秒前」的样式。
