@@ -265,7 +265,7 @@ pub(crate) fn run_with_hooks(
     // `Request::PhoneSetToken` 成功时会重新调用一次 `set_event_sink`
     // 把它补上（用户从 `Off` 第一次填令牌走的正是这条路径），
     // `Request::PhoneDisable` 会调用 `clear_event_sink` 收回——两处
-    // 都在 `handle()` 里，见那两个分支的注释。
+    // 都在 `handle(, Origin::Local)` 里，见那两个分支的注释。
     if recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some() {
         mgr.set_event_sink(event_tx.clone());
     }
@@ -1682,6 +1682,7 @@ fn serve(
                 Some(&web),
                 &pairs,
                 &live,
+                Origin::Local,
             ),
             Err(e) => Response::Error(ErrorCode::BadRequest(e.to_string())),
         };
@@ -1689,6 +1690,36 @@ fn serve(
         out.flush()?;
     }
     Ok(())
+}
+
+/// 一条请求从哪条路进 `handle`。
+///
+/// 跟 `web: Option<…>` 参数并存而没有并进来：并进来要动 `web.rs` 全部路由，
+/// 留到以后。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// 本机 socket：桌面界面和命令行。
+    Local,
+    /// 局域网手机页。
+    Http,
+    /// 组里另一台电脑经中转发来的远程调用；`from` 是对方的电脑名。
+    Remote { from: String },
+}
+
+/// 读 / 写远程操作开关。开关落在 mesh 目录（`remote_control.json`）。
+fn remote_control(mgr: &SessionManager, set: Option<bool>) -> anyhow::Result<Response> {
+    let home = mgr
+        .dct_home()
+        .ok_or_else(|| anyhow::anyhow!("dct 家目录未知，读不了远程操作开关"))?;
+    let store = crate::mesh::store::Store::at(home.join("mesh"));
+    if let Some(on) = set {
+        store.set_remote_control(on)?;
+    }
+    Ok(Response::RemoteControl {
+        on: store.remote_control(),
+        // 谁正在远程操作这台电脑，Task 4 接上在线名单后在这里填。
+        viewers: vec![],
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1715,7 +1746,16 @@ fn handle(
     // 同一场直播（是不是允许后一条路控制开关，是下一个任务接配对身份时
     // 要定的边界，这里先跟 `phone` 一样两边都能看）。
     live: &Arc<crate::live::LiveState>,
+    // 这条请求从哪来。**`Remote` 在函数第一步就按白名单过一遍**，不是路由
+    // 层拦过就算数——这是第二道，第一道漏了（或者将来谁加了条新入口忘了
+    // 拦）也到不了下面任何一支。
+    origin: Origin,
 ) -> Response {
+    if let Origin::Remote { .. } = &origin {
+        if crate::mesh::remote::capability_of(&req).is_none() {
+            return Response::Error(ErrorCode::RemoteForbidden);
+        }
+    }
     let r: anyhow::Result<Response> = match req {
         // 不碰任何状态，也不该失败：界面拿它判断「我该不该跟你说话」。
         Request::Hello => Ok(Response::Hello {
@@ -1726,9 +1766,16 @@ fn handle(
         }),
         // 占位：远程操作的执行入口在后面的任务里接上。在那之前一律拒绝，
         // 绝不能让一条远程请求落进下面任何一支。
-        Request::RemoteCall { .. } | Request::RemoteControl { .. } => {
-            Ok(Response::Error(ErrorCode::RemoteForbidden))
-        }
+        Request::RemoteCall { .. } => Ok(Response::Error(ErrorCode::RemoteForbidden)),
+        // 「允许我的其他电脑操作这台」的开关：只有本机 socket 碰得到它，
+        // 手机页（Http）和远端电脑（Remote）连读都不给——让别人替这台电脑
+        // 开门，等于没有这道门。
+        Request::RemoteControl { set } => match origin {
+            Origin::Local => remote_control(mgr, set),
+            Origin::Http | Origin::Remote { .. } => {
+                Ok(Response::Error(ErrorCode::RemoteForbidden))
+            }
+        },
         Request::List => Ok(Response::Sessions(mgr.list())),
         Request::Profiles { lang } => {
             let (all, mut warnings) = all_profiles(profiles_dir);
@@ -2470,7 +2517,7 @@ fn web_enable(
         live.clone(),
     );
     let dispatch =
-        move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr, &lv);
+        move |req: Request| handle(req, &m, &s, &sec, &pd, &ph, &br, &et, None, &pr, &lv, Origin::Http);
     let routes = crate::web::routes::Routes::new(Arc::new(dispatch));
     let server = crate::web::serve(listener, token.clone(), Arc::new(routes));
     let port = server.addr().port();
@@ -2676,7 +2723,7 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// 大多数 `handle()` 测试根本不关心手机通知，就是要传一个空壳槽。
+    /// 大多数 `handle(, Origin::Local)` 测试根本不关心手机通知，就是要传一个空壳槽。
     fn test_phone() -> Arc<Mutex<PhoneStatus>> {
         Arc::new(Mutex::new(PhoneStatus {
             state: PhoneState::Off,
@@ -2865,7 +2912,7 @@ mod tests {
         );
     }
 
-    /// `handle()` 现在要求一个 `event_tx`（修复 1：`PhoneSetToken` 成功时
+    /// `handle(, Origin::Local)` 现在要求一个 `event_tx`（修复 1：`PhoneSetToken` 成功时
     /// 要能重新调用 `set_event_sink`）——大多数测试不关心手机通知，给一个
     /// 没人接收的 channel 就够了，`send()` 本身不会因为没有接收端而失败。
     fn test_event_tx() -> std::sync::mpsc::Sender<Event> {
@@ -3935,6 +3982,7 @@ mod tests {
             None,
             &test_pairs(),
             &test_live(),
+            Origin::Local,
         );
 
         match resp {
@@ -3995,6 +4043,7 @@ mod tests {
             None,
             &test_pairs(),
             &test_live(),
+            Origin::Local,
         ) {
             Response::Profiles { entries, .. } => entries
                 .into_iter()
@@ -4024,12 +4073,12 @@ mod tests {
     /// `session::tests::creating_a_session_is_not_held_up_by_the_first_checkpoint`），
     /// 这里用一个**故意造大的仓库**钉住它不许挪回来。
     ///
-    /// 「不许持锁」是更早一次审查的回归：`handle()` 曾经在建会话的整段流程里
+    /// 「不许持锁」是更早一次审查的回归：`handle(, Origin::Local)` 曾经在建会话的整段流程里
     /// 一直攥着 secrets 锁，而 `SetSecret`/`DeleteSecret` 这两个本该极快的
     /// 操作绝不能被堵住排队。慢活挪走之后这条已经不容易踩中，但断言留着——
     /// 哪天又有人往 `Create` 里塞同步慢活，上面那条先红，这条随后。
     ///
-    /// 直接调用 `handle()` 而不是走真实 socket，是为了最直接地量最本质的
+    /// 直接调用 `handle(, Origin::Local)` 而不是走真实 socket，是为了最直接地量最本质的
     /// 东西，不掺网络往返的噪音。
     #[test]
     fn create_does_not_hold_the_secrets_lock_across_the_slow_work() {
@@ -4074,6 +4123,7 @@ mod tests {
                 None,
                 &test_pairs(),
                 &test_live(),
+                Origin::Local,
             );
             (t.elapsed(), resp)
         });
@@ -4141,7 +4191,7 @@ mod tests {
     }
 
     /// 回归测试：`Request::Explanation` 真的接到了 `mgr.explanation()`，不是
-    /// 一条只在类型上存在、`handle()` 里没人接的死请求。
+    /// 一条只在类型上存在、`handle(, Origin::Local)` 里没人接的死请求。
     #[test]
     fn explanation_request_is_wired_to_the_session_manager() {
         let repo = tempfile::tempdir().unwrap();
@@ -4191,6 +4241,7 @@ mod tests {
                 None,
                 &test_pairs(),
                 &test_live(),
+                Origin::Local,
             );
             if let Response::Explanation(Some(text)) = resp {
                 assert_eq!(text, "这个命令没配好，重开一次就行。");
@@ -4226,6 +4277,7 @@ mod tests {
             None,
             &test_pairs(),
             &test_live(),
+            Origin::Local,
         );
         assert!(matches!(resp, Response::Explanation(None)));
     }
@@ -4314,6 +4366,7 @@ mod tests {
             None,
             &test_pairs(),
             &test_live(),
+            Origin::Local,
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -4363,6 +4416,7 @@ mod tests {
             None,
             &test_pairs(),
             &test_live(),
+            Origin::Local,
         );
         let Response::Profiles { warnings, .. } = resp else {
             panic!("期待 Response::Profiles");
@@ -4378,7 +4432,7 @@ mod tests {
         );
     }
 
-    /// `bare_handle_deps` 的返回值：调用 `handle()` 要用的三个壳
+    /// `bare_handle_deps` 的返回值：调用 `handle(, Origin::Local)` 要用的三个壳
     /// （mgr/store/secrets）以及一个空 profiles 目录。
     type BareHandleDeps = (
         Arc<SessionManager>,
@@ -4387,7 +4441,7 @@ mod tests {
         tempfile::TempDir,
     );
 
-    /// 拼齐调用 `handle()` 要用的三个壳（mgr/store/secrets）以及一个空
+    /// 拼齐调用 `handle(, Origin::Local)` 要用的三个壳（mgr/store/secrets）以及一个空
     /// profiles 目录，手机通知的这几条测试都不关心这几个，只是签名要它们。
     fn bare_handle_deps() -> BareHandleDeps {
         let mgr = Arc::new(SessionManager::new());
@@ -4399,6 +4453,77 @@ mod tests {
         )));
         let profiles_dir = tempfile::tempdir().unwrap();
         (mgr, store, secrets, profiles_dir)
+    }
+
+    /// 用 `bare_handle_deps` 那套壳，以指定来源跑一条请求；家目录指到临时目录，
+    /// 开关文件落在 `<home>/mesh/`。
+    fn handle_from(origin: Origin, home: &Path, req: Request) -> Response {
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        mgr.set_pair_models_home(home.to_path_buf());
+        handle(
+            req,
+            &mgr,
+            &store,
+            &secrets,
+            profiles_dir.path(),
+            &test_phone(),
+            &test_bridge(),
+            &test_event_tx(),
+            None,
+            &test_pairs(),
+            &test_live(),
+            origin,
+        )
+    }
+
+    fn remote() -> Origin {
+        Origin::Remote { from: "Mac".into() }
+    }
+
+    fn switch_on(home: &Path) -> bool {
+        crate::mesh::store::Store::at(home.join("mesh")).remote_control()
+    }
+
+    #[test]
+    fn local_origin_can_read_and_toggle_remote_control() {
+        let home = tempfile::tempdir().unwrap();
+        let resp = handle_from(Origin::Local, home.path(), Request::RemoteControl { set: None });
+        assert!(matches!(resp, Response::RemoteControl { on: false, .. }), "{resp:?}");
+        let resp = handle_from(
+            Origin::Local,
+            home.path(),
+            Request::RemoteControl { set: Some(true) },
+        );
+        assert!(matches!(resp, Response::RemoteControl { on: true, .. }), "{resp:?}");
+        assert!(switch_on(home.path()));
+    }
+
+    #[test]
+    fn remote_origin_cannot_toggle_remote_control() {
+        let home = tempfile::tempdir().unwrap();
+        let resp = handle_from(remote(), home.path(), Request::RemoteControl { set: Some(true) });
+        assert!(matches!(resp, Response::Error(ErrorCode::RemoteForbidden)), "{resp:?}");
+        assert!(!switch_on(home.path()));
+    }
+
+    #[test]
+    fn http_origin_cannot_toggle_remote_control() {
+        let home = tempfile::tempdir().unwrap();
+        let resp = handle_from(
+            Origin::Http,
+            home.path(),
+            Request::RemoteControl { set: Some(true) },
+        );
+        assert!(matches!(resp, Response::Error(ErrorCode::RemoteForbidden)), "{resp:?}");
+        assert!(!switch_on(home.path()));
+    }
+
+    /// 第二道：就算路由层漏了，`Kill` 这种白名单外的请求进了 `handle` 也到不了执行。
+    #[test]
+    fn remote_origin_is_refused_off_whitelist_even_inside_handle() {
+        let home = tempfile::tempdir().unwrap();
+        let resp = handle_from(remote(), home.path(), Request::Kill { id: 1 });
+        assert!(matches!(resp, Response::Error(ErrorCode::RemoteForbidden)), "{resp:?}");
     }
 
     /// 排空只从本机 socket 上发起（在 `serve` 里分走）；从局域网手机页那一路
@@ -4429,6 +4554,7 @@ mod tests {
                 None,
                 &test_pairs(),
                 &test_live(),
+                Origin::Local,
             );
             assert!(
                 matches!(resp, Response::Error(ErrorCode::BadRequest(_))),
@@ -4461,6 +4587,7 @@ mod tests {
             None,
             &test_pairs(),
             &test_live(),
+            Origin::Local,
         );
 
         match resp {
@@ -4516,6 +4643,7 @@ mod tests {
             None,
             &test_pairs(),
             &test_live(),
+            Origin::Local,
         );
 
         match resp {
@@ -4588,6 +4716,7 @@ mod tests {
             None,
             &test_pairs(),
             &test_live(),
+            Origin::Local,
         );
 
         match resp {
@@ -4942,6 +5071,7 @@ mod tests {
             None,
             &test_pairs(),
             &test_live(),
+            Origin::Local,
         );
 
         match resp {
@@ -4989,6 +5119,7 @@ mod tests {
             None,
             &test_pairs(),
             &live,
+            Origin::Local,
         );
 
         assert!(
@@ -5024,6 +5155,7 @@ mod tests {
             None,
             &test_pairs(),
             &live,
+            Origin::Local,
         );
 
         match resp {
@@ -5063,6 +5195,7 @@ mod tests {
             None,
             &test_pairs(),
             &live,
+            Origin::Local,
         );
 
         match resp {
@@ -5103,6 +5236,7 @@ mod tests {
             None,
             &test_pairs(),
             &live,
+            Origin::Local,
         );
 
         assert!(
@@ -5138,6 +5272,7 @@ mod tests {
             None,
             &test_pairs(),
             &live,
+            Origin::Local,
         );
 
         let Response::Live(info) = resp else {
@@ -5171,6 +5306,7 @@ mod tests {
             None,
             &test_pairs(),
             &live,
+            Origin::Local,
         );
 
         assert!(
@@ -5205,6 +5341,7 @@ mod tests {
             None,
             &test_pairs(),
             &live,
+            Origin::Local,
         );
 
         match resp {
@@ -5236,6 +5373,7 @@ mod tests {
             None,
             &test_pairs(),
             live,
+            Origin::Local,
         )
     }
 
@@ -5425,7 +5563,7 @@ mod web_tests {
     use super::*;
     use crate::proto::WebInfo;
 
-    /// `handle()` 那一串参数在测试里要用四遍，打包成一个结构体传——
+    /// `handle(, Origin::Local)` 那一串参数在测试里要用四遍，打包成一个结构体传——
     /// 返回一个八元组的话 clippy 也有话说，而且调用点全是 `.0`/`.3` 这种
     /// 读不出意思的下标。
     struct Fx {

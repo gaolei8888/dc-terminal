@@ -978,6 +978,11 @@ impl SessionManager {
         *recover(self.pair_models_home.lock()) = Some(path);
     }
 
+    /// dct 的家目录；没装过（单元测试默认）就是 `None`。
+    pub fn dct_home(&self) -> Option<PathBuf> {
+        recover(self.pair_models_home.lock()).clone()
+    }
+
     /// 把自带运行时重新挂一遍守护进程的 PATH。
     ///
     /// **建 agent 会话之前必须调一次。** 守护进程启动时已经挂过，但那一刻

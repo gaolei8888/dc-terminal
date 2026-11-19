@@ -20,6 +20,7 @@ const SIGN_KEY: &str = "sign.key";
 const KX_KEY: &str = "kx.key";
 const NAME: &str = "name";
 const ROSTER: &str = "roster.json";
+const REMOTE_CONTROL: &str = "remote_control.json";
 const KEYS_LOCK: &str = ".keys.lock";
 
 /// 等别的进程生成钥匙最多等多久。生成本身是几毫秒的事。
@@ -165,6 +166,26 @@ impl Store {
         self.ensure_dir()?;
         let bytes = serde_json::to_vec_pretty(r)?;
         write_atomic(&self.dir.join(ROSTER), &bytes)
+    }
+
+    /// 允许不允许组里其他电脑操作这台。缺文件、读不了、解析不了一律当关：
+    /// 门的默认状态必须是关着，出了岔子也不能变成开着。
+    pub fn remote_control(&self) -> bool {
+        std::fs::read(self.dir.join(REMOTE_CONTROL))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("on").and_then(|o| o.as_bool()))
+            .unwrap_or(false)
+    }
+
+    /// 开 / 关。存在这里而不是 `config.toml`：那个文件程序只读，改写会冲掉
+    /// 用户的注释；这个目录本来就有原子写。
+    pub fn set_remote_control(&self, on: bool) -> Result<()> {
+        self.ensure_dir()?;
+        write_atomic(
+            &self.dir.join(REMOTE_CONTROL),
+            &serde_json::to_vec(&serde_json::json!({ "on": on }))?,
+        )
     }
 
     fn ensure_dir(&self) -> Result<()> {
@@ -505,6 +526,20 @@ mod tests {
             let disk = Store::at(dir).load_or_create_keys(&|| [1; 32]).unwrap();
             assert_eq!((disk.sign_pub(), disk.kx_pub()), a);
         }
+    }
+
+    #[test]
+    fn remote_control_is_off_until_turned_on_and_survives_reload() {
+        let (_d, s) = store();
+        assert!(!s.remote_control());
+        s.set_remote_control(true).unwrap();
+        assert!(s.remote_control());
+        assert!(Store::at(s.dir().to_path_buf()).remote_control());
+        s.set_remote_control(false).unwrap();
+        assert!(!Store::at(s.dir().to_path_buf()).remote_control());
+        // 坏文件当关
+        std::fs::write(s.dir().join(REMOTE_CONTROL), b"{not json").unwrap();
+        assert!(!s.remote_control());
     }
 
     #[test]
