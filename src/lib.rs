@@ -17,6 +17,7 @@ pub mod gate;
 pub mod git;
 pub mod i18n;
 pub mod journal;
+pub mod keep;
 pub mod judge;
 pub mod keys;
 pub mod last_sessions;

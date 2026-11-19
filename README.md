@@ -496,6 +496,36 @@ Good to know:
   on. If that file can't be read, dct falls back to asking Claude for the latest
   conversation in that folder (`--continue`).
 
+### Kept sessions
+
+Some sessions should just always be there — say a tutor that other tools send
+messages to by name. Add it to `~/.dct/config.toml`:
+
+```toml
+[[keep]]
+name = "tutor"       # the session's name; dct send finds it by this
+profile = "claude"   # which agent
+dir = "~/tutor"      # which folder: a full path, or ~/… for your home folder
+```
+
+- dct opens it as soon as the background service starts.
+- If it stops — it crashed, or you stopped it yourself — dct opens it again
+  under the **same number**, with the **same name**, and picks up the same
+  conversation where the agent can. Usually it is back within 5–10 seconds.
+- If it keeps stopping right after it opens, dct waits longer each time before
+  trying again: 5 seconds, then 10, 20 … up to 5 minutes. Once it stays up for
+  a minute, the wait goes back to the start.
+- To stop keeping it, delete the entry. The session that is running stays
+  running; dct just won't reopen it after it stops.
+- Changes to the file take effect within about 5 seconds, no restart needed.
+- For an agent, the folder must be a git repository (`git init` it once), the
+  same as any other agent session. dct won't create the folder for you.
+- Write the folder as a full path (`/Users/you/tutor`) or starting with `~/`.
+  Anything else (like just `tutor`) is skipped with a warning.
+- When something is wrong — the folder or agent doesn't exist, it won't start,
+  it keeps stopping, an entry is written wrong, another session already has the
+  same name — dct shows a warning once, not over and over.
+
 ---
 
 ## Commands
