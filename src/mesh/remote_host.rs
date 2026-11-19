@@ -1177,4 +1177,239 @@ mod tests {
             Response::Error(ErrorCode::RemoteUnavailable { ref peer }) if peer == "B"
         ));
     }
+
+    // ---- 操作方：`mesh::call_remote`（A 经中转调 B） ----
+
+    /// 包在 A 的 `FakeNet` 外面：记下每次 `ask` 发出去的 payload；
+    /// `lose_first` 设了，第一次 `ask` 照常投给 B（B 照常执行、答复），但
+    /// 答复「丢在半路」——A 这边看到的是超时。
+    struct Lossy {
+        inner: crate::mesh::net::testing::FakeNet,
+        lose_first: AtomicBool,
+        asked: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl Net for Lossy {
+        fn peers(&self) -> Result<Vec<String>, LinkError> {
+            self.inner.peers()
+        }
+        fn send(&self, to: &str, payload: Vec<u8>) -> Result<(), LinkError> {
+            self.inner.send(to, payload)
+        }
+        fn ask(&self, to: &str, payload: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, LinkError> {
+            self.asked.lock().unwrap().push(payload.clone());
+            let r = self.inner.ask(to, payload, timeout);
+            if self.lose_first.swap(false, Ordering::SeqCst) {
+                return Err(LinkError::Relay(dct_link::LinkError::NoAnswer));
+            }
+            r
+        }
+        fn reply(&self, to: &str, seq: u64, payload: Vec<u8>) -> Result<(), LinkError> {
+            self.inner.reply(to, seq, payload)
+        }
+    }
+
+    impl Two {
+        fn lossy(&self, lose_first: bool) -> Lossy {
+            Lossy {
+                inner: self.hub.net_for(&self.a_ep),
+                lose_first: AtomicBool::new(lose_first),
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// 用 B 的钥匙拆开 A 发出的一条 `RemoteCall`：(消息 id, body)。
+        fn open_call(&self, payload: &[u8]) -> (String, CallBody) {
+            let Payload::Sealed(s) = wire::decode(payload).unwrap() else {
+                panic!("发出去的该是密封的");
+            };
+            let b = self.b.lock().unwrap();
+            let m = seal::open(&s, &b.keys, &b.roster.as_ref().unwrap().roster, &self.a_ep)
+                .unwrap();
+            assert_eq!(m.kind, Kind::RemoteCall);
+            (m.id, serde_json::from_str(&m.body).unwrap())
+        }
+    }
+
+    #[test]
+    fn remote_call_round_trips_a_screen() {
+        let t = two(true);
+        let net = t.lossy(false);
+        let r = crate::mesh::call_remote(&t.a, &net, "B", Request::Screens { ids: vec![7] });
+        match r {
+            Response::Screens { screens } => {
+                assert_eq!(screens.iter().map(|s| s.id).collect::<Vec<_>>(), [7])
+            }
+            other => panic!("该原样回对方的画面：{other:?}"),
+        }
+        assert_eq!(t.inbox.remote_calls(), [r#"{"Screens":{"ids":[7]}}"#]);
+        assert_eq!(net.asked.lock().unwrap().len(), 1, "一次就成，不该重试");
+        // 对方的错误码原样回来，不改写成「连不上」。
+        t.b.lock()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .set_remote_control(false)
+            .unwrap();
+        let r = crate::mesh::call_remote(&t.a, &net, "B", Request::List);
+        assert!(matches!(r, Response::Error(ErrorCode::RemoteControlOff)), "{r:?}");
+    }
+
+    /// 第一次 ask 超时，但 B 其实已经执行了：重试用新信封、同一个 `seq`，
+    /// 拿到的是 B 缓存的那份答复——`Create` 只建了一个会话。
+    #[test]
+    fn a_timeout_is_retried_with_the_same_seq() {
+        let t = two(true);
+        let net = t.lossy(true);
+        let r = crate::mesh::call_remote(&t.a, &net, "B", create());
+        assert!(matches!(r, Response::Created { id: 101 }), "{r:?}");
+        assert_eq!(t.inbox.remote_calls().len(), 1, "Create 只该执行一次");
+        let asked = net.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2, "超时之后该重试一次");
+        let (id1, b1) = t.open_call(&asked[0]);
+        let (id2, b2) = t.open_call(&asked[1]);
+        assert_eq!(b1.seq, b2.seq, "重试要同一个 seq");
+        assert_ne!(id1, id2, "重试要新信封");
+
+        // 下一次调用换下一个号。
+        crate::mesh::call_remote(&t.a, &net, "B", Request::List);
+        let asked = net.asked.lock().unwrap().clone();
+        assert_eq!(t.open_call(&asked[2]).1.seq, b1.seq + 1);
+    }
+
+    /// 老版本的对方解不开 `RemoteCall`，一声不吭丢掉：试满三次就报连不上，
+    /// 不挂着、不无限重试。
+    #[test]
+    fn an_old_peer_that_never_answers_is_reported_unavailable() {
+        struct Deaf(std::sync::atomic::AtomicUsize);
+        impl Net for Deaf {
+            fn peers(&self) -> Result<Vec<String>, LinkError> {
+                Ok(vec![])
+            }
+            fn send(&self, _: &str, _: Vec<u8>) -> Result<(), LinkError> {
+                Ok(())
+            }
+            fn ask(&self, _: &str, _: Vec<u8>, _: Duration) -> Result<Vec<u8>, LinkError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(LinkError::Relay(dct_link::LinkError::NoAnswer))
+            }
+            fn reply(&self, _: &str, _: u64, _: Vec<u8>) -> Result<(), LinkError> {
+                Ok(())
+            }
+        }
+        let t = two(true);
+        let net = Deaf(Default::default());
+        let r = crate::mesh::call_remote(&t.a, &net, "B", Request::List);
+        assert!(
+            matches!(r, Response::Error(ErrorCode::RemoteUnavailable { ref peer }) if peer == "B"),
+            "{r:?}"
+        );
+        assert_eq!(net.0.load(Ordering::SeqCst), crate::mesh::REMOTE_CALL_ATTEMPTS);
+        assert_eq!(crate::mesh::REMOTE_CALL_ATTEMPTS, 3);
+    }
+
+    #[test]
+    fn an_unknown_peer_name_is_reported_unavailable() {
+        let t = two(true);
+        let net = t.lossy(false);
+        for name in ["Nope", "A"] {
+            let r = crate::mesh::call_remote(&t.a, &net, name, Request::List);
+            assert!(
+                matches!(r, Response::Error(ErrorCode::RemoteUnavailable { ref peer }) if peer == name),
+                "{name}: {r:?}"
+            );
+        }
+        assert!(net.asked.lock().unwrap().is_empty(), "不认识的、自己，都不该打网络");
+    }
+
+    /// 同一台对方，几条连接同时调：号不重、不互相排队等网络。
+    #[test]
+    fn concurrent_calls_to_one_peer_get_distinct_seqs() {
+        let t = Arc::new(two(true));
+        let net = Arc::new(t.lossy(false));
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let (t, net) = (t.clone(), net.clone());
+                std::thread::spawn(move || {
+                    // 按键，不用 `List`：积压的「看」会被顶掉（只留最新一条）。
+                    let req = Request::Input {
+                        id: 7,
+                        text: "x".into(),
+                    };
+                    crate::mesh::call_remote(&t.a, net.as_ref(), "B", req)
+                })
+            })
+            .collect();
+        for h in hs {
+            let r = h.join().unwrap();
+            assert!(matches!(r, Response::Ok), "{r:?}");
+        }
+        assert_eq!(t.inbox.remote_calls().len(), 8, "每一条都执行了一次");
+        let asked = net.asked.lock().unwrap().clone();
+        let mut seqs: Vec<u64> = asked.iter().map(|p| t.open_call(p).1.seq).collect();
+        seqs.sort();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 8, "{seqs:?}");
+    }
+
+    /// `ask` 在锁外：等网络的那段 `Mesh` 锁是空的；几条连接调同一台时
+    /// 同时在等，不是一条等完下一条才开始。
+    #[test]
+    fn calls_wait_on_the_network_without_the_mesh_lock_and_side_by_side() {
+        use std::sync::atomic::AtomicUsize;
+        struct Slow {
+            mesh: Arc<Mutex<Mesh>>,
+            now: AtomicUsize,
+            most: AtomicUsize,
+            locked: AtomicBool,
+            /// 只在一条调用独自跑时查锁：几条并发时别的线程正好在锁里封信，
+            /// `try_lock` 会失败，那不是 `ask` 攥着锁。
+            check_lock: AtomicBool,
+        }
+        impl Net for Slow {
+            fn peers(&self) -> Result<Vec<String>, LinkError> {
+                Ok(vec![])
+            }
+            fn send(&self, _: &str, _: Vec<u8>) -> Result<(), LinkError> {
+                Ok(())
+            }
+            fn ask(&self, _: &str, _: Vec<u8>, _: Duration) -> Result<Vec<u8>, LinkError> {
+                if self.check_lock.load(Ordering::SeqCst) && self.mesh.try_lock().is_err() {
+                    self.locked.store(true, Ordering::SeqCst);
+                }
+                let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+                self.most.fetch_max(n, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                self.now.fetch_sub(1, Ordering::SeqCst);
+                Err(LinkError::Relay(dct_link::LinkError::NoAnswer))
+            }
+            fn reply(&self, _: &str, _: u64, _: Vec<u8>) -> Result<(), LinkError> {
+                Ok(())
+            }
+        }
+        let t = two(true);
+        let net = Arc::new(Slow {
+            mesh: t.a.clone(),
+            now: AtomicUsize::new(0),
+            most: AtomicUsize::new(0),
+            locked: AtomicBool::new(false),
+            check_lock: AtomicBool::new(true),
+        });
+        crate::mesh::call_remote(&t.a, net.as_ref(), "B", Request::List);
+        assert!(!net.locked.load(Ordering::SeqCst), "等网络时攥着 Mesh 锁");
+        net.check_lock.store(false, Ordering::SeqCst);
+        let hs: Vec<_> = (0..4)
+            .map(|_| {
+                let (a, net) = (t.a.clone(), net.clone());
+                std::thread::spawn(move || {
+                    crate::mesh::call_remote(&a, net.as_ref(), "B", Request::List)
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert!(net.most.load(Ordering::SeqCst) > 1, "几条调用排成了一队");
+    }
 }

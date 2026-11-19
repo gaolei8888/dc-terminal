@@ -161,6 +161,9 @@ pub struct Mesh {
     remote_seen: Seen,
     /// 远程调用的被操作一方（`remote_host::attach` 接上）。没有就一律当开关关着。
     remote: Option<Arc<remote_host::RemoteHost>>,
+    /// 操作方这一侧：每台被操作电脑（按 endpoint）下一条 `RemoteCall` 用的
+    /// `seq`（`next_remote_seq`）。
+    remote_seq: HashMap<String, u64>,
     /// 这个进程从什么时候开始收（unix 秒）。`sent_at` 早于它的留言一律不收：
     /// 去重表只活在内存里，重启就空了，没有这一条，重启前收过的留言在窗口
     /// 之内可以原样再回放一遍。第一步没有离线留言，合法的东西不会因此丢。
@@ -222,6 +225,7 @@ impl Mesh {
             seen: Seen::default(),
             remote_seen: Seen::with_cap(REMOTE_SEEN_CAP),
             remote: None,
+            remote_seq: HashMap::new(),
             started_at: unix_now(),
             clock: Box::new(unix_now),
             rand: Box::new(os_rand),
@@ -541,8 +545,132 @@ pub fn worst_case(req: &crate::proto::Request) -> Option<std::time::Duration> {
         R::MeshPeers => call + deliver::STATUS_ASK_TIMEOUT,
         // 中转回 `Busy` 时换个 id 再问一次。
         R::MeshSend { .. } => deliver::SEND_ASK_TIMEOUT * 2,
+        // 最多问 `REMOTE_CALL_ATTEMPTS` 次，每次 `CALL_TIMEOUT`；封信、拆信
+        // 只在本机做，留一点余量。看板那边等 30 秒（`Client::call_within`），
+        // 必须比这个长。
+        R::RemoteCall { .. } => {
+            call * REMOTE_CALL_ATTEMPTS as u32 + std::time::Duration::from_secs(2)
+        }
         _ => return None,
     })
+}
+
+/// 一条 `RemoteCall` 最多问几次（第一次加两次重试）。
+pub const REMOTE_CALL_ATTEMPTS: usize = 3;
+
+impl Mesh {
+    /// 发给 `peer`（endpoint）的下一条 `RemoteCall` 的 `seq`。攥着 `Mesh` 锁
+    /// 取号，几条看板连接同时调同一台也不会拿到同一个号；取完就放锁。
+    ///
+    /// 第一次跟这台说话时从**此刻的 unix 毫秒**数起：这台守护进程重启之后
+    /// 不会再用到对方还记得的旧号（对方按 `seq` 去重，见 `remote_host`）——
+    /// 上一个进程一毫秒发不出一条，号永远落后于时钟。
+    fn next_remote_seq(&mut self, peer: &str) -> u64 {
+        let next = self
+            .remote_seq
+            .entry(peer.to_string())
+            .or_insert_with(unix_millis);
+        let seq = *next;
+        *next += 1;
+        seq
+    }
+}
+
+/// 操作方：经中转让 `peer_name`（名单上的电脑名）那台电脑执行 `req`，把它
+/// 的 `Response` 原样拿回来（它的错误码也原样，比如 `RemoteControlOff`）。
+///
+/// - 取号、封信、拆答复时短暂拿 `Mesh` 锁；**`ask` 在锁外**——一次最多
+///   `CALL_TIMEOUT`，攥着锁等的话留言、状态查询、别的远程调用全得排队。
+/// - 超时、对方不在线、中转忙、答复拆不开：换**新信封、同一个 `seq`** 再问，
+///   最多 `REMOTE_CALL_ATTEMPTS` 次。超时不等于对方没执行（`Create` 要先拍
+///   git 快照，可能超过 8 秒）；同一个 `seq` 对方只执行一次，重试拿到的是它
+///   记下的那份答复。新信封绕开对方的信封去重表。
+/// - 名单上没有这台、是这台自己、还没登录、试满了还没答复：
+///   `RemoteUnavailable { peer }`。
+pub fn call_remote(
+    mesh: &Mutex<Mesh>,
+    net: &dyn net::Net,
+    peer_name: &str,
+    req: crate::proto::Request,
+) -> crate::proto::Response {
+    use crate::link::LinkError;
+    use crate::proto::{ErrorCode, Response};
+    use dct_link::LinkError as Relay;
+
+    let unavailable = || {
+        Response::Error(ErrorCode::RemoteUnavailable {
+            peer: peer_name.to_string(),
+        })
+    };
+    let lock = || mesh.lock().unwrap_or_else(|e| e.into_inner());
+    let (target, seq, body) = {
+        let mut m = lock();
+        let Some(roster) = m.roster.as_ref() else {
+            return unavailable();
+        };
+        let Some(target) = roster.roster.by_name(peer_name).cloned() else {
+            return unavailable();
+        };
+        if target.endpoint == m.me.endpoint {
+            return unavailable();
+        }
+        let seq = m.next_remote_seq(&target.endpoint);
+        let body = remote::CallBody { seq, req };
+        let Ok(body) = serde_json::to_string(&body) else {
+            return unavailable();
+        };
+        (target, seq, body)
+    };
+    let mut why = "";
+    for _ in 0..REMOTE_CALL_ATTEMPTS {
+        // 每次一个新信封（新的消息 id、新的 `sent_at`），`seq` 不变。
+        let (id, payload) = {
+            let m = lock();
+            let msg = m.new_message(Kind::RemoteCall, &target.endpoint, "", "", &body);
+            let Some(p) = m.seal_for(&target, &msg) else {
+                return unavailable();
+            };
+            (msg.id, p)
+        };
+        why = match net.ask(&target.endpoint, payload, net::CALL_TIMEOUT) {
+            Ok(reply) => {
+                let m = lock();
+                let answer = m
+                    .open_answer(&reply, &target.endpoint, Kind::RemoteReply, &id)
+                    .and_then(|a| serde_json::from_str::<remote::ReplyBody>(&a.body).ok());
+                match answer {
+                    Some(r) if r.seq == seq => return r.resp,
+                    // 拆不开、或者答的不是这一号：当没答，再问一次。
+                    _ => "bad_reply",
+                }
+            }
+            Err(LinkError::Relay(Relay::NoAnswer)) => "no_answer",
+            Err(LinkError::Relay(Relay::Offline)) => "offline",
+            Err(LinkError::Relay(Relay::Busy)) => "busy",
+            Err(LinkError::Unreachable) => "unreachable",
+            // 令牌失效、额度用完、地址不对……再问也一样。
+            Err(e) => {
+                lock().journal.mesh(&format!(
+                    "remote_call_failed to={} seq={seq} err={e}",
+                    target.endpoint
+                ));
+                return unavailable();
+            }
+        };
+    }
+    // 只记最后一行：对方离线时看板每几秒问一次，每次重试都记会刷满日志。
+    lock().journal.mesh(&format!(
+        "remote_call_unavailable to={} seq={seq} why={why}",
+        target.endpoint
+    ));
+    unavailable()
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1)
 }
 
 /// 名单接受的名字（同 `roster` 里的规则、同 `store::set_name`）。
@@ -638,6 +766,19 @@ mod tests {
     use std::time::Duration;
 
     const NOW: u64 = 1_800_000_000;
+
+    /// 看板等一条 `RemoteCall` 30 秒（`Client::call_within`）：守护进程这边
+    /// 三次 ask 的最坏情况必须在那之前结束，否则看板放弃了、对方其实办成了。
+    #[test]
+    fn a_remote_call_worst_case_fits_in_the_boards_wait() {
+        let req = crate::proto::Request::RemoteCall {
+            peer: "Mac".into(),
+            req: Box::new(crate::proto::Request::List),
+        };
+        let worst = worst_case(&req).expect("RemoteCall 要打网络");
+        assert!(worst >= net::CALL_TIMEOUT * REMOTE_CALL_ATTEMPTS as u32, "{worst:?}");
+        assert!(worst < Duration::from_secs(30), "{worst:?}");
+    }
 
     fn keys(b: u8) -> MachineKeys {
         MachineKeys::from_seeds([b; 32], [b.wrapping_add(100); 32]).unwrap()

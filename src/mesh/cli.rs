@@ -661,6 +661,10 @@ mod tests {
                 text: "t".into(),
                 from_session: None,
             },
+            Request::RemoteCall {
+                peer: "Mac".into(),
+                req: Box::new(Request::List),
+            },
         ];
         for req in &all {
             let worst = crate::mesh::worst_case(req).unwrap_or_else(|| panic!("{req:?}"));

@@ -645,7 +645,7 @@ impl Mesh {
 
     /// 一条新消息，id 是新的随机数。**重发也要走这里拿新 id**：收件那边按
     /// `(from, id)` 去重，同一个 id 再来一次会被悄悄丢掉。
-    fn new_message(
+    pub(super) fn new_message(
         &self,
         kind: Kind,
         to: &str,
@@ -667,14 +667,14 @@ impl Mesh {
         }
     }
 
-    fn seal_for(&self, to: &Member, m: &Message) -> Option<Vec<u8>> {
+    pub(super) fn seal_for(&self, to: &Member, m: &Message) -> Option<Vec<u8>> {
         let kx: [u8; 32] = STANDARD.decode(&to.kx_pub).ok()?.try_into().ok()?;
         let sealed = seal::seal(m, &self.keys, &kx, (self.rand)());
         Some(wire::encode(&Payload::Sealed(sealed)))
     }
 
     /// 打开 `ask` 回来的答复：必须是 `from` 签的、`kind` 对、id 就是我发的那条。
-    fn open_answer(&self, bytes: &[u8], from: &str, kind: Kind, id: &str) -> Option<Message> {
+    pub(super) fn open_answer(&self, bytes: &[u8], from: &str, kind: Kind, id: &str) -> Option<Message> {
         let Ok(Payload::Sealed(s)) = wire::decode(bytes) else {
             return None;
         };

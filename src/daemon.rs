@@ -1686,6 +1686,12 @@ fn serve(
             ),
             Ok(Request::DrainStatus { renew }) => drain.status(renew),
             Ok(Request::DrainCancel) => drain.cancel(),
+            // 远程操作这两条要用到多电脑那一路（`MeshCtl`），也只从本机
+            // socket 上来（`Origin::Local`）：局域网手机页不能替这台电脑开门，
+            // 也不能借这台电脑去操作别的电脑。
+            Ok(req @ (Request::RemoteCall { .. } | Request::RemoteControl { .. })) => {
+                handle_remote(req, &mgr, &mesh)
+            }
             // 本机 socket 这一路**带着** `web`：设置页要能开关那个监听口。
             // 从 HTTP 上来的请求走的是另一个调用点，那边传 `None`——手机
             // 自己开关不了它，也问不出那条带令牌的地址。
@@ -1827,19 +1833,58 @@ pub enum Origin {
     Remote { from: String },
 }
 
+/// `RemoteCall` / `RemoteControl`：只从本机 socket 上来（`serve` 分过来）。
+///
+/// `RemoteCall` 会打网络（最坏 `mesh::worst_case`，三次 ask），在这条连接
+/// 自己的线程上等，**不攥 `MeshCtl` 的槽锁、也不攥 `Mesh` 锁**——几条看板连接
+/// 同时调同一台电脑，各等各的。
+fn handle_remote(req: Request, mgr: &SessionManager, mesh: &MeshCtl) -> Response {
+    match req {
+        Request::RemoteCall { peer, req } => match mesh.running() {
+            Some((m, n)) => crate::mesh::call_remote(&m, n.as_ref(), &peer, *req),
+            // 还没登录：没有中转，谁也够不着。
+            None => Response::Error(ErrorCode::RemoteUnavailable { peer }),
+        },
+        Request::RemoteControl { set } => {
+            let host = mesh
+                .running()
+                .and_then(|(m, _)| recover(m.lock()).remote_host());
+            remote_control(mgr, set, host.as_deref())
+                .unwrap_or_else(|e| Response::Error(to_code(e)))
+        }
+        other => Response::Error(ErrorCode::BadRequest(format!("{other:?}"))),
+    }
+}
+
 /// 读 / 写远程操作开关。开关落在 mesh 目录（`remote_control.json`）。
-fn remote_control(mgr: &SessionManager, set: Option<bool>) -> anyhow::Result<Response> {
+/// `host` 是被操作的那一头（没登录、没接上就是 `None`）：在场名单从它拿，
+/// 关开关时由它踢人。
+fn remote_control(
+    mgr: &SessionManager,
+    set: Option<bool>,
+    host: Option<&crate::mesh::remote_host::RemoteHost>,
+) -> anyhow::Result<Response> {
     let home = mgr
         .dct_home()
         .ok_or_else(|| anyhow::anyhow!("dct 家目录未知，读不了远程操作开关"))?;
     let store = crate::mesh::store::Store::at(home.join("mesh"));
     if let Some(on) = set {
+        // **先关开关、再踢人**：`kick_all` 只清已经排着的；开关还开着的那一
+        // 小段里新到的调用会照样排进去、照样执行。先关上，新到的在收件那一步
+        // 就被拒（`take_remote_call`），排着的再由 `kick_all` 拒掉，工作线程
+        // 执行前也会现读开关（`MeshInbox::grants`）。
         store.set_remote_control(on)?;
+        if !on {
+            if let Some(h) = host {
+                h.kick_all();
+            }
+        }
     }
     Ok(Response::RemoteControl {
         on: store.remote_control(),
-        // 谁正在远程操作这台电脑，Task 4 接上在线名单后在这里填。
-        viewers: vec![],
+        viewers: host
+            .map(|h| h.viewers(std::time::Instant::now()))
+            .unwrap_or_default(),
     })
 }
 
@@ -1885,18 +1930,15 @@ fn handle(
         Request::Instance => Ok(Response::Instance {
             id: mgr.instance_id(),
         }),
-        // 占位：远程操作的执行入口在后面的任务里接上。在那之前一律拒绝，
-        // 绝不能让一条远程请求落进下面任何一支。
-        Request::RemoteCall { .. } => Ok(Response::Error(ErrorCode::RemoteForbidden)),
-        // 「允许我的其他电脑操作这台」的开关：只有本机 socket 碰得到它，
-        // 手机页（Http）和远端电脑（Remote）连读都不给——让别人替这台电脑
-        // 开门，等于没有这道门。
-        Request::RemoteControl { set } => match origin {
-            Origin::Local => remote_control(mgr, set),
-            Origin::Http | Origin::Remote { .. } => {
-                Ok(Response::Error(ErrorCode::RemoteForbidden))
-            }
-        },
+        // 这两条要用到多电脑那一路，本机 socket 上来的在 `serve` 里就分走了
+        // （`handle_remote`）；走到这里的是手机页（Http）或远端电脑（Remote，
+        // 其实在上面白名单那一步就拒了）：
+        // - `RemoteCall`：不许借这台电脑去操作第三台（A 转跳到 C）；
+        // - `RemoteControl`：「允许我的其他电脑操作这台」的开关连读都不给——
+        //   让别人替这台电脑开门，等于没有这道门。
+        Request::RemoteCall { .. } | Request::RemoteControl { .. } => {
+            Ok(Response::Error(ErrorCode::RemoteForbidden))
+        }
         Request::List => Ok(Response::Sessions(mgr.list())),
         Request::Profiles { lang } => {
             let (all, mut warnings) = all_profiles(profiles_dir);
@@ -4605,18 +4647,95 @@ mod tests {
         crate::mesh::store::Store::at(home.join("mesh")).remote_control()
     }
 
+    /// 本机 socket 上的 `RemoteControl`：`serve` 分到 `handle_remote` →
+    /// `remote_control`。`host` 没接上（没登录）时照样能看能改，在场名单是空的。
+    fn local_remote_control(
+        home: &Path,
+        set: Option<bool>,
+        host: Option<&crate::mesh::remote_host::RemoteHost>,
+    ) -> Response {
+        let (mgr, ..) = bare_handle_deps();
+        mgr.set_pair_models_home(home.to_path_buf());
+        remote_control(&mgr, set, host).unwrap()
+    }
+
     #[test]
     fn local_origin_can_read_and_toggle_remote_control() {
         let home = tempfile::tempdir().unwrap();
-        let resp = handle_from(Origin::Local, home.path(), Request::RemoteControl { set: None });
+        let resp = local_remote_control(home.path(), None, None);
         assert!(matches!(resp, Response::RemoteControl { on: false, .. }), "{resp:?}");
-        let resp = handle_from(
-            Origin::Local,
-            home.path(),
-            Request::RemoteControl { set: Some(true) },
-        );
+        let resp = local_remote_control(home.path(), Some(true), None);
         assert!(matches!(resp, Response::RemoteControl { on: true, .. }), "{resp:?}");
         assert!(switch_on(home.path()));
+    }
+
+    /// 在场名单从被操作的那一头（`RemoteHost`）来；关开关（`K`、设置页）
+    /// 先把开关关上、再把人踢掉——名单随之清空。
+    #[test]
+    fn remote_control_lists_viewers_and_switching_off_kicks_them() {
+        use crate::mesh::remote::CallBody;
+        use crate::mesh::remote_host::{Call, RemoteHost};
+        let home = tempfile::tempdir().unwrap();
+        local_remote_control(home.path(), Some(true), None);
+
+        let inbox = crate::mesh::deliver::testing::FakeInbox::new();
+        let hub = crate::mesh::net::testing::FakeHub::new();
+        // 答复封不出来（`None`）就不发：这里只看在场名单。
+        let host = RemoteHost::new(inbox, Arc::new(hub.net_for("c-me")), Arc::new(|_, _| None));
+        host.submit(Call {
+            env_seq: 1,
+            msg: dct_mesh::seal::Message {
+                id: "m1".into(),
+                kind: dct_mesh::seal::Kind::RemoteCall,
+                from: "c-other".into(),
+                from_session: String::new(),
+                to: "c-me".into(),
+                to_session: String::new(),
+                body: String::new(),
+                sent_at: 0,
+            },
+            from_name: "Mac".into(),
+            me_name: "PC".into(),
+            body: CallBody {
+                seq: 1,
+                req: Request::Screens { ids: vec![1] },
+            },
+        });
+
+        let resp = local_remote_control(home.path(), None, Some(&host));
+        let Response::RemoteControl { on, viewers } = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(on);
+        assert_eq!(viewers, ["Mac"]);
+
+        let resp = local_remote_control(home.path(), Some(false), Some(&host));
+        let Response::RemoteControl { on, viewers } = resp else {
+            panic!("{resp:?}")
+        };
+        assert!(!on && viewers.is_empty(), "{on} {viewers:?}");
+        assert!(!switch_on(home.path()));
+    }
+
+    /// 不许经这台电脑转跳到第三台：远端电脑、手机页发来的 `RemoteCall` 一律拒，
+    /// 连网络都不碰。
+    #[test]
+    fn remote_call_from_a_remote_origin_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        for origin in [remote(), Origin::Http] {
+            let resp = handle_from(
+                origin.clone(),
+                home.path(),
+                Request::RemoteCall {
+                    peer: "C".into(),
+                    req: Box::new(Request::List),
+                },
+            );
+            assert!(
+                matches!(resp, Response::Error(ErrorCode::RemoteForbidden)),
+                "{origin:?}: {resp:?}"
+            );
+        }
     }
 
     #[test]
@@ -6070,6 +6189,26 @@ mod mesh_tests {
             inbox: None,
             slot: Mutex::new(None),
         }
+    }
+
+    /// 还没登录（没有中转）时调别的电脑：说连不上那台，不挂着。
+    #[test]
+    fn remote_call_before_login_is_unavailable() {
+        let (_t, socket, _secrets) = home();
+        let ctl = ctl_for(&socket);
+        let mgr = SessionManager::new();
+        let resp = handle_remote(
+            Request::RemoteCall {
+                peer: "Mac".into(),
+                req: Box::new(Request::List),
+            },
+            &mgr,
+            &ctl,
+        );
+        assert!(
+            matches!(resp, Response::Error(ErrorCode::RemoteUnavailable { ref peer }) if peer == "Mac"),
+            "{resp:?}"
+        );
     }
 
     fn no_network(_: &str, _: &str, _: &str) -> Result<(u16, String), String> {
