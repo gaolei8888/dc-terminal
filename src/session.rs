@@ -1104,6 +1104,7 @@ impl SessionManager {
     /// - 终端已经交给 agent 了（`PtySession::accepts_keys`）；
     /// - 空闲的，要连续空闲至少 3 秒；状态说不清的，要屏幕至少 5 秒没动。
     ///   在忙的不看这一条——催它停下那句本来就是打给在忙的会话的。
+    /// - 停在弹框上等人的（Asking）一律「不能」。
     ///
     /// 会话不在了答「不能」。
     pub fn ready_for_keys(&self, id: u32) -> bool {
@@ -1121,6 +1122,9 @@ impl SessionManager {
                 SessionState::Unknown => {
                     now.saturating_duration_since(s.quiet_since) >= after_quiet
                 }
+                // 弹框上的一个回车就是替用户做了选择（Claude 信任框默认选中
+                // 「No, exit」）。dct 自己要说的那几句，一句都不往弹框里打。
+                SessionState::Asking => false,
                 _ => true,
             })
         })
@@ -2419,6 +2423,29 @@ mod tests {
         let text =
             format!("● 最后一行写着 `Enter to confirm · Esc to cancel`。\n{CLAUDE_WAITING_FOR_YOU}");
         assert_eq!(classify_with("claude", &text), Some(SessionState::Idle));
+    }
+
+    /// 同上，但那句话**独占一行**——agent 在代码块里引用它、或者把本仓库的
+    /// spec / 这个测试文件显示在屏幕上。真弹框里这句是整屏最后一行非空行；
+    /// 活着的会话里，引用下面一定还压着输入框和底栏。
+    #[test]
+    fn the_dialog_footer_alone_on_a_line_above_a_live_prompt_is_not_asking() {
+        let quoted = "```\n Enter to confirm · Esc to cancel\n```\n";
+        assert_eq!(
+            classify_with("claude", &format!("{quoted}{CLAUDE_WAITING_FOR_YOU}")),
+            Some(SessionState::Idle)
+        );
+        assert_eq!(
+            classify_with("claude", &format!("{quoted}{CLAUDE_WORKING}")),
+            Some(SessionState::Working)
+        );
+    }
+
+    /// 真弹框底下还可能有几行空白（屏幕没铺满）——仍然是等人。
+    #[test]
+    fn the_trust_dialog_with_blank_rows_below_is_still_asking() {
+        let text = format!("{CLAUDE_TRUST_DIALOG}\n   \n\n");
+        assert_eq!(classify_with("claude", &text), Some(SessionState::Asking));
     }
 
     #[test]
@@ -5886,6 +5913,44 @@ mod tests {
         .unwrap();
         mgr.tick();
         assert!(!mgr.ready_for_keys(raw), "刚从忙变闲，还不够久");
+    }
+
+    /// 停在弹框上等人的会话，dct 永远不替用户往里打字（交接、催停、留言都
+    /// 一样）：弹框里一个回车就是替用户做了选择——Claude 信任框默认选中的是
+    /// 「No, exit」。
+    #[test]
+    #[cfg(unix)]
+    fn ready_for_keys_never_types_into_a_dialog() {
+        let mgr = SessionManager::new();
+        mgr.set_type_waits_for_test(
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        );
+        mgr.register_profile(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(
+                r#"
+                name = "dialog"
+                command = ["/bin/sh", "-c", 'stty -icanon; printf ASK; cat', "sh"]
+                is_agent = false
+                ask_pattern = "ASK"
+                busy_pattern = "BUSY"
+                idle_pattern = "IDLE"
+                "#,
+            ))
+            .unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let id = mgr.create(dir.path(), "dialog", None, &[]).unwrap();
+
+        // 远超三段等待时间，一直在弹框上。
+        let until = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < until {
+            mgr.tick();
+            sleep(Duration::from_millis(50));
+        }
+        assert_eq!(state_of(&mgr, id), SessionState::Asking);
+        assert!(!mgr.ready_for_keys(id), "弹框上不许替用户按键");
     }
 
     /// 没有忙/闲标记的会话按回车之后还是「说不清」，不会被永远钉在「干活中」。

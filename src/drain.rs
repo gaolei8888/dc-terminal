@@ -190,7 +190,12 @@ impl Drain {
                 // 分不出忙闲的会话（profile 没给忙/闲的标记，比如 qwen）：dct 看
                 // 不出它什么时候停下，等多久都白等，也不该对着可能空闲的它说
                 // 「请停下」。不等、不催，记成被打断——重启后叫它检查一下再继续。
-                Slot::Waiting { .. } if state == Some(SessionState::Unknown) => {
+                //
+                // 停在弹框上等人的（Asking）同理：它不会自己停下；而往弹框里催
+                // 一句更糟——Claude 信任框默认选中「No, exit」，一个回车就把它关了。
+                Slot::Waiting { .. }
+                    if matches!(state, Some(SessionState::Unknown | SessionState::Asking)) =>
+                {
                     *slot = Slot::Done;
                     self.interrupted.insert(m.id);
                 }
@@ -781,6 +786,18 @@ mod tests {
         let t0 = Instant::now();
         let mut d = Drain::new(vec![m(1, true), m(2, true)], None, cfg(), "/h".into(), t0);
         let a = d.step_all_ready(t0, &st(&[(1, Unknown), (2, Idle)]));
+        assert!(!a.iter().any(|x| matches!(x, Action::Nudge { .. })));
+        assert_eq!(finish(&a).unwrap().0, &HashSet::from([1]));
+    }
+
+    /// 停在弹框上等人的会话（比如 Claude 启动时的「信任这个文件夹吗」）：它不会
+    /// 自己停下，等到点白等；也绝不能往里催一句——信任框默认选中的是
+    /// 「No, exit」，一个回车就把它关了。跟 Unknown 一样：不等、不催，记成被打断。
+    #[test]
+    fn asking_sessions_are_not_waited_for_nor_nudged() {
+        let t0 = Instant::now();
+        let mut d = Drain::new(vec![m(1, true), m(2, true)], None, cfg(), "/h".into(), t0);
+        let a = d.step_all_ready(t0, &st(&[(1, Asking), (2, Idle)]));
         assert!(!a.iter().any(|x| matches!(x, Action::Nudge { .. })));
         assert_eq!(finish(&a).unwrap().0, &HashSet::from([1]));
     }

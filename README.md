@@ -642,9 +642,10 @@ is worse than admitting you don't know.
 `ask_pattern` is a third, optional one: the line that's always on screen when the
 agent has a dialog up waiting for a keypress. A match shows "asking you" and beats
 "working". The built-in Claude family uses the dialog's last line,
-`Enter to confirm · Esc to cancel`, anchored to a whole line so an agent quoting
-it doesn't count. Sessions sitting at the "trust this folder?" prompt used to show
-"working" forever.
+`Enter to confirm · Esc to cancel`, and only when it's the last line on the screen,
+so an agent quoting it doesn't count. The one dialog verified so far is the
+"trust this folder?" prompt at startup, where sessions used to show "working"
+forever; other dialogs with the same footer are caught too, others aren't.
 
 There's also `env` for environment variables, `secret` if your agent needs a key
 from the user, and `install` for how to install it. Get the TOML wrong and the
