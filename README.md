@@ -84,7 +84,8 @@ touched. **Without that the other three don't matter** — you'd still be sittin
 there clicking "allow", and running several agents would only make you busier.
 
 **State is read, not guessed.** Every 200ms dct reads each session's screen and
-works out what it's doing: working, idle, stopped, failed. Nine agents on one
+works out what it's doing: working, asking you, idle, stopped,
+failed. Nine agents on one
 board, and you can tell which is stuck without opening any of them. When it
 can't tell, it prints "—" instead of guessing — `shell` sessions used to get
 guessed as "working".
@@ -637,6 +638,13 @@ way round. Use `busy_pattern` when you can — "esc to interrupt" stays put,
 whereas the placeholder text in an input box vanishes the second someone types.
 If you give neither, the board shows `—`. That's on purpose. Making up a status
 is worse than admitting you don't know.
+
+`ask_pattern` is a third, optional one: the line that's always on screen when the
+agent has a dialog up waiting for a keypress. A match shows "asking you" and beats
+"working". The built-in Claude family uses the dialog's last line,
+`Enter to confirm · Esc to cancel`, anchored to a whole line so an agent quoting
+it doesn't count. Sessions sitting at the "trust this folder?" prompt used to show
+"working" forever.
 
 There's also `env` for environment variables, `secret` if your agent needs a key
 from the user, and `install` for how to install it. Get the TOML wrong and the

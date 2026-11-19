@@ -556,6 +556,8 @@ struct Session {
     /// 出错时屏幕上一定有的串。跟上面两个一起在 `create()` 里编译一次，
     /// 不在 tick 里每轮重编——tick 每秒跑 5 次。
     error_re: Option<regex::Regex>,
+    /// 弹框等人时屏幕上一定有的串（profile 的 `ask_pattern`），见 `classify`。
+    ask_re: Option<regex::Regex>,
     pty: PtySession,
     /// 出错原因的人话解释，由后台线程写回（见 `SessionManager::request_explanation`）。
     /// **必须是 `Arc<Mutex<_>>`**：那个线程拿不到 `Session` 的锁——`tick()`
@@ -1438,6 +1440,7 @@ impl SessionManager {
         let idle_re = profile.idle_regex()?;
         let busy_re = profile.busy_regex()?;
         let error_re = profile.error_regex()?;
+        let ask_re = profile.ask_regex()?;
         let is_agent = profile.is_agent;
 
         // 有 pattern 才敢说「干活中」：agent 刚起来确实在初始化。
@@ -1546,6 +1549,7 @@ impl SessionManager {
             idle_re,
             busy_re,
             error_re,
+            ask_re,
             pty,
             explanation_slot: Arc::new(Mutex::new(None)),
             name_slot: Arc::new(Mutex::new(restored_name)),
@@ -2031,9 +2035,6 @@ impl SessionManager {
                 self.prune();
                 continue;
             }
-            if s.state == SessionState::Asking {
-                continue;
-            }
             // busy 优先：agent 干活时的「按 esc 中断」提示是稳定的，
             // 而空闲时的输入框占位符用户一打字就没了。
             // screen_text() 只取一次，三个分支共用——它要扫一遍整屏文字，
@@ -2045,12 +2046,16 @@ impl SessionManager {
             // `persist_last_sessions`**，那会再去锁同一个会话而死锁，所以
             // 只在这里记一个标记，真正的落盘挪到下面松开锁之后。
             let mut just_finished_a_round = false;
-            if s.busy_re.is_some() || s.idle_re.is_some() || s.error_re.is_some() {
+            if s.busy_re.is_some()
+                || s.idle_re.is_some()
+                || s.error_re.is_some()
+                || s.ask_re.is_some()
+            {
                 let text = s.pty.screen_text();
                 let next = classify(
                     &text,
                     s.error_re.as_ref(),
-                    None,
+                    s.ask_re.as_ref(),
                     s.busy_re.as_ref(),
                     s.idle_re.as_ref(),
                 );
@@ -5437,6 +5442,53 @@ mod tests {
                 Instant::now() < deadline,
                 "busy_pattern 必须压过 idle_pattern"
             );
+            sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 用户答完弹框，agent 接着干活——状态必须从「等你回答」翻回「干活中」。
+    /// 以前 `tick()` 见到 Asking 就跳过整轮判定（那是给 Bridge 的 `ask_human`
+    /// 留的口子），Asking 一旦进去就再也出不来。
+    #[test]
+    fn asking_flips_back_to_working_once_answered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+
+        let mgr = SessionManager::new();
+        mgr.register_profile(
+            Profile::from_toml(&crate::sys::testing::toml_with_sh(
+                r#"
+                name = "asks"
+                command = ["/bin/sh", "-c", 'echo ASK; sleep 1; printf "\033[2J\033[HBUSY"; sleep 5']
+                is_agent = false
+                ask_pattern = "ASK"
+                busy_pattern = "BUSY"
+                idle_pattern = "IDLE"
+                "#,
+            ))
+            .unwrap(),
+        );
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let id = mgr.create(&proj, "asks", secrets.get("asks"), &[]).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Asking {
+                break;
+            }
+            assert!(Instant::now() < deadline, "弹框屏应判 Asking");
+            sleep(Duration::from_millis(50));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            mgr.tick();
+            if state_of(&mgr, id) == SessionState::Working {
+                break;
+            }
+            assert!(Instant::now() < deadline, "答完弹框必须翻回 Working");
             sleep(Duration::from_millis(50));
         }
     }
