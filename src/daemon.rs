@@ -191,6 +191,10 @@ pub(crate) fn run_with_hooks(
                 // `eprintln!` 谁都看不见——记下来，交给 `Request::Profiles` 顶给
                 // 界面，跟 `LlmUnavailable` 走的是同一条路。
                 m.set_resume_skips(skips);
+                // 「正在盯接回」的旗要在放下「正在接回」**之前**立起来：中间要是
+                // 空一下，常驻会话的看守会趁这一下开出一个跟接回线程撞名的会话。
+                // `watch_resumed_by_id` 不管怎么结束都会把它放下。
+                m.set_resume_watching(true);
                 m.set_restoring(false);
                 // 按 id 接回的那些在后台盯一小会儿：接回失败（对话没了）的会马上
                 // 退出，换一个新开的顶上，再补一句警告。**必须排在
@@ -1497,12 +1501,22 @@ fn watch_resumed_by_id(
     use crate::proto::{EndedHow, SessionResumeSkipReason, WarningCode};
     use crate::session::Liveness;
 
+    // 不管怎么结束（没东西可盯、盯完、线程起不来、panic）都放下「正在盯
+    // 接回」的旗：放不下的话常驻会话的看守会一直停着手。
+    struct Lower(Arc<SessionManager>);
+    impl Drop for Lower {
+        fn drop(&mut self) {
+            self.0.set_resume_watching(false);
+        }
+    }
+    let lower = Lower(mgr.clone());
     if pending.is_empty() {
         return None;
     }
     let spawned = std::thread::Builder::new()
         .name("resume-watch".into())
         .spawn(move || {
+            let _lower = lower;
             let deadline = std::time::Instant::now() + window;
             loop {
                 pending.retain(|w| match mgr.liveness(w.id) {
@@ -1615,7 +1629,7 @@ impl ManagerRoster<'_> {
 
 impl crate::keep::Roster for ManagerRoster<'_> {
     fn paused(&self) -> bool {
-        self.mgr.is_restoring() || self.mgr.is_draining()
+        self.mgr.is_restoring() || self.mgr.is_draining() || self.mgr.is_resume_watching()
     }
 
     fn find(&self, k: &crate::keep::Keep) -> Option<u32> {
@@ -1667,7 +1681,8 @@ impl crate::keep::Roster for ManagerRoster<'_> {
     }
 
     fn warn(&self, w: crate::proto::WarningCode) {
-        self.mgr.push_resume_skip(w);
+        // 同一个问题好了又坏，看守会再报一次；名单上已有就不再堆一句
+        self.mgr.push_resume_skip_once(w);
     }
 }
 
@@ -1694,7 +1709,7 @@ fn keep_round(
     // 修好之后它从 `said` 里掉出去，再写坏就再报。
     for w in &warnings {
         if !said.contains(w) {
-            mgr.push_resume_skip(w.clone());
+            mgr.push_resume_skip_once(w.clone());
         }
     }
     *said = warnings;
@@ -4018,6 +4033,33 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(mgr.conversation_of(after[0]).as_deref(), Some("keep"));
         assert!(mgr.resume_skips().is_empty());
+    }
+
+    /// 「正在盯接回」这面旗：盯的线程一结束就放下，没东西可盯也马上放下——
+    /// 常驻会话的看守看这面旗停手，旗要是忘了放，常驻会话就再也不会被重开。
+    #[test]
+    fn the_resume_watch_flag_is_lowered_when_the_watch_ends() {
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_resume_watching(true);
+        assert!(watch_resumed_by_id(mgr.clone(), vec![], vec![], Duration::from_secs(5)).is_none());
+        assert!(!mgr.is_resume_watching(), "没东西可盯，旗要马上放下");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let all = vec![echo_id_probe()];
+        let secrets = SecretStore::load(&tmp.path().join("secrets.toml"));
+        let mut r = rec(&proj, "echo-id");
+        r.conversation_id = Some("keep".into());
+        let (_, by_id, _) = restore_sessions(&[r], &all, &secrets, &mgr);
+        mgr.set_resume_watching(true);
+        let h = watch_resumed_by_id(mgr.clone(), all, by_id, Duration::from_millis(500)).unwrap();
+        assert!(mgr.is_resume_watching(), "盯着的时候旗要立着");
+        h.join().unwrap();
+        assert!(!mgr.is_resume_watching(), "盯完了旗要放下");
+        for s in mgr.list() {
+            mgr.discard(s.id);
+        }
     }
 
     /// 刚接回就被用户停掉：那是用户的意思，不是接回失败，不能再开一个。
@@ -7032,6 +7074,35 @@ mod keep_tests {
         assert!(wait_kept(&r.mgr, Duration::from_secs(10)).is_some());
     }
 
+    /// 平稳重启后接回线程还在盯「按 id 接回的会不会马上退出」：这时它会拿掉
+    /// 死格子、再开一个顶上。看守要是也在这个空当里开，就会有两个同名会话。
+    #[test]
+    fn nothing_is_opened_while_the_resume_watch_runs() {
+        let h = home_with_keep();
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_resume_watching(true);
+        let r = start(&h, mgr);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(r.mgr.list().is_empty(), "接回看守还在盯时不该开会话");
+        r.mgr.set_resume_watching(false);
+        assert!(wait_kept(&r.mgr, Duration::from_secs(10)).is_some());
+    }
+
+    /// 同一个问题来来去去（这里是坏配置修好又写坏），界面上的警告名单里
+    /// 也只留一句，不越堆越多。
+    #[test]
+    fn a_warning_that_comes_back_is_not_listed_twice() {
+        let h = home_with_keep();
+        let r = start(&h, Arc::new(SessionManager::new()));
+        for _ in 0..2 {
+            write_config(&h.socket, &h.work, "[[keep]]\nname = \"坏的\"\n");
+            std::thread::sleep(Duration::from_millis(300));
+            write_config(&h.socket, &h.work, "");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        assert_eq!(r.mgr.resume_skips().len(), 1, "{:?}", r.mgr.resume_skips());
+    }
+
     #[test]
     fn nothing_is_opened_while_restoring() {
         let h = home_with_keep();
@@ -7065,11 +7136,5 @@ mod keep_tests {
                 .count()
         };
         assert_eq!(bad(&r.mgr), 1, "同一条坏配置只报一次");
-        // 修好再写坏：问题回来了，再报一次
-        write_config(&h.socket, &h.work, "");
-        std::thread::sleep(Duration::from_millis(300));
-        write_config(&h.socket, &h.work, "[[keep]]\nname = \"坏的\"\n");
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(bad(&r.mgr), 2);
     }
 }
