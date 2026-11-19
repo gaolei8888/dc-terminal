@@ -133,7 +133,8 @@ pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 /// 按对话 id 接回后这么快就退出，多半是对话文件没了——下次别再带这个 id，
 /// 否则会一直「接回 → 秒退」。跟 `watch_resumed_by_id` 的 20 秒同一个道理。
 pub const RESUME_FAIL_WINDOW: Duration = Duration::from_secs(20);
-/// 连续失败到这个次数报一次「反复崩溃」。照样按退避重开，只是让用户知道。
+/// 连续「开起来又停了」到这个次数报一次「反复崩溃」。照样按退避重开，
+/// 只是让用户知道。开不起来不算进这里，那有 `StartFailed`。
 pub const CRASH_WARN_AFTER: u32 = 3;
 
 /// 第 `failures` 次失败之后要等多久：5 秒起翻倍，封顶 5 分钟。
@@ -180,12 +181,16 @@ impl Watched {
     }
 
     /// 记一次失败并排下一次重开。
-    fn fail(&mut self, now: Instant, name: &str, r: &dyn Roster) {
+    fn fail(&mut self, now: Instant) {
         self.failures += 1;
-        if self.failures >= CRASH_WARN_AFTER {
-            self.warn_once(name, KeptSessionReason::CrashLooping, r);
-        }
         self.next_try = Some(now + backoff(self.failures));
+    }
+
+    /// 活够了 `HEALTHY_AFTER`：失败次数清零，报过的警告下次出问题可以再报。
+    /// 撞名例外——它跟活多久无关，只在撞名消失时清，不然每 5 秒报一遍。
+    fn healthy(&mut self) {
+        self.failures = 0;
+        self.warned.retain(|r| *r == KeptSessionReason::NameClash);
     }
 }
 
@@ -234,21 +239,32 @@ impl KeepWatch {
             w.clear(KeptSessionReason::DirGone);
             w.clear(KeptSessionReason::ProfileGone);
             if w.opened_at.is_none_or(|t| now.duration_since(t) >= HEALTHY_AFTER) {
-                w.failures = 0;
-                w.warned.retain(|r| *r == KeptSessionReason::NameClash);
+                w.healthy();
             }
             return;
         }
 
         // 刚发现它停了：判一下是不是秒退，排好重开时刻，这一轮先不开
         if w.seen && w.next_try.is_none() {
+            // 「活了多久」量到看守**发现**它没了的这一轮，不是它真停的那一刻，
+            // 会多算最多一轮（现在 5 秒）：实际上 20 秒窗口是 15–20 秒、60 秒是
+            // 55–60 秒。把轮次拉长之前先想想这两个窗口还够不够用。
             let lived = w.opened_at.map(|t| now.duration_since(t));
             if w.resumed && lived.is_some_and(|d| d < RESUME_FAIL_WINDOW) {
                 w.conversation = None;
             }
             if lived.is_some_and(|d| d < HEALTHY_AFTER) {
-                w.fail(now, &k.name, r);
+                w.fail(now);
+                // 只在「开起来又停了」这条路上报：开不起来已经有 StartFailed
+                if w.failures >= CRASH_WARN_AFTER {
+                    w.warn_once(&k.name, KeptSessionReason::CrashLooping, r);
+                }
             } else {
+                // 最后一次见它活着可能还不到一分钟，但发现它没了时已经过了：
+                // 它活够了，跟在找到它的那一轮清零是一回事
+                if lived.is_some() {
+                    w.healthy();
+                }
                 w.next_try = Some(now + backoff(w.failures));
             }
             return;
@@ -283,7 +299,7 @@ impl KeepWatch {
                 w.opened_at = None;
                 w.resumed = false;
                 w.warn_once(&k.name, KeptSessionReason::StartFailed, r);
-                w.fail(now, &k.name, r);
+                w.fail(now);
             }
         }
     }
@@ -673,6 +689,47 @@ mod watch_tests {
     }
 
     #[test]
+    fn a_death_first_noticed_after_a_healthy_minute_resets_the_backoff() {
+        // 最后一次见它活着是 +55，+60 才发现它没了：它活够了一分钟，算好过，
+        // 失败次数清零，等 5 秒；之前报过的「反复崩溃」也可以再报
+        let mut h = H::new("shell");
+        h.at(0);
+        let mut t = 0;
+        for _ in 0..4 {
+            h.die();
+            t = h.next_open_from(t + 1);
+        }
+        assert_eq!(h.warned(KeptSessionReason::CrashLooping), 1);
+        h.live(101);
+        for s in (t + 5..=t + 55).step_by(5) {
+            h.at(s);
+        }
+        h.die();
+        let noticed = t + 60;
+        t = h.next_open_from(noticed);
+        assert_eq!(t - noticed, 5);
+        for _ in 0..3 {
+            h.die();
+            t = h.next_open_from(t + 1);
+        }
+        assert_eq!(h.warned(KeptSessionReason::CrashLooping), 2);
+    }
+
+    #[test]
+    fn failed_opens_alone_do_not_say_crash_looping() {
+        // 开不起来已经有 StartFailed 了，同一个原因不再多报一条「一直在停」
+        let mut h = H::new("claude");
+        h.r.open_fails.set(true);
+        let mut t = 0;
+        h.at(0);
+        for _ in 0..5 {
+            t = h.next_open_from(t + 1);
+        }
+        assert_eq!(h.warned(KeptSessionReason::StartFailed), 1);
+        assert_eq!(h.warned(KeptSessionReason::CrashLooping), 0);
+    }
+
+    #[test]
     fn a_session_found_alive_and_then_lost_is_not_counted_as_a_quick_death() {
         // 不是我们开的（比如平稳重启接回的），死了按第一次算：5 秒
         let mut h = H::new("shell");
@@ -883,15 +940,16 @@ mod watch_tests {
         h.at(0);
         assert_eq!(h.opens().len(), 1);
         h.live(101);
-        for s in 1..30 {
+        // 跨过「活够一分钟」：清零时也不能把撞名的已报记录清掉，否则每 5 秒报一遍
+        for s in 1..120 {
             h.at(s);
         }
         assert_eq!(h.warned(KeptSessionReason::NameClash), 1);
         // 那个同名会话走了又来：再报一次
         h.r.clash.set(false);
-        h.at(30);
+        h.at(120);
         h.r.clash.set(true);
-        h.at(31);
+        h.at(121);
         assert_eq!(h.warned(KeptSessionReason::NameClash), 2);
     }
 }
