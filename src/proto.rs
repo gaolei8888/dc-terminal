@@ -150,7 +150,10 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 26 = 会话一停就从名册上消失，问一个刚结束的会话不再只说「没有这个会话」：
 /// 多了 `ErrorCode::SessionEnded { id, how }`。**响应**里多了一个旧界面解不出
 /// 的变体，照 18 那次的规矩加一。
-pub const PROTOCOL_VERSION: u32 = 26;
+///
+/// 27 = 常驻会话（`[[keep]]`）：`WarningCode` 多了 `KeepEntryInvalid` /
+/// `KeptSessionProblem`。警告走响应，旧界面解不出新变体，照 26 的规矩加一。
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1440,6 +1443,44 @@ pub enum WarningCode {
     /// 交接文件到期限都没出现）。重启后它是一段新对话，得用户告诉它之前在
     /// 做什么。
     HandoffMissing { dir: String },
+    /// `config.toml` 里第 `index` 条（从 1 数）`[[keep]]` 写坏了，跳过。
+    KeepEntryInvalid {
+        index: usize,
+        reason: KeepEntryProblem,
+    },
+    /// 常驻会话（`[[keep]]`）出了问题。`name` 是用户在配置里起的名字。
+    KeptSessionProblem {
+        name: String,
+        reason: KeptSessionReason,
+    },
+}
+
+/// `[[keep]]` 的某一条为什么被跳过。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KeepEntryProblem {
+    /// 缺了某个字段（带字段名：`name` / `profile` / `dir`），或者类型不对
+    MissingField(String),
+    /// 名字是空的（或只有空格）
+    EmptyName,
+    /// 名字和前面某一条重复，保留先写的那条
+    DuplicateName(String),
+    /// 这一条根本不是一张表（比如 `keep = [1, 2]`）；整个 `keep` 不是数组时 index 为 0
+    NotATable,
+}
+
+/// 常驻会话为什么没能起来、或者为什么停止重启它。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KeptSessionReason {
+    /// 配置里的目录不存在了
+    DirGone,
+    /// 配置里的 agent（profile）不认识了
+    ProfileGone,
+    /// 启动失败
+    StartFailed,
+    /// 反复崩溃，不再自动重启
+    CrashLooping,
+    /// 名字和另一个会话撞了
+    NameClash,
 }
 
 /// 恢复上次会话时，某一条为什么被跳过。
@@ -1699,7 +1740,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                26,
+                27,
                 r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Submit":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}},{"Drain":{"wait_s":1,"nudge_wait_s":2,"initiator":3,"now":true,"exe":"/x/dct"}},{"DrainStatus":{"renew":true}},"DrainCancel","Instance"]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1716,7 +1757,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
             (
-                26,
+                27,
                 r#"[{"DrainCancelled":{"told":[2,5]}},{"Instance":{"id":7}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1756,7 +1797,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
             (
-                26,
+                27,
                 r#"{"DrainProgress":{"progress":{"waiting":[2],"remaining_s":9,"nudged":true},"done":false,"active":true}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1781,7 +1822,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                26,
+                27,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1896,7 +1937,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                26,
+                27,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":"","last_active_ms":0}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1999,7 +2040,7 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (26, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (27, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
         );
     }
@@ -2015,7 +2056,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
             (
-                26,
+                27,
                 r#"{"Error":{"SessionEnded":{"id":3,"how":"ExitedOnItsOwn"}}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -2035,7 +2076,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (26, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (27, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -2112,7 +2153,7 @@ mod tests {
                 shape(&LivePublic::Listed { title: "课".into() })
             ),
             (
-                26,
+                27,
                 r#""Private""#.to_string(),
                 r#"{"Listed":{"title":"课"}}"#.to_string()
             )
@@ -2149,7 +2190,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, sent[0].as_str(), sent[1].as_str(), peers.as_str()),
             (
-                26,
+                27,
                 r#"{"MeshSent":"Delivered"}"#,
                 r##"{"MeshSent":{"NoSuchSession":["#3 a（b）"]}}"##,
                 r#"{"MeshPeers":[{"name":"A","online":true,"os":"macos","sessions":[{"name":"s","state":"闲","dir":"/d"}],"tentacles":["cam"]}]}"#
@@ -2188,7 +2229,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&v).unwrap().as_str()),
             (
-                26,
+                27,
                 r#"{"Mesh":{"logged_in":true,"name":"A","endpoint":"c-a","in_group":true,"members":[{"name":"A","endpoint":"c-a","online":true,"is_me":true}],"messages":{"7":2},"invite":{"id":3,"code":"012345","expires_at":1800000600},"invite_note":{"id":2,"outcome":{"Joined":{"name":"公司电脑"}}}}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"

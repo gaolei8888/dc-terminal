@@ -320,6 +320,19 @@ mod tests {
         );
     }
 
+    /// `[[keep]]` 写坏了不能连累 `[llm]`：两边各读各的。
+    #[test]
+    fn a_malformed_keep_entry_does_not_hide_llm() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            "[llm]\nprovider = \"claude\"\n\n[[keep]]\nname = \"a\"\n",
+        )
+        .unwrap();
+        assert!(Config::load(&p).llm.is_some());
+    }
+
     #[test]
     fn config_path_sits_next_to_the_socket() {
         let p = config_path_for_socket(std::path::Path::new("/home/x/.dct/daemon.sock"));
