@@ -230,6 +230,12 @@ impl Client {
         }
     }
 
+    /// 这条连接连的是哪个 socket。看板给每台别的电脑另开一条连接
+    /// （`ui::remote::Feed`），要从这里知道连哪。
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
     /// 重连上的是不是另一个后台（问一次就清掉）。
     pub fn take_new_daemon(&mut self) -> bool {
         std::mem::take(&mut self.new_daemon)

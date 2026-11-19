@@ -20,7 +20,11 @@ pub struct App {
     // 守护进程。所有需要调用它的地方走 `client()`，`None` 时统一返回
     // 「守护进程连不上」——这跟真实断线走的是同一条错误路径，不为
     // 「构造不出连接」单独开一条新分支。
-    pub client: Option<Client>,
+    //
+    // 包的是 `Router` 不是裸的 `Client`：远程电脑上的会话也用 `u32` 号
+    // （合成号），请求经它分到本机或那台电脑的后台线程，界面别处不用知道
+    // 一个会话在哪台电脑上。见 `remote.rs` 文件头。
+    pub client: Option<super::remote::Router>,
     pub view: View,
     pub list_state: ListState,
     /// 守护进程返回的**全量**列表。界面不直接读它，读的是 `groups`。
@@ -235,7 +239,7 @@ impl App {
     /// 生产环境不一样的初值，形同没测（这正是本函数存在的原因，见
     /// `a_fresh_app_starts_on_the_board_with_nothing_stale`）。
     fn new_inner(
-        client: Option<Client>,
+        client: Option<super::remote::Router>,
         default_dir: PathBuf,
         lang: crate::i18n::Lang,
         socket: PathBuf,
@@ -316,7 +320,7 @@ impl App {
         socket: PathBuf,
         view_mode: super::view::ViewMode,
     ) -> App {
-        Self::new_inner(Some(client), default_dir, lang, socket, view_mode)
+        Self::new_inner(Some(client.into()), default_dir, lang, socket, view_mode)
     }
 
     /// 只给测试用：不需要一个活的守护进程就能构造。
@@ -490,12 +494,16 @@ impl App {
     /// 拿到活的守护进程连接；构造时没能连上（目前只有测试会这样构造）就
     /// 报「守护进程连不上」——跟真实断线共用同一条错误路径，调用方不用
     /// 为“压根没连过”单独判一次。
-    pub fn client(&mut self) -> Result<&mut Client> {
+    pub fn client(&mut self) -> Result<&mut super::remote::Router> {
         // 先抄一份：`self.client.as_mut()` 之后就不能再读 `self` 的别的字段了
         let lang = self.lang;
-        self.client
+        let router = self
+            .client
             .as_mut()
-            .ok_or_else(|| anyhow!(crate::i18n::text(crate::i18n::Key::DaemonUnreachable, lang)))
+            .ok_or_else(|| anyhow!(crate::i18n::text(crate::i18n::Key::DaemonUnreachable, lang)))?;
+        // 远程画面还没到时那句「正在连接…」跟着界面语言走。
+        router.set_lang(lang);
+        Ok(router)
     }
 }
 
@@ -527,6 +535,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 
@@ -701,6 +710,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 
@@ -714,6 +724,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 

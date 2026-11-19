@@ -1767,6 +1767,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         };
         let live = vec![info(3, "codex"), info(4, "claude")];
         assert!(initiator_unresumable(&sock, &live, 3));
@@ -2003,6 +2004,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 

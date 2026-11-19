@@ -1139,6 +1139,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         };
         app.set_sessions(vec![mk(1, &a), mk(2, &b)]);
         app.list_state.select(Some(0));
@@ -2054,7 +2055,7 @@ mod tests {
     fn choosing_a_ready_agent_lands_you_inside_the_new_session() {
         let (sock, _fake_dir, received) = fake_daemon();
         let (mut app, _dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
 
         let mut state = ListState::default();
         state.select(Some(0));
@@ -2085,7 +2086,7 @@ mod tests {
     fn choosing_an_agent_for_a_hidden_project_uses_that_directory() {
         let (sock, _fake_dir, received) = fake_daemon();
         let (mut app, dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
         let target = dir.path().join("selected-project");
         std::fs::create_dir(&target).unwrap();
         app.set_sessions(vec![sess_in(1, "/w/other-project")]);
@@ -2130,7 +2131,7 @@ mod tests {
     fn project_picker_keeps_saved_projects_that_are_not_recent() {
         let (sock, _fake_dir, _received) = fake_daemon();
         let (mut app, _dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
         super::super::open_project_picker(&mut app);
         let View::PickProject(picker) = &app.view else {
             panic!("项目选择器没有打开")
@@ -2541,6 +2542,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 

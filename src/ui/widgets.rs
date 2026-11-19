@@ -901,6 +901,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         };
         assert_eq!(session_label(&s), "claude");
         s.tag = "修登录白屏".into();

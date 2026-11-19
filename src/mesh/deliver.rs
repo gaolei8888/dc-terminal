@@ -934,6 +934,7 @@ pub mod testing {
                 is_agent,
                 tag: tag.into(),
                 last_active_ms: 0,
+                machine: None,
             });
         }
 
@@ -1178,6 +1179,7 @@ mod tests {
             is_agent: true,
             tag: tag.into(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 

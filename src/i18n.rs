@@ -442,6 +442,9 @@ pub enum Key {
     /// 或者截图还没截成，这是最常见的一种「什么都没发生」，红字会把它说得
     /// 比实情严重。
     NoImageInClipboard,
+    /// 在别的电脑上的会话里按了 F5。图片要传文件，这一期不做；**不是红字**——
+    /// 用户没做错事，他需要知道的只是「这里只能粘文字」。
+    RemotePasteTextOnly,
     NoSessionSelected,
     DaemonUnreachable,
     StaleData,
@@ -997,6 +1000,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "The clipboard has no image",
             zh: "剪贴板里没有图片",
+        ),
+        RemotePasteTextOnly => t!(
+            lang,
+            en: "Sessions on another computer can only take pasted text",
+            zh: "远程会话只能粘文字",
         ),
         NoSessionSelected => t!(lang, en: "No session selected", zh: "没有选中会话"),
         DaemonUnreachable => t!(
@@ -1557,6 +1565,11 @@ pub mod msg {
 
     pub fn killed_session(lang: Lang, id: u32) -> String {
         t!(lang, en: format!("Killed session {id}"), zh: format!("已杀掉 {id} 号会话"))
+    }
+
+    /// 远程会话的画面还没取回来第一张时，画面里那一行。
+    pub fn remote_connecting(lang: Lang, peer: &str) -> String {
+        t!(lang, en: format!("Connecting to {peer}…"), zh: format!("正在连接 {peer}…"))
     }
 
     pub fn pruned(lang: Lang, n: u32) -> String {
@@ -3369,6 +3382,7 @@ mod tests {
             PasteOrTypeKey,
             NoOtherRunningSession,
             NoImageInClipboard,
+            RemotePasteTextOnly,
             NoSessionSelected,
             DaemonUnreachable,
             StaleData,
@@ -3486,7 +3500,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 222, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 223, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();

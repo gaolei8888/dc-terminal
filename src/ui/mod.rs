@@ -40,6 +40,7 @@ mod settings_view;
 mod web;
 
 mod computers;
+pub mod remote;
 mod view;
 use view::SecretPhase;
 pub use view::{
@@ -3092,6 +3093,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 
@@ -3743,6 +3745,7 @@ is_agent = true
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         app.explained_failure = Some((1, "上一次贴在这里时看到的旧解释".into()));
 
@@ -3920,6 +3923,7 @@ is_agent = true
             is_agent: false,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         app.view = View::Board;
 
@@ -4029,6 +4033,7 @@ is_agent = true
                 is_agent: true,
                 tag: String::new(),
                 last_active_ms: 0,
+                machine: None,
             },
             SessionInfo {
                 id: 2,
@@ -4039,6 +4044,7 @@ is_agent = true
                 is_agent: true,
                 tag: String::new(),
                 last_active_ms: 0,
+                machine: None,
             },
         ];
 
@@ -4223,6 +4229,7 @@ is_agent = true
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         // 第 0 行是组头，第 1 行才是那个会话。停在组头上等于「没选中会话」，
         // s/u/d 也就都不该写在底栏上——那是对的行为，但不是这些测试要问的。
@@ -4249,6 +4256,7 @@ is_agent = true
                 is_agent: true,
                 tag: String::new(),
                 last_active_ms: 0,
+                machine: None,
             },
             SessionInfo {
                 id: 2,
@@ -4259,6 +4267,7 @@ is_agent = true
                 is_agent: true,
                 tag: String::new(),
                 last_active_ms: 0,
+                machine: None,
             },
         ]);
         // 行序：组头 a / 会话 1 / 组头 b / 会话 2
@@ -4394,6 +4403,7 @@ is_agent = true
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         app.list_state.select(Some(1));
         app.view = View::Board;
@@ -4677,6 +4687,7 @@ is_agent = true
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         app.view = View::grid(0);
 
@@ -4801,6 +4812,7 @@ is_agent = true
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         app.view = View::PickProject(crate::ui::view::ProjectPicker::new(
             vec!["/w/other".to_string()],
@@ -4989,6 +5001,7 @@ is_agent = true
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         app.view = View::Board;
         assert!(
@@ -5030,6 +5043,7 @@ is_agent = true
                 is_agent: true,
                 tag: String::new(),
                 last_active_ms: 0,
+                machine: None,
             }]);
             app.view = View::Board;
             term.draw(|f| draw(f, &mut app)).unwrap();
@@ -5101,6 +5115,7 @@ is_agent = true
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         app.view = View::Board;
         term.draw(|f| draw(f, &mut app)).unwrap();

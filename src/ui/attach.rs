@@ -250,6 +250,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
 /// 路径就能自己去读那张图——Claude Code、codex 都是这么用的。
 fn paste_image(app: &mut App, id: u32) {
     use crate::clipboard::Pasted;
+    // 别的电脑上的会话：存下来的图在这台电脑上，送过去的路径对方读不到。
+    // 先问，别白存一张图。
+    if app.client().is_ok_and(|c| c.check_image_paste(id).is_err()) {
+        app.message = crate::i18n::text(crate::i18n::Key::RemotePasteTextOnly, app.lang).into();
+        return;
+    }
     match crate::clipboard::image_to_file() {
         Ok(Pasted::Image(path)) => {
             let text = path_as_input(&path);
@@ -644,6 +650,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 
@@ -1062,6 +1069,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         };
         app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
         // 行：[组头 a, 会话 1, 组头 b, 会话 2]——先站在 a 的会话上
@@ -1100,6 +1108,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         };
         app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
         // 把 b 折起来，再回到 a 的会话上
