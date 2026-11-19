@@ -304,6 +304,17 @@ pub(crate) fn run_with_hooks(
         });
     }
 
+    // 常驻会话（`[[keep]]`）。排在接回线程之后：`set_restoring(true)` 已经
+    // 立起来了，看守第一轮就会等接回做完，不会跟它抢着开同一个会话。
+    // 没写 `[[keep]]` 的人每 5 秒读一次配置文件，别的什么都不做。
+    spawn_keep_watcher(
+        socket,
+        mgr.clone(),
+        secrets.clone(),
+        KeepClock::real(),
+        Arc::new(AtomicBool::new(false)),
+    );
+
     let tick_mgr = mgr.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(200));
@@ -1547,6 +1558,202 @@ fn watch_resumed_by_id(
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("没能起接回看守线程：{e}");
+            None
+        }
+    }
+}
+
+/// 常驻会话（`[[keep]]`）的看守线程多久走一轮。改长之前先看
+/// `keep::KeepWatch::step` 里那段「活了多久量到发现它没了的那一轮」。
+const KEEP_TICK: Duration = Duration::from_secs(5);
+
+/// 看守线程的钟：多久走一轮、「现在」是几点。生产用 `KeepClock::real()`；
+/// 测试换一个每问一次就拨过一整轮的钟，不用真等 10 秒的退避。
+pub(crate) struct KeepClock {
+    tick: Duration,
+    now: Box<dyn Fn() -> std::time::Instant + Send>,
+}
+
+impl KeepClock {
+    fn real() -> KeepClock {
+        KeepClock {
+            tick: KEEP_TICK,
+            now: Box::new(std::time::Instant::now),
+        }
+    }
+}
+
+/// `crate::keep::Roster` 落在真名册上的那一面。每轮新建一个：`profiles`
+/// 是这一轮现读的全集，开会话要用它（磁盘上新建的 profile 才找得到）。
+struct ManagerRoster<'a> {
+    mgr: &'a SessionManager,
+    secrets: &'a Mutex<SecretStore>,
+    profiles: &'a [Profile],
+}
+
+/// 同一个目录的两种写法算一个：macOS 上 `/var/…` 和 `/private/var/…`、
+/// 结尾带不带 `/`。规范化失败（目录没了）就按原样比。
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+impl ManagerRoster<'_> {
+    /// 名册上还活着的会话。已停止的不算：它马上就会被抹掉，算上它会让看守
+    /// 以为常驻会话还在、不去重开。
+    fn live(&self) -> impl Iterator<Item = crate::session::SessionInfo> {
+        self.mgr
+            .list()
+            .into_iter()
+            .filter(|s| s.state != crate::session::SessionState::Stopped)
+    }
+
+    fn is_its(s: &crate::session::SessionInfo, k: &crate::keep::Keep) -> bool {
+        s.tag == k.name && s.profile == k.profile && same_dir(Path::new(&s.dir), &k.dir)
+    }
+}
+
+impl crate::keep::Roster for ManagerRoster<'_> {
+    fn paused(&self) -> bool {
+        self.mgr.is_restoring() || self.mgr.is_draining()
+    }
+
+    fn find(&self, k: &crate::keep::Keep) -> Option<u32> {
+        self.live().find(|s| Self::is_its(s, k)).map(|s| s.id)
+    }
+
+    fn name_taken_elsewhere(&self, k: &crate::keep::Keep) -> bool {
+        self.live().any(|s| s.tag == k.name && !Self::is_its(&s, k))
+    }
+
+    fn conversation_of(&self, id: u32) -> Option<String> {
+        self.mgr.conversation_of(id)
+    }
+
+    fn open(
+        &self,
+        k: &crate::keep::Keep,
+        conversation: Option<&str>,
+        want_id: Option<u32>,
+    ) -> Result<u32, String> {
+        // 原来的编号上还躺着一个已停止、没来得及抹掉的格子：先拿掉，不然
+        // `restore` 看见号被占了，会另发一个新号。号上是别的活会话就不动它。
+        if let Some(id) = want_id {
+            if self.mgr.list().iter().any(|s| {
+                s.id == id && s.state == crate::session::SessionState::Stopped
+            }) {
+                self.mgr.discard(id);
+            }
+        }
+        // 只为这一条短暂持锁，理由同接回线程的 `secret_of`。
+        let secret = recover(self.secrets.lock())
+            .get(&k.profile)
+            .map(str::to_string);
+        self.mgr
+            .restore(
+                &k.dir,
+                &k.profile,
+                secret.as_deref(),
+                self.profiles,
+                false,
+                Some(&k.name),
+                conversation,
+                want_id,
+            )
+            .map_err(|e| {
+                eprintln!("常驻会话「{}」没开起来：{e}", k.name);
+                e.to_string()
+            })
+    }
+
+    fn warn(&self, w: crate::proto::WarningCode) {
+        self.mgr.push_resume_skip(w);
+    }
+}
+
+/// 看守的一轮：重读 `[[keep]]` 和 profile 全集，报新出现的配置警告，走一步。
+/// `said` 是上一轮已经报过的那批配置警告。
+#[allow(clippy::too_many_arguments)]
+fn keep_round(
+    watch: &mut crate::keep::KeepWatch,
+    said: &mut Vec<crate::proto::WarningCode>,
+    now: std::time::Instant,
+    config: &Path,
+    home: &Path,
+    profiles_dir: &Path,
+    mgr: &SessionManager,
+    secrets: &Mutex<SecretStore>,
+) {
+    // 接回期间连配置警告也先不报：接回线程收尾时 `set_resume_skips` 整份
+    // 覆盖，这时报的会被冲掉，而 `said` 记着「报过了」，就再也不报了。
+    if mgr.is_restoring() || mgr.is_draining() {
+        return;
+    }
+    let (keeps, warnings) = crate::keep::load(config, home);
+    // 坏配置一直坏着，每 5 秒报一遍会把界面刷满：只报这一轮新出现的。
+    // 修好之后它从 `said` 里掉出去，再写坏就再报。
+    for w in &warnings {
+        if !said.contains(w) {
+            mgr.push_resume_skip(w.clone());
+        }
+    }
+    *said = warnings;
+    let (profiles, _) = all_profiles(profiles_dir);
+    let roster = ManagerRoster {
+        mgr,
+        secrets,
+        profiles: &profiles,
+    };
+    watch.step(now, &keeps, &profiles, &roster);
+}
+
+/// 起常驻会话的看守线程。每 `clock.tick` 走一轮 `keep_round`；一轮里 panic 了
+/// 只记一句，下一轮照走——这条线死了，常驻会话就再也不会被重开。
+/// `stop` 只给测试收线程用，生产里从不置位（线程不挡进程退出）。
+pub(crate) fn spawn_keep_watcher(
+    socket: &Path,
+    mgr: Arc<SessionManager>,
+    secrets: Arc<Mutex<SecretStore>>,
+    clock: KeepClock,
+    stop: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let config = crate::config::config_path_for_socket(socket);
+    let profiles_dir = profiles_dir_for_socket(socket);
+    // `~` 是用户真正的家目录（`sys::home`，跟装说明卡、`dct` 其它地方一样），
+    // 不是 socket 所在的 `~/.dct`。问不出家目录时退到 socket 往上两层：
+    // 真正的守护进程 socket 就在 `~/.dct/daemon.sock`。
+    let home = crate::sys::home()
+        .or_else(|| socket.parent().and_then(Path::parent).map(Path::to_path_buf))
+        .unwrap_or_default();
+    let spawned = std::thread::Builder::new()
+        .name("keep".into())
+        .spawn(move || {
+            let mut watch = crate::keep::KeepWatch::new();
+            let mut said = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let now = (clock.now)();
+                let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    keep_round(
+                        &mut watch,
+                        &mut said,
+                        now,
+                        &config,
+                        &home,
+                        &profiles_dir,
+                        &mgr,
+                        &secrets,
+                    )
+                }));
+                if round.is_err() {
+                    eprintln!("常驻会话看守这一轮出错了，下一轮再试");
+                }
+                std::thread::sleep(clock.tick);
+            }
+        });
+    match spawned {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("没能起常驻会话看守线程：{e}");
             None
         }
     }
@@ -6660,5 +6867,209 @@ mod drain_tests {
             "B 能按 id 接回，不用写交接"
         );
         r.call(Request::DrainCancel);
+    }
+}
+
+#[cfg(test)]
+mod keep_tests {
+    use super::*;
+    use crate::proto::{KeepEntryProblem, WarningCode};
+    use crate::session::{Liveness, SessionState};
+    use std::sync::atomic::AtomicU64;
+    use std::time::Instant;
+
+    /// 临时家目录：socket、一个不算 agent 的测试 profile（`sleep`，不用 git 仓库）、
+    /// 一个工作目录，`config.toml` 里一条 `[[keep]]` 指向它。
+    struct Home {
+        _t: tempfile::TempDir,
+        socket: PathBuf,
+        work: PathBuf,
+    }
+
+    fn home_with_keep() -> Home {
+        let t = tempfile::tempdir().unwrap();
+        let socket = t.path().join("daemon.sock");
+        let profiles = profiles_dir_for_socket(&socket);
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("keepme.toml"),
+            crate::sys::testing::toml_with_sh(
+                r#"
+                name = "keepme"
+                command = ["/bin/sh", "-c", "sleep 1000", "sh"]
+                is_agent = false
+                "#,
+            ),
+        )
+        .unwrap();
+        let work = t.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        write_config(&socket, &work, "");
+        Home {
+            _t: t,
+            socket,
+            work,
+        }
+    }
+
+    fn write_config(socket: &Path, work: &Path, extra: &str) {
+        let dir = work.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            crate::config::config_path_for_socket(socket),
+            format!("[[keep]]\nname = \"常驻\"\nprofile = \"keepme\"\ndir = \"{dir}\"\n{extra}"),
+        )
+        .unwrap();
+    }
+
+    /// 手拨的钟：看守每问一次时间，就当过去了一整轮（5 秒）。真等 10 秒的退避
+    /// 太慢；只把轮次缩短又会让「刚开就死」的窗口失真。
+    fn fast_clock() -> KeepClock {
+        let t0 = Instant::now();
+        let n = AtomicU64::new(0);
+        KeepClock {
+            tick: Duration::from_millis(20),
+            now: Box::new(move || t0 + KEEP_TICK * n.fetch_add(1, Ordering::SeqCst) as u32),
+        }
+    }
+
+    struct Running {
+        mgr: Arc<SessionManager>,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+            for s in self.mgr.list() {
+                self.mgr.discard(s.id);
+            }
+        }
+    }
+
+    fn start(h: &Home, mgr: Arc<SessionManager>) -> Running {
+        let secrets = Arc::new(Mutex::new(SecretStore::load(&secrets_path_for_socket(
+            &h.socket,
+        ))));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle =
+            spawn_keep_watcher(&h.socket, mgr.clone(), secrets, fast_clock(), stop.clone());
+        assert!(handle.is_some(), "看守线程没起来");
+        Running { mgr, stop, handle }
+    }
+
+    fn kept(mgr: &SessionManager) -> Vec<crate::session::SessionInfo> {
+        mgr.list()
+            .into_iter()
+            .filter(|s| s.tag == "常驻" && s.state != SessionState::Stopped)
+            .collect()
+    }
+
+    fn wait_kept(mgr: &SessionManager, within: Duration) -> Option<crate::session::SessionInfo> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(s) = kept(mgr).into_iter().next() {
+                return Some(s);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_kept_session_is_opened_and_comes_back_with_the_same_number_after_stop() {
+        let h = home_with_keep();
+        let r = start(&h, Arc::new(SessionManager::new()));
+        let first = wait_kept(&r.mgr, Duration::from_secs(10)).expect("常驻会话没开起来");
+        assert_eq!(first.profile, "keepme");
+        assert_eq!(
+            PathBuf::from(&first.dir).canonicalize().unwrap(),
+            h.work.canonicalize().unwrap()
+        );
+
+        r.mgr.stop(first.id).unwrap();
+        assert!(kept(&r.mgr).is_empty(), "停了就该从名册上没了");
+        let back = wait_kept(&r.mgr, Duration::from_secs(10)).expect("停掉之后没再开回来");
+        assert_eq!(back.id, first.id, "编号不变");
+        // 重用的编号刚记进「最近结束」：问它时不能还说「已结束」
+        assert_eq!(r.mgr.liveness(back.id), Liveness::Running);
+        assert!(r.mgr.screen(back.id).is_ok(), "活着的会话被当成已结束了");
+        assert_eq!(kept(&r.mgr).len(), 1, "只该有一个");
+    }
+
+    #[test]
+    fn the_daemon_starts_the_watcher_on_its_own() {
+        let h = home_with_keep();
+        let mgr = Arc::new(SessionManager::new());
+        let (s, m) = (h.socket.clone(), mgr.clone());
+        std::thread::spawn(move || {
+            let _ = run_with_manager(&s, m);
+        });
+        // 第一轮不等：后台一起来就开
+        let got = wait_kept(&mgr, Duration::from_secs(10));
+        // 后台线程收不掉：先删配置让它不再开，再收掉会话
+        let _ = std::fs::remove_file(crate::config::config_path_for_socket(&h.socket));
+        for s in mgr.list() {
+            mgr.discard(s.id);
+        }
+        assert!(got.is_some(), "后台没开常驻会话");
+    }
+
+    #[test]
+    fn nothing_is_opened_while_draining() {
+        let h = home_with_keep();
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_draining(true);
+        let r = start(&h, mgr);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(r.mgr.list().is_empty(), "准备重启时不该开会话");
+        r.mgr.set_draining(false);
+        assert!(wait_kept(&r.mgr, Duration::from_secs(10)).is_some());
+    }
+
+    #[test]
+    fn nothing_is_opened_while_restoring() {
+        let h = home_with_keep();
+        write_config(&h.socket, &h.work, "[[keep]]\nname = \"坏的\"\n");
+        let mgr = Arc::new(SessionManager::new());
+        mgr.set_restoring(true);
+        let r = start(&h, mgr);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(r.mgr.list().is_empty(), "接回上次的会话时不该开会话");
+        // 接回线程收尾时整份覆盖警告：这时报了会被冲掉，以后又不再报
+        assert!(r.mgr.resume_skips().is_empty(), "接回时也不报配置警告");
+        r.mgr.set_restoring(false);
+        assert!(wait_kept(&r.mgr, Duration::from_secs(10)).is_some());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(r.mgr.resume_skips().len(), 1, "接回完了再报");
+    }
+
+    #[test]
+    fn a_broken_entry_is_reported_once_not_every_round() {
+        let h = home_with_keep();
+        write_config(&h.socket, &h.work, "[[keep]]\nname = \"坏的\"\n");
+        let r = start(&h, Arc::new(SessionManager::new()));
+        assert!(wait_kept(&r.mgr, Duration::from_secs(10)).is_some(), "好的那条照开");
+        std::thread::sleep(Duration::from_millis(300));
+        let bad = |m: &SessionManager| {
+            m.resume_skips()
+                .iter()
+                .filter(|w| {
+                    matches!(w, WarningCode::KeepEntryInvalid { index: 2, reason: KeepEntryProblem::MissingField(f) } if f == "profile")
+                })
+                .count()
+        };
+        assert_eq!(bad(&r.mgr), 1, "同一条坏配置只报一次");
+        // 修好再写坏：问题回来了，再报一次
+        write_config(&h.socket, &h.work, "");
+        std::thread::sleep(Duration::from_millis(300));
+        write_config(&h.socket, &h.work, "[[keep]]\nname = \"坏的\"\n");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(bad(&r.mgr), 2);
     }
 }
