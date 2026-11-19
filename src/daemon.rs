@@ -265,7 +265,7 @@ pub(crate) fn run_with_hooks(
     // `Request::PhoneSetToken` 成功时会重新调用一次 `set_event_sink`
     // 把它补上（用户从 `Off` 第一次填令牌走的正是这条路径），
     // `Request::PhoneDisable` 会调用 `clear_event_sink` 收回——两处
-    // 都在 `handle(, Origin::Local)` 里，见那两个分支的注释。
+    // 都在 `handle()` 里，见那两个分支的注释。
     if recover(secrets.lock()).get(PHONE_TOKEN_KEY).is_some() {
         mgr.set_event_sink(event_tx.clone());
     }
@@ -2723,7 +2723,7 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// 大多数 `handle(, Origin::Local)` 测试根本不关心手机通知，就是要传一个空壳槽。
+    /// 大多数 `handle()` 测试根本不关心手机通知，就是要传一个空壳槽。
     fn test_phone() -> Arc<Mutex<PhoneStatus>> {
         Arc::new(Mutex::new(PhoneStatus {
             state: PhoneState::Off,
@@ -2912,7 +2912,7 @@ mod tests {
         );
     }
 
-    /// `handle(, Origin::Local)` 现在要求一个 `event_tx`（修复 1：`PhoneSetToken` 成功时
+    /// `handle()` 现在要求一个 `event_tx`（修复 1：`PhoneSetToken` 成功时
     /// 要能重新调用 `set_event_sink`）——大多数测试不关心手机通知，给一个
     /// 没人接收的 channel 就够了，`send()` 本身不会因为没有接收端而失败。
     fn test_event_tx() -> std::sync::mpsc::Sender<Event> {
@@ -4073,12 +4073,12 @@ mod tests {
     /// `session::tests::creating_a_session_is_not_held_up_by_the_first_checkpoint`），
     /// 这里用一个**故意造大的仓库**钉住它不许挪回来。
     ///
-    /// 「不许持锁」是更早一次审查的回归：`handle(, Origin::Local)` 曾经在建会话的整段流程里
+    /// 「不许持锁」是更早一次审查的回归：`handle()` 曾经在建会话的整段流程里
     /// 一直攥着 secrets 锁，而 `SetSecret`/`DeleteSecret` 这两个本该极快的
     /// 操作绝不能被堵住排队。慢活挪走之后这条已经不容易踩中，但断言留着——
     /// 哪天又有人往 `Create` 里塞同步慢活，上面那条先红，这条随后。
     ///
-    /// 直接调用 `handle(, Origin::Local)` 而不是走真实 socket，是为了最直接地量最本质的
+    /// 直接调用 `handle()` 而不是走真实 socket，是为了最直接地量最本质的
     /// 东西，不掺网络往返的噪音。
     #[test]
     fn create_does_not_hold_the_secrets_lock_across_the_slow_work() {
@@ -4191,7 +4191,7 @@ mod tests {
     }
 
     /// 回归测试：`Request::Explanation` 真的接到了 `mgr.explanation()`，不是
-    /// 一条只在类型上存在、`handle(, Origin::Local)` 里没人接的死请求。
+    /// 一条只在类型上存在、`handle()` 里没人接的死请求。
     #[test]
     fn explanation_request_is_wired_to_the_session_manager() {
         let repo = tempfile::tempdir().unwrap();
@@ -4432,7 +4432,7 @@ mod tests {
         );
     }
 
-    /// `bare_handle_deps` 的返回值：调用 `handle(, Origin::Local)` 要用的三个壳
+    /// `bare_handle_deps` 的返回值：调用 `handle()` 要用的三个壳
     /// （mgr/store/secrets）以及一个空 profiles 目录。
     type BareHandleDeps = (
         Arc<SessionManager>,
@@ -4441,7 +4441,7 @@ mod tests {
         tempfile::TempDir,
     );
 
-    /// 拼齐调用 `handle(, Origin::Local)` 要用的三个壳（mgr/store/secrets）以及一个空
+    /// 拼齐调用 `handle()` 要用的三个壳（mgr/store/secrets）以及一个空
     /// profiles 目录，手机通知的这几条测试都不关心这几个，只是签名要它们。
     fn bare_handle_deps() -> BareHandleDeps {
         let mgr = Arc::new(SessionManager::new());
@@ -5563,7 +5563,7 @@ mod web_tests {
     use super::*;
     use crate::proto::WebInfo;
 
-    /// `handle(, Origin::Local)` 那一串参数在测试里要用四遍，打包成一个结构体传——
+    /// `handle()` 那一串参数在测试里要用四遍，打包成一个结构体传——
     /// 返回一个八元组的话 clippy 也有话说，而且调用点全是 `.0`/`.3` 这种
     /// 读不出意思的下标。
     struct Fx {
