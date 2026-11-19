@@ -47,7 +47,7 @@ pub fn parse(src: &str, home: &Path) -> (Vec<Keep>, Vec<WarningCode>) {
         reason,
     };
     let Some(entries) = keep.as_array() else {
-        return (Vec::new(), vec![invalid(0, KeepEntryProblem::NotATable)]);
+        return (Vec::new(), vec![invalid(0, KeepEntryProblem::KeepNotAnArray)]);
     };
     let mut out: Vec<Keep> = Vec::new();
     let mut warnings = Vec::new();
@@ -65,22 +65,18 @@ pub fn parse(src: &str, home: &Path) -> (Vec<Keep>, Vec<WarningCode>) {
             warnings.push(invalid(index, KeepEntryProblem::EmptyName));
             continue;
         }
-        let mut fields = Vec::with_capacity(3);
-        let mut missing = None;
-        for key in ["name", "profile", "dir"] {
-            match text_field(t, key) {
-                Some(v) => fields.push(v),
-                None => {
-                    missing = Some(key);
-                    break;
-                }
-            }
-        }
-        if let Some(key) = missing {
-            warnings.push(invalid(index, KeepEntryProblem::MissingField(key.into())));
+        let Some(name) = text_field(t, "name") else {
+            warnings.push(invalid(index, KeepEntryProblem::MissingField("name".into())));
             continue;
-        }
-        let [name, profile, dir]: [String; 3] = fields.try_into().expect("三个字段");
+        };
+        let Some(profile) = text_field(t, "profile") else {
+            warnings.push(invalid(index, KeepEntryProblem::MissingField("profile".into())));
+            continue;
+        };
+        let Some(dir) = text_field(t, "dir") else {
+            warnings.push(invalid(index, KeepEntryProblem::MissingField("dir".into())));
+            continue;
+        };
         if out.iter().any(|k| k.name == name) {
             warnings.push(invalid(index, KeepEntryProblem::DuplicateName(name)));
             continue;
@@ -227,9 +223,45 @@ dir = "/w/2"
         let (k, w) = parse("keep = 3\n", &home());
         assert!(k.is_empty());
         assert_eq!(w.len(), 1);
+        assert_eq!(problem(&w[0]), (0, &KeepEntryProblem::KeepNotAnArray));
         let (k, w) = parse("keep = [1, 2]\n", &home());
         assert!(k.is_empty());
         assert_eq!(w.len(), 2);
+        assert_eq!(problem(&w[0]), (1, &KeepEntryProblem::NotATable));
+        assert_eq!(problem(&w[1]), (2, &KeepEntryProblem::NotATable));
+    }
+
+    #[test]
+    fn surrounding_spaces_are_trimmed() {
+        let src = "[[keep]]\nname = \"  a \"\nprofile = \" p\"\ndir = \" /w \"\n";
+        let (k, w) = parse(src, &home());
+        assert!(w.is_empty());
+        assert_eq!(k[0].name, "a");
+        assert_eq!(k[0].profile, "p");
+        assert_eq!(k[0].dir, PathBuf::from("/w"));
+    }
+
+    #[test]
+    fn duplicates_are_detected_after_trimming() {
+        let src = "[[keep]]\nname = \"a\"\nprofile = \"p\"\ndir = \"/1\"\n\
+                   [[keep]]\nname = \" a \"\nprofile = \"p\"\ndir = \"/2\"\n";
+        let (k, w) = parse(src, &home());
+        assert_eq!(k.len(), 1);
+        assert_eq!(
+            problem(&w[0]),
+            (2, &KeepEntryProblem::DuplicateName("a".into()))
+        );
+    }
+
+    #[test]
+    fn a_non_string_field_counts_as_missing() {
+        let src = "[[keep]]\nname = \"a\"\nprofile = 5\ndir = \"/w\"\n";
+        let (k, w) = parse(src, &home());
+        assert!(k.is_empty());
+        assert_eq!(
+            problem(&w[0]),
+            (1, &KeepEntryProblem::MissingField("profile".into()))
+        );
     }
 
     #[test]

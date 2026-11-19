@@ -2777,6 +2777,14 @@ pub mod msg {
                     zh: format!("没能接回 {dir} 的「{profile}」会话：{why}。"),
                 )
             }
+            KeepEntryInvalid {
+                reason: crate::proto::KeepEntryProblem::KeepNotAnArray,
+                ..
+            } => t!(
+                lang,
+                en: "The always-on sessions in the settings file are not written correctly: each one should start with [[keep]]. None of them were used.".to_string(),
+                zh: "设置文件里的 keep 写法不对，每个常驻会话都应该以 [[keep]] 开头，所以一个都没用上。".to_string(),
+            ),
             KeepEntryInvalid { index, reason } => {
                 let why = match reason {
                     crate::proto::KeepEntryProblem::MissingField(f) => t!(
@@ -2794,7 +2802,8 @@ pub mod msg {
                         en: format!("the name “{n}” is already used by an earlier entry"),
                         zh: format!("名字「{n}」前面已经用过了"),
                     ),
-                    crate::proto::KeepEntryProblem::NotATable => t!(
+                    crate::proto::KeepEntryProblem::NotATable
+                    | crate::proto::KeepEntryProblem::KeepNotAnArray => t!(
                         lang,
                         en: "it is not written as an entry".to_string(),
                         zh: "格式不对".to_string(),
@@ -3872,8 +3881,12 @@ mod tests {
                 reason: crate::proto::KeepEntryProblem::DuplicateName("a".into()),
             },
             KeepEntryInvalid {
-                index: 0,
+                index: 2,
                 reason: crate::proto::KeepEntryProblem::NotATable,
+            },
+            KeepEntryInvalid {
+                index: 0,
+                reason: crate::proto::KeepEntryProblem::KeepNotAnArray,
             },
             KeptSessionProblem {
                 name: "a".into(),

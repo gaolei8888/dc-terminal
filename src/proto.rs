@@ -1464,8 +1464,11 @@ pub enum KeepEntryProblem {
     EmptyName,
     /// 名字和前面某一条重复，保留先写的那条
     DuplicateName(String),
-    /// 这一条根本不是一张表（比如 `keep = [1, 2]`）；整个 `keep` 不是数组时 index 为 0
+    /// 这一条根本不是一张表（比如 `keep = [1, 2]` 里的 `1`）
     NotATable,
+    /// `keep` 本身不是数组（比如 `keep = 3`）。这时没有「第几条」，`index` 填 0，
+    /// 渲染时不提序号。
+    KeepNotAnArray,
 }
 
 /// 常驻会话为什么没能起来、或者为什么停止重启它。
