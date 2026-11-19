@@ -42,10 +42,6 @@ pub const REMOTE_BASE: u32 = 1 << 24;
 /// 本机连接默认的 5 秒读超时（`client::READ_TIMEOUT`）一定不够。
 pub const REMOTE_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 同一批按键连续送不到几次就整队清空。清空比过一会儿一股脑打进去安全：
-/// 用户早就以为那些字没了，接着在打别的。
-const KEY_TRIES: u32 = 3;
-
 fn is_synthetic(id: u32) -> bool {
     id >= REMOTE_BASE
 }
@@ -121,7 +117,10 @@ pub enum PeerStatus {
 /// 的一句话；id 都已经换成合成 id。
 #[derive(Debug)]
 pub enum FeedEvent {
-    /// 按键连续 `KEY_TRIES` 次没送到，整队清空了。
+    /// 一批按键没送到，整队清空了。**不在这一层重发**：守护进程那一次
+    /// `RemoteCall` 里已经带着同一个 `seq` 试过三次；这里再发就是新 `seq`，
+    /// 对方要是其实执行过（只是答复丢了），同一个键就会打两遍。清空也比
+    /// 过一会儿一股脑打进去安全：用户早就以为那些字没了，接着在打别的。
     KeysLost { peer: String },
     /// 对方收到了按键，但拒绝了（没开远程、会话没了……）。
     Refused { peer: String, code: ErrorCode },
@@ -453,8 +452,6 @@ struct Schedule {
     next_list: Instant,
     not_before: Instant,
     backoff: Duration,
-    /// 队首这批按键已经连续失败几次。
-    key_failures: u32,
 }
 
 impl Schedule {
@@ -508,7 +505,6 @@ fn run(peer: &str, shared: &Shared, dial: &Dial, pace: Pace) {
         next_list: now,
         not_before: now,
         backoff: Duration::ZERO,
-        key_failures: 0,
     };
     let mut line: Option<Box<dyn Line>> = None;
     loop {
@@ -573,17 +569,27 @@ fn settle(
             st.status = PeerStatus::Offline;
             s.backoff = (s.backoff * 2).clamp(pace.backoff_min, pace.backoff_max);
             s.not_before = now + s.backoff;
+            // 读（列表、画面、项目）过一会儿照样再问，靠上面的退避控制频率。
+            // 写（按键、新建、停止……）**一次失败就是失败**，绝不换个 `seq`
+            // 重发——见 `FeedEvent::KeysLost`。
             if let Job::Keys(op) = job {
-                s.key_failures += 1;
-                if s.key_failures >= KEY_TRIES {
-                    s.key_failures = 0;
-                    st.queue.clear();
-                    st.events.push(FeedEvent::KeysLost {
+                match op.answer_of() {
+                    // 新建/停止/回滚/改动：报回去，后面排着的照常发。
+                    Some(of) => st.events.push(FeedEvent::Answer {
                         peer: peer.to_string(),
-                    });
-                } else {
-                    // 留在队首重发，后面的不许插队。
-                    st.queue.push_front(op);
+                        id: (op.id != 0).then_some(op.id),
+                        of,
+                        resp: Response::Error(ErrorCode::RemoteUnavailable {
+                            peer: peer.to_string(),
+                        }),
+                    }),
+                    // 按键：后面排着的键少了前面这几个就是乱码，整队清空。
+                    None => {
+                        st.queue.clear();
+                        st.events.push(FeedEvent::KeysLost {
+                            peer: peer.to_string(),
+                        });
+                    }
                 }
             }
             return;
@@ -642,25 +648,22 @@ fn settle(
             }
             _ => {}
         },
-        Job::Keys(op) => {
-            s.key_failures = 0;
-            match op.answer_of() {
-                Some(of) => st.events.push(FeedEvent::Answer {
-                    peer: peer.to_string(),
-                    id: (op.id != 0).then_some(op.id),
-                    of,
-                    resp,
-                }),
-                None => {
-                    if let Response::Error(code) = resp {
-                        st.events.push(FeedEvent::Refused {
-                            peer: peer.to_string(),
-                            code,
-                        });
-                    }
+        Job::Keys(op) => match op.answer_of() {
+            Some(of) => st.events.push(FeedEvent::Answer {
+                peer: peer.to_string(),
+                id: (op.id != 0).then_some(op.id),
+                of,
+                resp,
+            }),
+            None => {
+                if let Response::Error(code) = resp {
+                    st.events.push(FeedEvent::Refused {
+                        peer: peer.to_string(),
+                        code,
+                    });
                 }
             }
-        }
+        },
         Job::Projects => {
             st.want_projects = false;
             if let Response::Projects { recent, pinned } = resp {
@@ -1197,17 +1200,22 @@ mod tests {
         );
     }
 
+    /// 第一问慢一点再失败：保证后面那几条在失败落地之前都已经进了队列，
+    /// 测的是「失败时队里排着的东西怎么处理」，而不是赛跑。
+    fn slow_failure() -> Result<Response> {
+        std::thread::sleep(Duration::from_millis(200));
+        Ok(Response::Error(ErrorCode::RemoteUnavailable {
+            peer: "mac".into(),
+        }))
+    }
+
+    /// 守护进程那一次 `RemoteCall` 里已经带同一个 `seq` 试过三次了。Feed
+    /// 再发就是新 `seq`：对方要是其实执行过（只是答复丢了），键会打两遍。
     #[test]
-    fn keys_keep_their_order_across_a_retry() {
-        let failed_once = Arc::new(AtomicUsize::new(0));
-        let f = failed_once.clone();
+    fn a_failed_key_call_is_never_resent() {
         let r = remote(move |req| match req {
             Request::List => Ok(Response::Sessions(vec![sess(7, "/r")])),
-            Request::Input { .. } if f.fetch_add(1, Ordering::SeqCst) == 0 => {
-                Ok(Response::Error(ErrorCode::RemoteUnavailable {
-                    peer: "mac".into(),
-                }))
-            }
+            Request::Input { text, .. } if text == "a" => slow_failure(),
             _ => Ok(Response::Ok),
         });
         let mut rig = rig(vec![], r, fast());
@@ -1229,35 +1237,30 @@ mod tests {
         ] {
             assert!(matches!(rig.router.call(req).unwrap(), Response::Ok));
         }
-        assert!(wait_up_to(Duration::from_secs(5), || inputs(
-            &rig.remote_seen
-        )
-        .len()
-            >= 4));
-        let got = inputs(&rig.remote_seen);
+        let mut events = Vec::new();
+        assert!(wait_up_to(Duration::from_secs(5), || {
+            events.extend(rig.router.take_events());
+            !events.is_empty()
+        }));
+        // 再给它充分的时间：要是会重发，这段时间里就发了
+        std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
-            got,
-            vec![
-                r#"Input { id: 7, text: "a" }"#,
-                r#"Input { id: 7, text: "a" }"#,
-                "Key(7, Enter)",
-                r#"Input { id: 7, text: "b" }"#,
-            ],
-            "失败的那条留在队首重发，后面的不许插队"
-        );
-        assert!(
-            rig.router.take_events().is_empty(),
-            "重试成功了就不该报丢键"
+            inputs(&rig.remote_seen),
+            vec![r#"Input { id: 7, text: "a" }"#],
+            "失败的那条不许再发，排在它后面的回车和 b 也不许跟着打进去"
         );
     }
 
     #[test]
-    fn three_failures_drop_the_queue_and_say_so() {
+    fn a_failed_key_call_drops_the_queue_and_says_so() {
         let refuse = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let r_ = refuse.clone();
         let r = remote(move |req| match req {
             Request::List => Ok(Response::Sessions(vec![sess(7, "/r")])),
-            _ if r_.load(Ordering::SeqCst) => Err(anyhow::anyhow!("relay down")),
+            _ if r_.load(Ordering::SeqCst) => {
+                std::thread::sleep(Duration::from_millis(200));
+                Err(anyhow::anyhow!("relay down"))
+            }
             _ => Ok(Response::Ok),
         });
         let mut rig = rig(vec![], r, fast());
@@ -1281,15 +1284,16 @@ mod tests {
             events.extend(rig.router.take_events());
             !events.is_empty()
         }));
+        std::thread::sleep(Duration::from_millis(100));
+        events.extend(rig.router.take_events());
         assert!(
             matches!(&events[..], [FeedEvent::KeysLost { peer }] if peer == "mac"),
-            "{events:?}"
+            "一次失败就报一次丢键：{events:?}"
         );
-        let tries = inputs(&rig.remote_seen);
         assert_eq!(
-            tries,
-            vec![r#"Input { id: 7, text: "a" }"#; 3],
-            "试三次就停，回车不能在清空之后再被打进去"
+            inputs(&rig.remote_seen),
+            vec![r#"Input { id: 7, text: "a" }"#],
+            "一次失败就清空，回车不能在清空之后再被打进去"
         );
 
         // 清空之后队列重新可用：下一条照常送到
@@ -1305,7 +1309,59 @@ mod tests {
         )
         .last()
         .is_some_and(|s| s.contains("\"z\""))));
-        assert_eq!(inputs(&rig.remote_seen).len(), 4);
+        assert_eq!(inputs(&rig.remote_seen).len(), 2);
+    }
+
+    /// 新建失败不重发：守护进程那一次里已经同 `seq` 试过三次，再发可能
+    /// 在对方建出两个会话。失败经事件报回去，排在后面的照常发。
+    #[test]
+    fn a_failed_create_is_not_resent() {
+        let r = remote(move |req| match req {
+            Request::List => Ok(Response::Sessions(vec![sess(7, "/r")])),
+            Request::Create { .. } => slow_failure(),
+            _ => Ok(Response::Ok),
+        });
+        let mut rig = rig(vec![], r, fast());
+        rig.router.set_peers(&["mac".to_string()]);
+        let id = first_remote_id(&mut rig.router, "mac");
+        rig.router
+            .create_on("mac", "/r/proj".into(), "claude".into())
+            .unwrap();
+        rig.router
+            .call(Request::Input {
+                id,
+                text: "x".into(),
+            })
+            .unwrap();
+        let mut events = Vec::new();
+        assert!(wait_up_to(Duration::from_secs(5), || {
+            events.extend(rig.router.take_events());
+            !events.is_empty()
+        }));
+        assert!(
+            matches!(
+                &events[..],
+                [FeedEvent::Answer {
+                    of: AnswerOf::Create,
+                    resp: Response::Error(ErrorCode::RemoteUnavailable { .. }),
+                    ..
+                }]
+            ),
+            "{events:?}"
+        );
+        assert!(wait_up_to(Duration::from_secs(5), || inputs(
+            &rig.remote_seen
+        )
+        .len()
+            >= 2));
+        std::thread::sleep(Duration::from_millis(200));
+        let seen = inputs(&rig.remote_seen);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].starts_with("Create"), "{seen:?}");
+        assert_eq!(
+            seen[1], r#"Input { id: 7, text: "x" }"#,
+            "新建失败不连累后面的键"
+        );
     }
 
     #[test]
