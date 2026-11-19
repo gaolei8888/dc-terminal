@@ -137,7 +137,8 @@ pub const RESUME_FAIL_WINDOW: Duration = Duration::from_secs(20);
 /// 只是让用户知道。开不起来不算进这里，那有 `StartFailed`。
 pub const CRASH_WARN_AFTER: u32 = 3;
 
-/// 第 `failures` 次失败之后要等多久：5 秒起翻倍，封顶 5 分钟。
+/// 已经连续失败 `failures` 次时，这次要等多久：0 次 5 秒，之后每次翻倍，
+/// 封顶 5 分钟。
 fn backoff(failures: u32) -> Duration {
     RESTART_BASE
         .checked_mul(1u32.checked_shl(failures).unwrap_or(u32::MAX))
@@ -180,10 +181,11 @@ impl Watched {
         self.warned.retain(|w| *w != reason);
     }
 
-    /// 记一次失败并排下一次重开。
+    /// 记一次失败并排下一次重开。先按**这次之前**的次数算等多久再加一：
+    /// 第一次秒退等 5 秒，之后 10、20……封顶 5 分钟。
     fn fail(&mut self, now: Instant) {
-        self.failures += 1;
         self.next_try = Some(now + backoff(self.failures));
+        self.failures += 1;
     }
 
     /// 活够了 `HEALTHY_AFTER`：失败次数清零，报过的警告下次出问题可以再报。
@@ -660,7 +662,7 @@ mod watch_tests {
             opened = h.next_open_from(died);
             waits.push(opened - died);
         }
-        assert_eq!(waits, vec![10, 20, 40, 80, 160, 300, 300, 300]);
+        assert_eq!(waits, vec![5, 10, 20, 40, 80, 160, 300, 300]);
         // 这次活够一分钟，清零
         h.live(101);
         h.at(opened + 1);
@@ -685,7 +687,7 @@ mod watch_tests {
             opened = h.next_open_from(died);
             waits.push(opened - died);
         }
-        assert_eq!(waits, vec![10, 20, 40]);
+        assert_eq!(waits, vec![5, 10, 20]);
     }
 
     #[test]
@@ -904,11 +906,11 @@ mod watch_tests {
         h.at(0);
         assert_eq!(h.opens().len(), 1);
         assert_eq!(h.warned(KeptSessionReason::StartFailed), 1);
-        assert_eq!(h.next_open_from(1), 10);
-        assert_eq!(h.next_open_from(11), 30);
+        assert_eq!(h.next_open_from(1), 5);
+        assert_eq!(h.next_open_from(6), 15);
         assert_eq!(h.warned(KeptSessionReason::StartFailed), 1);
         h.r.open_fails.set(false);
-        assert_eq!(h.next_open_from(31), 70);
+        assert_eq!(h.next_open_from(16), 35);
     }
 
     #[test]
