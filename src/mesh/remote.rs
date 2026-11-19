@@ -64,7 +64,10 @@ pub fn capability_of(req: &Request) -> Option<Capability> {
         | Request::Screens { .. }
         | Request::Explanation { .. }
         | Request::Projects
-        | Request::Profiles { .. } => Some(View),
+        | Request::Profiles { .. }
+        // 开机编号：操作方靠它发现这台重启过、会话号重新数过了（`ui::remote::Ids`），
+        // 不然它手里的旧号会指到别的会话上去。只读、不碰任何状态。
+        | Request::Instance => Some(View),
 
         Request::Input { .. }
         | Request::Submit { .. }
@@ -115,7 +118,6 @@ pub fn capability_of(req: &Request) -> Option<Capability> {
         | Request::Drain { .. }
         | Request::DrainStatus { .. }
         | Request::DrainCancel
-        | Request::Instance
         | Request::RemoteCall { .. }
         | Request::RemoteControl { .. } => None,
     }
@@ -240,6 +242,7 @@ mod tests {
             (Request::Screens { ids: vec![1] }, View),
             (Request::Explanation { id: 1 }, View),
             (Request::Projects, View),
+            (Request::Instance, View),
             (
                 Request::Profiles {
                     lang: crate::i18n::Lang::Zh,
@@ -428,6 +431,7 @@ mod tests {
         assert!(!counts_as_presence(&Request::List));
         assert!(!counts_as_presence(&Request::Projects));
         assert!(!counts_as_presence(&Request::Hello));
+        assert!(!counts_as_presence(&Request::Instance));
         assert!(counts_as_presence(&Request::Screen { id: 1 }));
         assert!(counts_as_presence(&Request::Screens { ids: vec![1] }));
         assert!(counts_as_presence(&Request::Input {

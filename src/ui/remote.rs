@@ -142,29 +142,37 @@ pub enum AnswerOf {
     Diff,
 }
 
-/// `(电脑名, 真号) ↔ 合成号` 的双向表。只增不减，见文件头。
+/// `(电脑名, 那台后台的第几代, 真号) ↔ 合成号` 的双向表。只增不减，见文件头。
+///
+/// **「第几代」不能省。** 对方后台一重启，会话号又从 1 数起（`session.rs`
+/// 的 `next_id`）：只按 `(电脑名, 真号)` 记的话，界面手里攥着的旧号会悄悄
+/// 指到一个毫不相干的新会话上，用户接着打的字就打进了别的 agent。代数由
+/// `Feed` 在发现对方开机编号（`Request::Instance`）变了时加一，旧代的号从此
+/// 作废，见 `Feed` 的 `retire`。
 #[derive(Default)]
 pub(crate) struct Ids {
-    to: HashMap<(String, u32), u32>,
-    from: HashMap<u32, (String, u32)>,
+    to: HashMap<(String, u32, u32), u32>,
+    from: HashMap<u32, (String, u32, u32)>,
 }
 
 impl Ids {
-    pub(crate) fn synthetic(&mut self, peer: &str, real: u32) -> u32 {
-        if let Some(&s) = self.to.get(&(peer.to_string(), real)) {
+    pub(crate) fn synthetic(&mut self, peer: &str, epoch: u32, real: u32) -> u32 {
+        let key = (peer.to_string(), epoch, real);
+        if let Some(&s) = self.to.get(&key) {
             return s;
         }
         // 表只增不减，所以「已发出去几个」就是下一个号——天然不复用。
         let s = REMOTE_BASE.saturating_add(self.from.len() as u32);
-        self.to.insert((peer.to_string(), real), s);
-        self.from.insert(s, (peer.to_string(), real));
+        self.to.insert(key.clone(), s);
+        self.from.insert(s, key);
         s
     }
 
-    pub(crate) fn real(&self, synthetic: u32) -> Option<(&str, u32)> {
+    /// `(电脑名, 代, 真号)`。
+    pub(crate) fn real(&self, synthetic: u32) -> Option<(&str, u32, u32)> {
         self.from
             .get(&synthetic)
-            .map(|(peer, real)| (peer.as_str(), *real))
+            .map(|(peer, epoch, real)| (peer.as_str(), *epoch, *real))
     }
 }
 
@@ -309,7 +317,13 @@ struct State {
     /// 正在看的会话（真号）。只给这几个取画面。
     watched: Vec<u32>,
     queue: VecDeque<Op>,
-    events: Vec<FeedEvent>,
+    /// 带着产生时的代数：换号时得按那一代去换。
+    events: Vec<(u32, FeedEvent)>,
+    /// 对方后台的开机编号，最近一次问到的。`None` = 还没问到（或对方太老、
+    /// 答不上来——那就没法发现它重启过）。
+    instance: Option<u64>,
+    /// 对方后台的第几代，见 `Ids`。
+    epoch: u32,
     projects: Option<(Vec<String>, Vec<String>)>,
     projects_at: Option<Instant>,
     profiles: Option<Vec<ProfileEntry>>,
@@ -342,6 +356,8 @@ impl Feed {
                 watched: Vec::new(),
                 queue: VecDeque::new(),
                 events: Vec::new(),
+                instance: None,
+                epoch: 0,
                 projects: None,
                 projects_at: None,
                 profiles: None,
@@ -381,14 +397,27 @@ impl Feed {
         }
     }
 
-    fn enqueue(&self, op: Op) {
-        self.lock().queue.push_back(op);
+    /// 进队列，**前提是对方还是 `epoch` 那一代**——查和放在同一把锁里，
+    /// 不然查完、放之前对方换了代，旧号的键就进了新一代的队列。
+    fn enqueue_in(&self, epoch: u32, op: Op) -> bool {
+        let mut st = self.lock();
+        if st.epoch != epoch {
+            return false;
+        }
+        st.queue.push_back(op);
+        drop(st);
         self.shared.wake.notify_all();
+        true
     }
 
-    /// 这个会话（真号）的画面是多久以前取回来的；还没取到过是 `None`。
-    pub fn age(&self, id: u32) -> Option<Duration> {
-        self.lock().screens.get(&id).map(|c| c.at.elapsed())
+    /// 第 `epoch` 代、真号 `id` 的画面是多久以前取回来的；还没取到过、或者
+    /// 那一代已经作废，是 `None`。
+    pub fn age(&self, epoch: u32, id: u32) -> Option<Duration> {
+        let st = self.lock();
+        if st.epoch != epoch {
+            return None;
+        }
+        st.screens.get(&id).map(|c| c.at.elapsed())
     }
 
     pub fn status(&self) -> PeerStatus {
@@ -408,6 +437,8 @@ impl Drop for Feed {
 enum Job {
     Keys(Op),
     Screens(Vec<u32>),
+    /// 每轮取列表之前先问一句对方的开机编号，见 `Ids`。
+    Instance,
     List,
     Projects,
     Profiles(Lang),
@@ -418,6 +449,7 @@ enum JobKind {
     Nothing,
     Keys,
     Screens,
+    Instance,
     List,
     Catalog,
 }
@@ -427,6 +459,7 @@ impl Job {
         match self {
             Job::Keys(_) => JobKind::Keys,
             Job::Screens(_) => JobKind::Screens,
+            Job::Instance => JobKind::Instance,
             Job::List => JobKind::List,
             Job::Projects | Job::Profiles(_) => JobKind::Catalog,
         }
@@ -438,6 +471,7 @@ impl Job {
             // 只看一个会话时用 `Screen`：它带光标、状态、滚动，`Screens` 只带行。
             Job::Screens(ids) if ids.len() == 1 => Request::Screen { id: ids[0] },
             Job::Screens(ids) => Request::Screens { ids: ids.clone() },
+            Job::Instance => Request::Instance,
             Job::List => Request::List,
             Job::Projects => Request::Projects,
             Job::Profiles(lang) => Request::Profiles { lang: *lang },
@@ -452,6 +486,8 @@ struct Schedule {
     next_list: Instant,
     not_before: Instant,
     backoff: Duration,
+    /// 这一轮的开机编号已经问过了，可以取列表了。
+    instance_checked: bool,
 }
 
 impl Schedule {
@@ -473,14 +509,22 @@ fn pick(st: &mut State, s: &Schedule, now: Instant, pace: Pace) -> Option<Job> {
     // 没开远程的电脑取画面也只会被拒，只靠列表等它开。
     let watching = !st.watched.is_empty() && st.status != PeerStatus::ControlOff;
     let keys = !st.queue.is_empty();
+    // 一轮 = 先问开机编号、再取列表。两问都各自守着 `gap`，2 问/秒照旧。
+    let round = || {
+        if s.instance_checked {
+            Job::List
+        } else {
+            Job::Instance
+        }
+    };
     if list_starved {
-        return Some(Job::List);
+        return Some(round());
     }
     if keys && !(watching && s.last == JobKind::Keys) {
         return take_batch(&mut st.queue).map(Job::Keys);
     }
     if list_due && s.last != JobKind::List {
-        return Some(Job::List);
+        return Some(round());
     }
     if st.want_projects {
         return Some(Job::Projects);
@@ -492,7 +536,7 @@ fn pick(st: &mut State, s: &Schedule, now: Instant, pace: Pace) -> Option<Job> {
         return Some(Job::Screens(st.watched.clone()));
     }
     if list_due {
-        return Some(Job::List);
+        return Some(round());
     }
     None
 }
@@ -505,6 +549,7 @@ fn run(peer: &str, shared: &Shared, dial: &Dial, pace: Pace) {
         next_list: now,
         not_before: now,
         backoff: Duration::ZERO,
+        instance_checked: false,
     };
     let mut line: Option<Box<dyn Line>> = None;
     loop {
@@ -563,7 +608,9 @@ fn settle(
     let mut st = recover(shared.st.lock());
     if matches!(job, Job::List) {
         s.next_list = now + pace.list_every;
+        s.instance_checked = false;
     }
+    let epoch = st.epoch;
     let resp = match result {
         Ok(Response::Error(ErrorCode::RemoteUnavailable { .. })) | Err(_) => {
             st.status = PeerStatus::Offline;
@@ -575,20 +622,28 @@ fn settle(
             if let Job::Keys(op) = job {
                 match op.answer_of() {
                     // 新建/停止/回滚/改动：报回去，后面排着的照常发。
-                    Some(of) => st.events.push(FeedEvent::Answer {
-                        peer: peer.to_string(),
-                        id: (op.id != 0).then_some(op.id),
-                        of,
-                        resp: Response::Error(ErrorCode::RemoteUnavailable {
+                    Some(of) => st.events.push((
+                        epoch,
+                        FeedEvent::Answer {
                             peer: peer.to_string(),
-                        }),
-                    }),
-                    // 按键：后面排着的键少了前面这几个就是乱码，整队清空。
+                            id: (op.id != 0).then_some(op.id),
+                            of,
+                            resp: Response::Error(ErrorCode::RemoteUnavailable {
+                                peer: peer.to_string(),
+                            }),
+                        },
+                    )),
+                    // 按键：后面排着的键少了前面这几个就是乱码，清掉所有按键。
+                    // 排着的新建/停止/回滚/改动**留着照发**：它们各自独立，
+                    // 扔掉的话用户按的 `x`、`n` 就无声无息地没了。
                     None => {
-                        st.queue.clear();
-                        st.events.push(FeedEvent::KeysLost {
-                            peer: peer.to_string(),
-                        });
+                        st.queue.retain(|op| op.answer_of().is_some());
+                        st.events.push((
+                            epoch,
+                            FeedEvent::KeysLost {
+                                peer: peer.to_string(),
+                            },
+                        ));
                     }
                 }
             }
@@ -604,6 +659,16 @@ fn settle(
         PeerStatus::Online
     };
     match job {
+        Job::Instance => {
+            s.instance_checked = true;
+            // 答不上来（对方太老，不认识这一问）就当不知道，照常取列表。
+            if let Response::Instance { id } = resp {
+                if st.instance.is_some_and(|old| old != id) {
+                    retire(peer, &mut st);
+                }
+                st.instance = Some(id);
+            }
+        }
         Job::List => {
             if let Response::Sessions(v) = resp {
                 st.screens.retain(|id, _| v.iter().any(|s| s.id == *id));
@@ -649,18 +714,24 @@ fn settle(
             _ => {}
         },
         Job::Keys(op) => match op.answer_of() {
-            Some(of) => st.events.push(FeedEvent::Answer {
-                peer: peer.to_string(),
-                id: (op.id != 0).then_some(op.id),
-                of,
-                resp,
-            }),
+            Some(of) => st.events.push((
+                epoch,
+                FeedEvent::Answer {
+                    peer: peer.to_string(),
+                    id: (op.id != 0).then_some(op.id),
+                    of,
+                    resp,
+                },
+            )),
             None => {
                 if let Response::Error(code) = resp {
-                    st.events.push(FeedEvent::Refused {
-                        peer: peer.to_string(),
-                        code,
-                    });
+                    st.events.push((
+                        epoch,
+                        FeedEvent::Refused {
+                            peer: peer.to_string(),
+                            code,
+                        },
+                    ));
                 }
             }
         },
@@ -681,6 +752,48 @@ fn settle(
     }
 }
 
+/// 对方后台换了一个（重启过）：这一代的号全部作废。
+///
+/// 手里的列表、画面、正在看的会话都是旧一代的，清掉；排着的、指名某个会话
+/// 的操作（按键、停止、回滚、改动）也清掉——它们的真号在新一代里指的是
+/// 别的会话。按键丢了报 `KeysLost`，停止/回滚/改动各报一句「会话没了」。
+/// 新建（不指名会话）留着照发。
+fn retire(peer: &str, st: &mut State) {
+    let old = st.epoch;
+    st.epoch += 1;
+    st.sessions.clear();
+    st.screens.clear();
+    st.watched.clear();
+    let mut keys_lost = false;
+    let queue = std::mem::take(&mut st.queue);
+    for op in queue {
+        if op.id == 0 {
+            st.queue.push_back(op);
+            continue;
+        }
+        match op.answer_of() {
+            Some(of) => st.events.push((
+                old,
+                FeedEvent::Answer {
+                    peer: peer.to_string(),
+                    id: Some(op.id),
+                    of,
+                    resp: Response::Error(ErrorCode::NoSuchSession(op.id)),
+                },
+            )),
+            None => keys_lost = true,
+        }
+    }
+    if keys_lost {
+        st.events.push((
+            old,
+            FeedEvent::KeysLost {
+                peer: peer.to_string(),
+            },
+        ));
+    }
+}
+
 /// 看板手里的「守护进程连接」：本机的请求原样转给本机，远程会话的请求
 /// 走各自的 `Feed`。`App::client()` 返回的就是它。
 pub struct Router {
@@ -691,6 +804,8 @@ pub struct Router {
     dial: Dial,
     pace: Pace,
     lang: Lang,
+    /// `Router` 自己要报的事（往作废的号上发了东西），跟各 `Feed` 的一起取走。
+    events: Vec<FeedEvent>,
 }
 
 impl From<Client> for Router {
@@ -714,6 +829,7 @@ impl Router {
             dial,
             pace,
             lang: Lang::Zh,
+            events: Vec::new(),
         }
     }
 
@@ -744,8 +860,14 @@ impl Router {
     pub fn watch(&mut self, ids: &[u32]) {
         let mut by_peer: HashMap<&str, Vec<u32>> = HashMap::new();
         for &id in ids {
-            if let Some((peer, real)) = self.ids.real(id) {
-                by_peer.entry(peer).or_default().push(real);
+            if let Some((peer, epoch, real)) = self.ids.real(id) {
+                if self
+                    .remotes
+                    .get(peer)
+                    .is_some_and(|f| f.lock().epoch == epoch)
+                {
+                    by_peer.entry(peer).or_default().push(real);
+                }
             }
         }
         for (name, feed) in &self.remotes {
@@ -760,13 +882,13 @@ impl Router {
     /// 合成号那个会话的画面是多久以前的（给「n 秒前」）。本机会话、还没
     /// 取到过画面都是 `None`。
     pub fn age(&self, id: u32) -> Option<Duration> {
-        let (peer, real) = self.ids.real(id)?;
-        self.remotes.get(peer)?.age(real)
+        let (peer, epoch, real) = self.ids.real(id)?;
+        self.remotes.get(peer)?.age(epoch, real)
     }
 
     /// 这个号的会话在哪台电脑上；本机是 `None`。
     pub fn machine_of(&self, id: u32) -> Option<&str> {
-        self.ids.real(id).map(|(peer, _)| peer)
+        self.ids.real(id).map(|(peer, _, _)| peer)
     }
 
     /// F5 粘图之前问一句：远程会话只能粘文字（图要传文件，这一期不做）。
@@ -785,7 +907,9 @@ impl Router {
                 peer: peer.to_string(),
             })
         })?;
-        feed.enqueue(Op::new(0, OpKind::Create { dir, profile }));
+        // 新建不指名会话，哪一代都一样。
+        let epoch = feed.lock().epoch;
+        feed.enqueue_in(epoch, Op::new(0, OpKind::Create { dir, profile }));
         Ok(())
     }
 
@@ -816,16 +940,16 @@ impl Router {
 
     /// 取走各个后台线程攒下的事，号换成合成号。
     pub fn take_events(&mut self) -> Vec<FeedEvent> {
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.events);
         for (peer, feed) in &self.remotes {
             let events = std::mem::take(&mut feed.lock().events);
-            for mut e in events {
+            for (epoch, mut e) in events {
                 if let FeedEvent::Answer { id, of, resp, .. } = &mut e {
                     if let Some(real) = id {
-                        *real = self.ids.synthetic(peer, *real);
+                        *real = self.ids.synthetic(peer, epoch, *real);
                     }
                     if let (AnswerOf::Create, Response::Created { id }) = (*of, resp) {
-                        *id = self.ids.synthetic(peer, *id);
+                        *id = self.ids.synthetic(peer, epoch, *id);
                     }
                 }
                 out.push(e);
@@ -875,9 +999,13 @@ impl Router {
             return Ok(resp);
         };
         for (peer, feed) in &self.remotes {
-            let theirs = feed.lock().sessions.clone();
+            // 代数和列表在同一把锁里读：两者必须是同一代的。
+            let (epoch, theirs) = {
+                let st = feed.lock();
+                (st.epoch, st.sessions.clone())
+            };
             for mut s in theirs {
-                s.id = self.ids.synthetic(peer, s.id);
+                s.id = self.ids.synthetic(peer, epoch, s.id);
                 s.machine = Some(peer.clone());
                 all.push(s);
             }
@@ -886,18 +1014,25 @@ impl Router {
     }
 
     fn enqueue(&mut self, id: u32, kind: OpKind) -> Response {
-        let Some((peer, real)) = self.ids.real(id) else {
+        let Some((peer, epoch, real)) = self.ids.real(id) else {
             return Response::Error(ErrorCode::NoSuchSession(id));
         };
-        match self.remotes.get(peer) {
-            Some(feed) => {
-                feed.enqueue(Op::new(real, kind));
-                Response::Ok
-            }
-            None => Response::Error(ErrorCode::RemoteUnavailable {
+        let Some(feed) = self.remotes.get(peer) else {
+            return Response::Error(ErrorCode::RemoteUnavailable {
                 peer: peer.to_string(),
-            }),
+            });
+        };
+        if feed.enqueue_in(epoch, Op::new(real, kind)) {
+            return Response::Ok;
         }
+        // 作废的号（对方重启过）：一个键都不发。答复里带「会话没了」，
+        // 再报一条事件——滚轮、鼠标这些调用点是不看答复的。
+        let code = ErrorCode::NoSuchSession(id);
+        self.events.push(FeedEvent::Refused {
+            peer: peer.to_string(),
+            code: code.clone(),
+        });
+        Response::Error(code)
     }
 
     fn connecting(&self, peer: &str) -> Vec<Vec<ScreenSpan>> {
@@ -908,7 +1043,7 @@ impl Router {
     }
 
     fn cached_screen(&self, id: u32) -> Response {
-        let Some((peer, real)) = self.ids.real(id) else {
+        let Some((peer, epoch, real)) = self.ids.real(id) else {
             return Response::Error(ErrorCode::NoSuchSession(id));
         };
         let Some(feed) = self.remotes.get(peer) else {
@@ -917,6 +1052,20 @@ impl Router {
             });
         };
         let st = feed.lock();
+        if st.epoch != epoch {
+            // 对方重启过，这个号指的会话已经不在了。答「已停止」，贴在里面的
+            // 界面会照常退回看板并说一句「会话结束了」。
+            return Response::Screen {
+                lines: vec![vec![ScreenSpan {
+                    text: crate::i18n::msg::session_ended(self.lang, id),
+                    style: Default::default(),
+                }]],
+                cursor: (0, 0),
+                cursor_hidden: true,
+                state: SessionState::Stopped,
+                scroll: ScrollState::default(),
+            };
+        }
         let listed = st
             .sessions
             .iter()
@@ -1027,6 +1176,8 @@ mod tests {
         seen: Arc<Mutex<Vec<String>>>,
         script: Arc<Script>,
         delay: Duration,
+        /// 对方后台的开机编号；`Instance` 由这里答，不走 `script`。0 = 问不到。
+        instance: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl Line for FakeRemote {
@@ -1039,6 +1190,12 @@ mod tests {
                 panic!("Feed 只该发 RemoteCall");
             };
             self.seen.lock().unwrap().push(format!("{req:?}"));
+            if let Request::Instance = *req {
+                return Ok(match self.instance.load(Ordering::SeqCst) {
+                    0 => Response::Error(ErrorCode::RemoteUnavailable { peer: "mac".into() }),
+                    id => Response::Instance { id },
+                });
+            }
             (self.script)(&req)
         }
     }
@@ -1083,6 +1240,7 @@ mod tests {
             seen: Arc::new(Mutex::new(Vec::new())),
             script: Arc::new(script),
             delay: Duration::ZERO,
+            instance: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
@@ -1113,7 +1271,9 @@ mod tests {
         seen.lock()
             .unwrap()
             .iter()
-            .filter(|s| !s.starts_with("List") && !s.starts_with("Screen"))
+            .filter(|s| {
+                !s.starts_with("List") && !s.starts_with("Screen") && !s.starts_with("Instance")
+            })
             .cloned()
             .collect()
     }
@@ -1421,12 +1581,15 @@ mod tests {
                 }))
             }
         });
+        let instance = r.instance.clone();
         let mut pace = fast();
         pace.backoff_min = Duration::from_millis(50);
         pace.backoff_max = Duration::from_millis(200);
         let mut rig = rig(vec![], r, pace);
         rig.router.set_peers(&["mac".to_string()]);
         let id = first_remote_id(&mut rig.router, "mac");
+        // 整台够不着：开机编号也问不到了
+        instance.store(0, Ordering::SeqCst);
         assert!(wait_up_to(Duration::from_secs(5), || rig
             .router
             .status("mac")
@@ -1437,24 +1600,26 @@ mod tests {
         );
 
         // 退避：连不上之后不许每 1ms 就问一次
-        let before = calls.load(Ordering::SeqCst);
+        let before = rig.remote_seen.lock().unwrap().len();
         std::thread::sleep(Duration::from_millis(500));
-        let asked = calls.load(Ordering::SeqCst) - before;
+        let asked = rig.remote_seen.lock().unwrap().len() - before;
         assert!(asked <= 6, "离线的电脑 500ms 里被问了 {asked} 次");
     }
 
     #[test]
     fn synthetic_ids_are_never_reused() {
         let mut ids = Ids::default();
-        let a = ids.synthetic("mac", 1);
-        let b = ids.synthetic("mac", 2);
-        let c = ids.synthetic("pc", 1);
+        let a = ids.synthetic("mac", 0, 1);
+        let b = ids.synthetic("mac", 0, 2);
+        let c = ids.synthetic("pc", 0, 1);
         assert!(a >= REMOTE_BASE && b >= REMOTE_BASE && c >= REMOTE_BASE);
-        assert_eq!(ids.synthetic("mac", 1), a, "同一个会话永远是同一个号");
-        assert_eq!(ids.real(b), Some(("mac", 2)));
+        assert_eq!(ids.synthetic("mac", 0, 1), a, "同一个会话永远是同一个号");
+        assert_eq!(ids.real(b), Some(("mac", 0, 2)));
         // 会话没了再来新的：拿新号，旧号不回收
-        let d = ids.synthetic("mac", 3);
-        let all = [a, b, c, d];
+        let d = ids.synthetic("mac", 0, 3);
+        // 对方重启后的 1 号是另一个会话：新号
+        let e = ids.synthetic("mac", 1, 1);
+        let all = [a, b, c, d, e];
         for (i, x) in all.iter().enumerate() {
             for y in &all[i + 1..] {
                 assert_ne!(x, y);
@@ -1643,5 +1808,191 @@ mod tests {
             Some(crate::proto::CodedError(ErrorCode::RemoteForbidden))
         ));
         assert!(rig.router.check_image_paste(3).is_ok(), "本机会话照常粘图");
+    }
+
+    /// 按键那一问失败只清按键：排在后面的停止照常发、照常有答复。
+    #[test]
+    fn a_failed_key_call_keeps_queued_manage_ops() {
+        let r = remote(move |req| match req {
+            Request::List => Ok(Response::Sessions(vec![sess(7, "/r")])),
+            Request::Input { .. } => slow_failure(),
+            _ => Ok(Response::Ok),
+        });
+        let mut rig = rig(vec![], r, fast());
+        rig.router.set_peers(&["mac".to_string()]);
+        let id = first_remote_id(&mut rig.router, "mac");
+        rig.router
+            .call(Request::Input {
+                id,
+                text: "a".into(),
+            })
+            .unwrap();
+        rig.router
+            .call(Request::Key {
+                id,
+                name: "Enter".into(),
+            })
+            .unwrap();
+        rig.router.call(Request::Stop { id }).unwrap();
+
+        let mut events = Vec::new();
+        assert!(wait_up_to(Duration::from_secs(5), || {
+            events.extend(rig.router.take_events());
+            events.len() >= 2
+        }));
+        assert!(
+            matches!(events[0], FeedEvent::KeysLost { .. }),
+            "{events:?}"
+        );
+        assert!(
+            matches!(
+                &events[1],
+                FeedEvent::Answer { of: AnswerOf::Stop, id: Some(i), resp: Response::Ok, .. } if *i == id
+            ),
+            "{events:?}"
+        );
+        assert_eq!(
+            inputs(&rig.remote_seen),
+            vec![
+                r#"Input { id: 7, text: "a" }"#.to_string(),
+                format!("{:?}", Request::Stop { id: 7 }),
+            ],
+            "回车跟着失败的字一起丢，停止照发"
+        );
+    }
+
+    /// 对方后台重启，会话号又从 1 数起：手里的旧号不许指到新的 1 号上。
+    #[test]
+    fn a_restarted_peer_retires_its_old_ids() {
+        let r = remote(move |req| match req {
+            Request::List => Ok(Response::Sessions(vec![sess(1, "/r")])),
+            _ => Ok(Response::Ok),
+        });
+        let instance = r.instance.clone();
+        let mut rig = rig(vec![], r, fast());
+        rig.router.set_peers(&["mac".to_string()]);
+        let old = first_remote_id(&mut rig.router, "mac");
+
+        instance.store(2, Ordering::SeqCst);
+        let mut fresh = None;
+        assert!(wait_up_to(Duration::from_secs(5), || {
+            fresh = sessions_of(&mut rig.router)
+                .into_iter()
+                .find(|s| s.machine.is_some())
+                .map(|s| s.id)
+                .filter(|&id| id != old);
+            fresh.is_some()
+        }));
+        let fresh = fresh.unwrap();
+        assert!(fresh > old, "新一代的会话拿新号，旧号不复用");
+        assert_eq!(
+            sessions_of(&mut rig.router)
+                .iter()
+                .filter(|s| s.machine.is_some())
+                .count(),
+            1,
+            "旧号不再出现在列表里"
+        );
+
+        // 往旧号上打字：一个字都不许发出去，答复和事件都说会话没了
+        let seen_before = inputs(&rig.remote_seen).len();
+        let resp = rig
+            .router
+            .call(Request::Input {
+                id: old,
+                text: "rm -rf".into(),
+            })
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Error(ErrorCode::NoSuchSession(i)) if i == old),
+            "{resp:?}"
+        );
+        assert!(matches!(
+            &rig.router.take_events()[..],
+            [FeedEvent::Refused {
+                code: ErrorCode::NoSuchSession(_),
+                ..
+            }]
+        ));
+        // 旧号的画面：已停止，界面会退回看板
+        match rig.router.call(Request::Screen { id: old }).unwrap() {
+            Response::Screen { state, .. } => assert_eq!(state, SessionState::Stopped),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rig.router.age(old), None);
+
+        // 新号照常把字送到对方的 1 号
+        rig.router
+            .call(Request::Input {
+                id: fresh,
+                text: "ok".into(),
+            })
+            .unwrap();
+        assert!(wait_up_to(Duration::from_secs(5), || inputs(
+            &rig.remote_seen
+        )
+        .len()
+            > seen_before));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            inputs(&rig.remote_seen)[seen_before..],
+            [r#"Input { id: 1, text: "ok" }"#.to_string()],
+            "只有新号的字送出去了"
+        );
+    }
+
+    /// 重启时排着的、指名旧会话的操作一律不发：真号在新一代里指的是别的会话。
+    #[test]
+    fn a_restart_drops_ops_queued_for_old_sessions() {
+        let mut st = State {
+            stop: false,
+            status: PeerStatus::Online,
+            sessions: vec![sess(1, "/r")],
+            screens: HashMap::new(),
+            watched: vec![1],
+            queue: VecDeque::new(),
+            events: Vec::new(),
+            instance: Some(1),
+            epoch: 0,
+            projects: None,
+            projects_at: None,
+            profiles: None,
+            profiles_at: None,
+            want_projects: false,
+            want_profiles: None,
+        };
+        st.queue.push_back(Op::new(1, OpKind::Input("a".into())));
+        st.queue.push_back(Op::new(
+            0,
+            OpKind::Create {
+                dir: "/r".into(),
+                profile: "claude".into(),
+            },
+        ));
+        st.queue.push_back(Op::new(1, OpKind::Stop));
+        retire("mac", &mut st);
+        assert_eq!(st.epoch, 1);
+        assert!(st.sessions.is_empty() && st.watched.is_empty());
+        assert_eq!(st.queue.len(), 1, "只有不指名会话的新建留下");
+        assert!(matches!(st.queue[0].kind, OpKind::Create { .. }));
+        let kinds: Vec<String> = st
+            .events
+            .iter()
+            .map(|(e, ev)| format!("{e}:{ev:?}"))
+            .collect();
+        assert_eq!(st.events.len(), 2, "{kinds:?}");
+        assert!(st.events.iter().all(|(e, _)| *e == 0), "事件按旧一代换号");
+        assert!(st
+            .events
+            .iter()
+            .any(|(_, ev)| matches!(ev, FeedEvent::KeysLost { .. })));
+        assert!(st.events.iter().any(|(_, ev)| matches!(
+            ev,
+            FeedEvent::Answer {
+                of: AnswerOf::Stop,
+                resp: Response::Error(ErrorCode::NoSuchSession(1)),
+                ..
+            }
+        )));
     }
 }
