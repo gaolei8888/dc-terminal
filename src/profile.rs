@@ -132,6 +132,13 @@ pub struct Profile {
     /// 没出事的东西，然后就不再相信这个标记了。没写 = 这个功能对它关着。
     #[serde(default)]
     pub error_pattern: Option<String>,
+    /// agent 弹框等人时屏幕上一定有的串（比如 Claude 确认框最后一行的
+    /// `Enter to confirm · Esc to cancel`）。命中 = 「等你回答」，压过
+    /// `busy_pattern`。跟 `error_pattern` 同一条规矩：**只给见过真实弹框的
+    /// profile 写**，而且要锚定到弹框独有的形状上——agent 的回答里引用这句话
+    /// 不能把会话判成等人。没写 = 这个功能对它关着。
+    #[serde(default)]
+    pub ask_pattern: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -303,6 +310,17 @@ impl Profile {
             Some(p) => {
                 Ok(Some(regex::Regex::new(p).with_context(|| {
                     format!("busy_pattern 不是合法正则: {p}")
+                })?))
+            }
+        }
+    }
+
+    pub fn ask_regex(&self) -> Result<Option<regex::Regex>> {
+        match &self.ask_pattern {
+            None => Ok(None),
+            Some(p) => {
+                Ok(Some(regex::Regex::new(p).with_context(|| {
+                    format!("ask_pattern 不是合法正则: {p}")
                 })?))
             }
         }
@@ -1084,6 +1102,19 @@ mod tests {
         )
         .unwrap();
         assert!(p.busy_regex().is_err(), "非法正则要报错，不能静默当没有");
+    }
+
+    #[test]
+    fn bad_ask_pattern_is_an_error() {
+        let p = Profile::from_toml(
+            r#"
+            name = "x"
+            command = ["x"]
+            ask_pattern = "["
+            "#,
+        )
+        .unwrap();
+        assert!(p.ask_regex().is_err(), "非法正则要报错，不能静默当没有");
     }
 
     #[test]

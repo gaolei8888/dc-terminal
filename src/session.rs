@@ -94,14 +94,29 @@ pub enum SessionState {
 /// ——不表态，保持原状态。看板宁可继续写「干活中」（它确实还没干完），
 /// 也不许谎称在等人。**只声明一条的 profile 行为一个字都没变**：那时候
 /// 我们没有第二个标记，分不清「不忙」和「说不清」，只能沿用旧推断。
+///
+/// # 弹框等人：error > ask > busy > idle
+///
+/// 2026-11-19 本机 11 个「干活中」的会话，实际全停在 Claude 启动时的
+/// 「信任这个文件夹吗」弹框上：弹框里既没有 `esc to interrupt` 也没有
+/// 顶格的 `❯`，于是走了上面「不表态」那条路，状态永远停在建会话时的
+/// Working——用户要找的「谁在等我」恰恰被藏进了「干活中」。
+///
+/// ask 压过 busy：弹框是 agent 停下来等人的确证，而 busy 串可能还留在
+/// 弹框上方的旧画面里。错误仍然压过一切，理由同上。ask 的正则由 profile
+/// 负责锚定成弹框独有的形状（claude 系是整行锚定），这里不替它防误报。
 fn classify(
     text: &str,
     error_re: Option<&regex::Regex>,
+    ask_re: Option<&regex::Regex>,
     busy_re: Option<&regex::Regex>,
     idle_re: Option<&regex::Regex>,
 ) -> Option<SessionState> {
     if error_re.is_some_and(|re| re.is_match(text)) {
         return Some(SessionState::Failed);
+    }
+    if ask_re.is_some_and(|re| re.is_match(text)) {
+        return Some(SessionState::Asking);
     }
     match (busy_re, idle_re) {
         // 唯一分得清「不忙」和「说不清」的组合，见上面那段。
@@ -2035,6 +2050,7 @@ impl SessionManager {
                 let next = classify(
                     &text,
                     s.error_re.as_ref(),
+                    None,
                     s.busy_re.as_ref(),
                     s.idle_re.as_ref(),
                 );
@@ -2318,6 +2334,7 @@ mod tests {
             let state = classify(
                 CLAUDE_WAITING_FOR_YOU,
                 p.error_regex().unwrap().as_ref(),
+                p.ask_regex().unwrap().as_ref(),
                 p.busy_regex().unwrap().as_ref(),
                 p.idle_regex().unwrap().as_ref(),
             );
@@ -2338,6 +2355,7 @@ mod tests {
             let state = classify(
                 CLAUDE_WORKING,
                 p.error_regex().unwrap().as_ref(),
+                p.ask_regex().unwrap().as_ref(),
                 p.busy_regex().unwrap().as_ref(),
                 p.idle_regex().unwrap().as_ref(),
             );
@@ -2347,6 +2365,72 @@ mod tests {
                 "{name}：正在干活的屏幕被判成了 {state:?}"
             );
         }
+    }
+
+    /// Claude 启动时的「信任这个文件夹吗」弹框。逐行抄自 2026-11-19 本机
+    /// 11 个真实会话（全是这一屏），每行前导一个空格是原样——`❯ No, exit`
+    /// 前面那个空格正是 `idle_pattern` 的 `^❯` 匹不上它的原因。
+    const CLAUDE_TRUST_DIALOG: &str = "\
+────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+ /Users/lei/Documents/work/dc/dcd-comfy
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+";
+
+    fn classify_with(name: &str, text: &str) -> Option<SessionState> {
+        let p = crate::profile::Profile::builtin(name).unwrap();
+        classify(
+            text,
+            p.error_regex().unwrap().as_ref(),
+            p.ask_regex().unwrap().as_ref(),
+            p.busy_regex().unwrap().as_ref(),
+            p.idle_regex().unwrap().as_ref(),
+        )
+    }
+
+    /// 停在弹框上等人的会话以前一直被报成「干活中」：两条标记都不在屏幕上，
+    /// `classify` 不表态，状态停在建会话时的 Working。
+    #[test]
+    fn a_claude_family_trust_dialog_is_asking() {
+        for name in ["claude", "deepseek", "glm", "kimi", "qwen-api"] {
+            assert_eq!(
+                classify_with(name, CLAUDE_TRUST_DIALOG),
+                Some(SessionState::Asking),
+                "{name}：停在信任弹框上的会话不是在干活，是在等人"
+            );
+        }
+    }
+
+    /// agent 的回答里引用了弹框那句话（比如它在讲这个功能），屏幕底下是正常的
+    /// 空闲提示符——不能判成等人。这就是 `ask_pattern` 要整行锚定的原因。
+    #[test]
+    fn quoting_the_dialog_footer_inside_prose_is_not_asking() {
+        let text =
+            format!("● 最后一行写着 `Enter to confirm · Esc to cancel`。\n{CLAUDE_WAITING_FOR_YOU}");
+        assert_eq!(classify_with("claude", &text), Some(SessionState::Idle));
+    }
+
+    #[test]
+    fn an_error_beats_a_dialog() {
+        let text = format!("API Error: 529 overloaded\n{CLAUDE_TRUST_DIALOG}");
+        assert_eq!(classify_with("claude", &text), Some(SessionState::Failed));
+    }
+
+    #[test]
+    fn a_dialog_beats_the_busy_marker() {
+        let ask = regex::Regex::new("ASK").unwrap();
+        let busy = regex::Regex::new("BUSY").unwrap();
+        let idle = regex::Regex::new("IDLE").unwrap();
+        assert_eq!(
+            classify("BUSY\nASK", None, Some(&ask), Some(&busy), Some(&idle)),
+            Some(SessionState::Asking)
+        );
     }
 
     /// 同一台机器上，同一个 agent **卡死了**。
@@ -2393,6 +2477,7 @@ mod tests {
             let state = classify(
                 CLAUDE_WEDGED,
                 p.error_regex().unwrap().as_ref(),
+                p.ask_regex().unwrap().as_ref(),
                 p.busy_regex().unwrap().as_ref(),
                 p.idle_regex().unwrap().as_ref(),
             );
@@ -2435,7 +2520,7 @@ mod tests {
     fn only_a_profile_with_both_markers_can_say_i_dont_know() {
         let busy = regex::Regex::new("BUSY").unwrap();
         let idle = regex::Regex::new("READY").unwrap();
-        let call = |text, b, i| classify(text, None, b, i);
+        let call = |text, b, i| classify(text, None, None, b, i);
 
         // 两条都有：这是唯一分得清「不忙」和「说不清」的组合
         let both = (Some(&busy), Some(&idle));
@@ -2538,6 +2623,7 @@ mod tests {
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
             error_pattern: None,
+            ask_pattern: None,
             env: Default::default(),
             secret: None,
             install: None,
@@ -2610,6 +2696,7 @@ mod tests {
             idle_pattern: None,
             busy_pattern: None,
             error_pattern: Some("BOOM".into()),
+            ask_pattern: None,
             env: Default::default(),
             secret: None,
             install: None,
@@ -2643,6 +2730,7 @@ mod tests {
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
             error_pattern: None,
+            ask_pattern: None,
             env: Default::default(),
             secret: None,
             install: None,
@@ -2677,6 +2765,7 @@ mod tests {
             idle_pattern: None,
             busy_pattern: Some("esc to interrupt".into()),
             error_pattern: None,
+            ask_pattern: None,
             env: Default::default(),
             secret: None,
             install: None,
@@ -3444,6 +3533,7 @@ mod tests {
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
             error_pattern: Some("BOOM".into()),
+            ask_pattern: None,
             env: Default::default(),
             secret: None,
             install: None,

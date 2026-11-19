@@ -23,6 +23,10 @@ busy_pattern = "esc to interrupt"
 # 判定退回「不表态」——保持原状态，不会退回到谎称空闲。
 idle_pattern = "(?m)^❯|bypass permissions on"
 error_pattern = "API Error|Connection closed mid-response"
+# 弹框等人：Claude 的确认框最后一行独占一行写这句。实测（2026-11-19，
+# 本机 11 个会话）：启动时的「信任这个文件夹吗」弹框。整行锚定——agent 的
+# 回答里引用这句话不能把会话判成「等你回答」。
+ask_pattern = '(?m)^\s*Enter to confirm · Esc to cancel\s*$'
 # 恢复守护进程重启前的会话时用：`claude --continue` 接回这个目录下
 # 最近一次对话。实测过，不是猜的。
 resume_args = ["--continue"]
