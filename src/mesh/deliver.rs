@@ -324,6 +324,22 @@ pub trait Inbox: Send + Sync {
     fn draining(&self) -> bool {
         false
     }
+    /// 执行组里另一台电脑（`from` 是它的 endpoint）发来的一条远程调用。
+    /// 实现方先过 `remote::allowed`，再交给守护进程的 `handle`
+    /// （`Origin::Remote`）。在 `remote_host` 的工作线程上调，**不攥着
+    /// `Mesh` 锁**。
+    ///
+    /// 默认一律拒绝：没接上授权判定的实现绝不能碰会话。
+    fn remote_call(&self, from: &str, req: crate::proto::Request) -> crate::proto::Response {
+        let _ = (from, req);
+        crate::proto::Response::Error(crate::proto::ErrorCode::RemoteForbidden)
+    }
+    /// 这台电脑 `Projects` 里的项目（最近的和钉住的合在一起），跟
+    /// `Request::Projects` 回的字符串一模一样——远程 `Create` 的 `dir` 要跟
+    /// 它逐字相等（`remote::allowed`）。
+    fn projects(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 /// `bridge::submit` 的结果分成「送进去了」和「没送进去」。只有快照没拍上
@@ -895,7 +911,13 @@ pub mod testing {
         pub fail: Mutex<Option<Result<Typed, String>>>,
         /// 模拟「dct 正在准备重启」。
         pub draining: std::sync::atomic::AtomicBool,
+        /// 执行过的远程调用：`(发件 endpoint, 请求的 JSON)`，按执行顺序。
+        pub remote_calls: Mutex<Vec<(String, String)>>,
+        /// 执行远程调用那一刻先调它（测试在这里睡、在这里卡住工作线程）。
+        pub on_remote: Mutex<Option<OnRemote>>,
     }
+
+    type OnRemote = Arc<dyn Fn(&crate::proto::Request) + Send + Sync>;
 
     impl FakeInbox {
         pub fn new() -> Arc<FakeInbox> {
@@ -961,6 +983,40 @@ pub mod testing {
 
         fn draining(&self) -> bool {
             self.draining.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// 不做授权判定（那是守护进程实现的事，在 `daemon` 里测）；只记账、
+        /// 给几种请求回个像样的答复。
+        fn remote_call(&self, from: &str, req: crate::proto::Request) -> crate::proto::Response {
+            use crate::proto::{Request, Response, ScreenEntry};
+            let f = self.on_remote.lock().unwrap().clone();
+            if let Some(f) = f {
+                f(&req);
+            }
+            self.remote_calls
+                .lock()
+                .unwrap()
+                .push((from.to_string(), serde_json::to_string(&req).unwrap()));
+            match req {
+                Request::List => Response::Sessions(self.sessions()),
+                Request::Screens { ids } => Response::Screens {
+                    screens: ids
+                        .into_iter()
+                        .map(|id| ScreenEntry { id, lines: vec![] })
+                        .collect(),
+                },
+                Request::Create { .. } => Response::Created {
+                    id: 100 + self.remote_calls.lock().unwrap().len() as u32,
+                },
+                _ => Response::Ok,
+            }
+        }
+    }
+
+    impl FakeInbox {
+        /// 执行过的远程调用的 JSON，按执行顺序。
+        pub fn remote_calls(&self) -> Vec<String> {
+            self.remote_calls.lock().unwrap().iter().map(|(_, r)| r.clone()).collect()
         }
     }
 }
@@ -1566,6 +1622,9 @@ mod tests {
             fn ask(&self, _: &str, _: Vec<u8>, _: Duration) -> Result<Vec<u8>, LinkError> {
                 Ok(self.answer.clone())
             }
+            fn reply(&self, _: &str, _: u64, _: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                unreachable!("这个测试不答远程调用")
+            }
         }
         let r = roster3();
         let a = Mutex::new(Mesh::new(keys(1), "A".into(), Some(r.clone())));
@@ -1631,6 +1690,9 @@ mod tests {
                     return Err(LinkError::Relay(dct_link::LinkError::Busy));
                 }
                 self.inner.ask(to, p, t)
+            }
+            fn reply(&self, _: &str, _: u64, _: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                unreachable!("这个测试不答远程调用")
             }
         }
         let hub = FakeHub::new();
@@ -2247,6 +2309,9 @@ mod tests {
             }
             fn ask(&self, _: &str, p: Vec<u8>, _: Duration) -> Result<Vec<u8>, LinkError> {
                 Ok((self.answer.lock().unwrap())(&p))
+            }
+            fn reply(&self, _: &str, _: u64, _: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                unreachable!("这个测试不答远程调用")
             }
         }
         let r = roster3();

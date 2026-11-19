@@ -31,6 +31,7 @@ pub mod invite;
 pub mod login;
 pub mod net;
 pub mod remote;
+pub mod remote_host;
 pub mod store;
 
 /// 中转的默认地址。`~/.dct/config.toml` 里 `[mesh] relay = "…"` 可以改。
@@ -53,6 +54,12 @@ pub const SENT_AT_WINDOW_SECS: u64 = 10 * 60;
 /// 去重表记多少条。
 const SEEN_CAP: usize = 1024;
 
+/// 远程调用那张去重表记多少条。远程调用比留言密得多（看着一个会话就是每秒
+/// 一两条），跟留言挤一张表，留言的 id 会被挤出窗口；另起一张、记得多一些：
+/// 十分钟窗口里每秒五条也装得下。挤出去了也执行不了第二次——下面还有按
+/// `seq` 的一层（`remote_host`）。
+const REMOTE_SEEN_CAP: usize = 4096;
+
 /// 新电脑 `dct join` 时最多探问几台同账号在线的电脑（中转报的在线列表去重
 /// 之后）。中转能在「谁在线」里列出任意多台假电脑；超过这个数就一台都不问
 /// （`MeshProblem::TooManyAnswered`）——自己的电脑同时在线不会有这么多。
@@ -72,13 +79,27 @@ pub struct QueuedMsg {
 /// 两种方式往外挤：按年龄（`sent_at` 已经落到窗口外面的，反正回放进来也会
 /// 被窗口挡掉，不用再记），和按条数（`SEEN_CAP`，兜底，防一个发件人刷爆
 /// 内存）。
-#[derive(Default)]
 struct Seen {
     order: VecDeque<(String, String, u64)>,
     set: HashSet<(String, String)>,
+    cap: usize,
+}
+
+impl Default for Seen {
+    fn default() -> Seen {
+        Seen::with_cap(SEEN_CAP)
+    }
 }
 
 impl Seen {
+    fn with_cap(cap: usize) -> Seen {
+        Seen {
+            order: VecDeque::new(),
+            set: HashSet::new(),
+            cap,
+        }
+    }
+
     /// 第一次见返回 `true` 并记下；见过返回 `false`。
     fn first_time(&mut self, from: &str, id: &str, sent_at: u64, now: u64) -> bool {
         self.evict_older_than(now.saturating_sub(SENT_AT_WINDOW_SECS));
@@ -86,7 +107,7 @@ impl Seen {
         if self.set.contains(&key) {
             return false;
         }
-        if self.order.len() >= SEEN_CAP {
+        if self.order.len() >= self.cap {
             if let Some((f, i, _)) = self.order.pop_front() {
                 self.set.remove(&(f, i));
             }
@@ -136,6 +157,10 @@ pub struct Mesh {
     pub(crate) auto_name: bool,
     journal: Arc<Journal>,
     seen: Seen,
+    /// 远程调用（`RemoteCall`/`RemoteReply`）的信封去重，不挤留言那张。
+    remote_seen: Seen,
+    /// 远程调用的被操作一方（`remote_host::attach` 接上）。没有就一律当开关关着。
+    remote: Option<Arc<remote_host::RemoteHost>>,
     /// 这个进程从什么时候开始收（unix 秒）。`sent_at` 早于它的留言一律不收：
     /// 去重表只活在内存里，重启就空了，没有这一条，重启前收过的留言在窗口
     /// 之内可以原样再回放一遍。第一步没有离线留言，合法的东西不会因此丢。
@@ -195,6 +220,8 @@ impl Mesh {
             auto_name: false,
             journal: Arc::new(Journal::new()),
             seen: Seen::default(),
+            remote_seen: Seen::with_cap(REMOTE_SEEN_CAP),
+            remote: None,
             started_at: unix_now(),
             clock: Box::new(unix_now),
             rand: Box::new(os_rand),
@@ -261,6 +288,12 @@ impl Mesh {
     pub fn on_envelope(&mut self, env: &Envelope) -> Option<Vec<u8>> {
         match self.step(env) {
             Step::Done(r) => r,
+            Step::Remote(call) => {
+                if let Some(h) = self.remote.clone() {
+                    h.submit(call);
+                }
+                None
+            }
             Step::Type(t) => {
                 let r = match &self.inbox {
                     Some(i) => i.type_into(t.session, &t.text),
@@ -417,7 +450,12 @@ impl Mesh {
         if m.sent_at < self.started_at {
             return Step::Done(self.drop(env, "before_start"));
         }
-        if !self.seen.first_time(&m.from, &m.id, m.sent_at, now) {
+        // 远程调用另有一张表：一秒一两条的画面请求不能把留言的 id 挤出窗口。
+        let seen = match m.kind {
+            Kind::RemoteCall | Kind::RemoteReply => &mut self.remote_seen,
+            _ => &mut self.seen,
+        };
+        if !seen.first_time(&m.from, &m.id, m.sent_at, now) {
             return Step::Done(self.drop(env, "replay"));
         }
         match m.kind {
@@ -437,9 +475,10 @@ impl Mesh {
             // 回执和状态只该作为 `ask` 的答复回来，不该从轮询里进来；进来了
             // 也不回——回的话两台电脑能互相回到天荒地老。
             Kind::Receipt | Kind::Status => Step::Done(None),
-            // 远程操作的收件路径是后面的任务接上的；在那之前收到就不执行、
-            // 不回——绝不能在没有授权判定的路径上碰会话。
-            Kind::RemoteCall | Kind::RemoteReply => Step::Done(None),
+            Kind::RemoteCall => self.take_remote_call(env, &m),
+            // 答复只该作为 `ask` 的回信回来；从轮询里进来的是对方超时之后才
+            // 到的那一封，丢掉、不回（同 `Receipt`）。
+            Kind::RemoteReply => Step::Done(None),
         }
     }
 
@@ -516,10 +555,12 @@ fn valid_kx_pub(b64: &str) -> bool {
 }
 
 /// `on_envelope` 的第一步出来的东西：直接回的答复，或者一件要放了锁再做
-/// 的「往会话里敲字」。
+/// 的事——「往会话里敲字」，或者交给工作线程的一条远程调用。
 enum Step {
     Done(Option<Vec<u8>>),
     Type(deliver::Typing),
+    /// 交给 `remote_host`，收件线程不等它执行、也不当场答。
+    Remote(remote_host::Call),
 }
 
 /// 一个电脑信封，锁分两段拿：验、决定在锁里（`Mesh::step`）；**往会话里敲字
@@ -527,12 +568,19 @@ enum Step {
 /// （`dct peers`、投递线程、下一个信封）不该跟着等；敲完再拿锁回回执。
 pub fn handle(mesh: &Mutex<Mesh>, env: &Envelope) -> Option<Vec<u8>> {
     let lock = || mesh.lock().unwrap_or_else(|e| e.into_inner());
-    let (step, inbox) = {
+    let (step, inbox, remote) = {
         let mut m = lock();
-        (m.step(env), m.inbox.clone())
+        (m.step(env), m.inbox.clone(), m.remote.clone())
     };
     match step {
         Step::Done(r) => r,
+        // 远程调用：交出去就回去收下一封，答复由工作线程经 `Net::reply` 发。
+        Step::Remote(call) => {
+            if let Some(h) = remote {
+                h.submit(call);
+            }
+            None
+        }
         Step::Type(t) => {
             // 敲字半路 panic 也得把「正在敲」清掉，见 `deliver::InFlight`。
             let guard = deliver::InFlight::new(mesh, t.session);

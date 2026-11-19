@@ -21,6 +21,13 @@ pub trait Net: Send + Sync {
     fn send(&self, to: &str, payload: Vec<u8>) -> Result<(), LinkError>;
     /// 投一个信封，最多等 `timeout` 拿对面的答复。
     fn ask(&self, to: &str, payload: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, LinkError>;
+    /// 晚一点再答对方的一次 `ask`：信封的 `seq` 用对方那封的 `seq`（中转靠
+    /// `(to, seq)` 把答复配回那次 `ask`，跟 `link::Link::reply_to` 同一条规矩）。
+    ///
+    /// 远程调用在工作线程上做完才答，不在收件线程上同步答（`remote_host`）。
+    /// 对方要是已经不等了，中转把它当普通信封投过去，对方当作不请自来的
+    /// 答复丢掉。
+    fn reply(&self, to: &str, seq: u64, payload: Vec<u8>) -> Result<(), LinkError>;
 }
 
 /// `peers`、`send` 一次最多等多久（连接加读写，整条请求）。`ask` 另按调用方
@@ -86,6 +93,17 @@ impl Net for LinkNet {
         link::send(&self.cfg, &self.agent, env)
     }
 
+    fn reply(&self, to: &str, seq: u64, payload: Vec<u8>) -> Result<(), LinkError> {
+        let env = Envelope {
+            from: self.cfg.endpoint.clone(),
+            to: EndpointId::new(to).map_err(|_| LinkError::BadEndpoint)?,
+            seq,
+            payload,
+            recipients: vec![],
+        };
+        link::send(&self.cfg, &self.agent, env)
+    }
+
     fn ask(&self, to: &str, payload: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, LinkError> {
         let env = self.envelope(to, payload)?;
         let (want_from, want_seq) = (env.to.clone(), env.seq);
@@ -104,20 +122,43 @@ pub mod testing {
     use super::*;
     use crate::mesh::Mesh;
     use std::collections::{HashMap, HashSet};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// 一次挂着的 `ask`：答复到了就是 `Some`。
+    type Slot = Option<Vec<u8>>;
 
     /// 几台 `Mesh` 按端点登记在这里；`send`/`ask` 直接同步调对方的
     /// `on_envelope`，`peers` 列出其它登记过、且在线的端点。
+    ///
+    /// 对方当场不答（`on_envelope` 返回 `None`）时，`ask` 跟真中转一样挂着
+    /// 等同一个 `seq` 的 `reply`，等到 `timeout` 为止——远程调用就是这样在
+    /// 工作线程上做完才答的。
     #[derive(Default)]
     pub struct FakeHub {
         nodes: Mutex<HashMap<String, Arc<Mutex<Mesh>>>>,
         offline: Mutex<HashSet<String>>,
         seq: AtomicU64,
+        /// 正挂着等答复的 `ask`，键是 `(提问的端点, seq)`；值是到了的答复。
+        waiting: Mutex<HashMap<(String, u64), Slot>>,
+        arrived: Condvar,
+        /// 设了就像真的 `Link::run` 那样，每台电脑收信封一次只处理一封
+        /// （`one_link_thread`）。
+        serial: AtomicBool,
+        links: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     }
 
     impl FakeHub {
         pub fn new() -> Arc<FakeHub> {
             Arc::new(FakeHub::default())
+        }
+
+        /// 每台电脑只有一条收件线：同一台电脑上，前一封信封的 `on_envelope`
+        /// 没回来，后一封就进不去。真守护进程就是这样（`Link::run` 一次处理
+        /// 一封）；「慢的远程调用不挡留言」要在这个前提下测才有意义。默认
+        /// 不开：有的测试在敲字回调里往同一台电脑再投一封，开了就是死锁。
+        pub fn one_link_thread(&self) {
+            self.serial.store(true, Ordering::SeqCst);
         }
 
         /// 把一台 `Mesh` 挂上来，端点就是它自己的端点。
@@ -147,6 +188,7 @@ pub mod testing {
             &self,
             from: &str,
             to: &str,
+            seq: u64,
             payload: Vec<u8>,
         ) -> Result<Option<Vec<u8>>, LinkError> {
             let to_id = EndpointId::new(to).map_err(|_| LinkError::BadEndpoint)?;
@@ -162,10 +204,16 @@ pub mod testing {
             let env = Envelope {
                 from: EndpointId::new(from).map_err(|_| LinkError::BadEndpoint)?,
                 to: to_id,
-                seq: self.seq.fetch_add(1, Ordering::Relaxed),
+                seq,
                 payload,
                 recipients: vec![],
             };
+            let line = if self.serial.load(Ordering::SeqCst) {
+                Some(self.links.lock().unwrap().entry(to.to_string()).or_default().clone())
+            } else {
+                None
+            };
+            let _one_at_a_time = line.as_ref().map(|l| l.lock().unwrap());
             // 跟 `route` 同一个入口：往会话里敲字在对方的锁外做。
             let reply = crate::mesh::handle(&target, &env);
             Ok(reply)
@@ -194,18 +242,58 @@ pub mod testing {
         }
 
         fn send(&self, to: &str, payload: Vec<u8>) -> Result<(), LinkError> {
-            self.hub.deliver(&self.me, to, payload).map(|_| ())
+            let seq = self.hub.seq.fetch_add(1, Ordering::Relaxed);
+            self.hub.deliver(&self.me, to, seq, payload).map(|_| ())
         }
 
-        fn ask(
-            &self,
-            to: &str,
-            payload: Vec<u8>,
-            _timeout: Duration,
-        ) -> Result<Vec<u8>, LinkError> {
-            self.hub
-                .deliver(&self.me, to, payload)?
-                .ok_or(LinkError::Relay(dct_link::LinkError::NoAnswer))
+        fn ask(&self, to: &str, payload: Vec<u8>, timeout: Duration) -> Result<Vec<u8>, LinkError> {
+            let hub = &self.hub;
+            let seq = hub.seq.fetch_add(1, Ordering::Relaxed);
+            let key = (self.me.clone(), seq);
+            // 跟真中转一样先挂号再投递：答得快的工作线程不会扑空。
+            hub.waiting.lock().unwrap().insert(key.clone(), None);
+            let forget = || {
+                hub.waiting.lock().unwrap().remove(&key);
+            };
+            match hub.deliver(&self.me, to, seq, payload) {
+                Err(e) => {
+                    forget();
+                    Err(e)
+                }
+                Ok(Some(r)) => {
+                    forget();
+                    Ok(r)
+                }
+                Ok(None) => {
+                    let deadline = std::time::Instant::now() + timeout;
+                    let mut w = hub.waiting.lock().unwrap();
+                    loop {
+                        if let Some(Some(_)) = w.get(&key) {
+                            return Ok(w.remove(&key).flatten().unwrap());
+                        }
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            w.remove(&key);
+                            return Err(LinkError::Relay(dct_link::LinkError::NoAnswer));
+                        }
+                        w = hub.arrived.wait_timeout(w, left).unwrap().0;
+                    }
+                }
+            }
+        }
+
+        fn reply(&self, to: &str, seq: u64, payload: Vec<u8>) -> Result<(), LinkError> {
+            let hub = &self.hub;
+            {
+                let mut w = hub.waiting.lock().unwrap();
+                if let Some(slot @ None) = w.get_mut(&(to.to_string(), seq)) {
+                    *slot = Some(payload);
+                    hub.arrived.notify_all();
+                    return Ok(());
+                }
+            }
+            // 没人挂着等（已经超时走了）：真中转把它当普通信封投给对方。
+            hub.deliver(&self.me, to, seq, payload).map(|_| ())
         }
     }
 
@@ -274,6 +362,12 @@ pub mod testing {
             self.sent.lock().unwrap().push((to.to_string(), p.clone()));
             let r = self.inner.ask(to, p, timeout)?;
             (self.incoming)(to, r)
+        }
+
+        fn reply(&self, to: &str, seq: u64, payload: Vec<u8>) -> Result<(), LinkError> {
+            let p = (self.outgoing)(to, payload);
+            self.sent.lock().unwrap().push((to.to_string(), p.clone()));
+            self.inner.reply(to, seq, p)
         }
     }
 }

@@ -271,12 +271,42 @@ pub(crate) fn run_with_hooks(
     }
     crate::bridge::spawn_event_consumer(event_rx, bridge.clone());
 
+    // 局域网手机端那个 HTTP 服务。**默认不开**——它是这台机器上唯一一个
+    // 对局域网敞口的东西，开不开是用户在设置页里的一次明确动作，
+    // 不是装了 dct 就有的默认行为。
+    let web: Arc<Mutex<Option<crate::web::Server>>> = Arc::new(Mutex::new(None));
+
+    // 正在进行的配对，按 profile 名。跟 `secrets`/`phone` 一样是长活在
+    // 这个进程里的共享状态，同样的理由：多个连接（桌面、后面 Task 6 的
+    // 网页）都可能问起同一条正在跑的配对。
+    let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
+
+    // 直播状态槽，跟 `pairs`/`web` 一样长活在这个进程里、每条连接共享同一份。
+    // `base`（学生链接的 origin）来自 `crate::live::relay_base()`——只看
+    // `DCT_RELAY` 环境变量，**没有默认值**：没设就没有中转，`LiveStart`
+    // 会被拒绝。见 `live.rs` 模块头「中转地址从哪来」。
+    let live: Arc<crate::live::LiveState> =
+        Arc::new(crate::live::LiveState::new(crate::live::relay_base()));
+
+    // 留言和远程调用共用这一个收件口：远程调用经它走同一个 `handle`
+    // （`Origin::Remote`），所以 `handle` 要的那些长活状态要先建好。
+    let mesh_inbox: Arc<dyn crate::mesh::deliver::Inbox> = Arc::new(MeshInbox {
+        local: crate::mesh::deliver::LocalInbox::new(mgr.clone()),
+        mgr: mgr.clone(),
+        store: store.clone(),
+        secrets: secrets.clone(),
+        profiles_dir: profiles_dir.clone(),
+        phone: phone.clone(),
+        bridge: bridge.clone(),
+        event_tx: Mutex::new(event_tx.clone()),
+        pairs: pairs.clone(),
+        live: live.clone(),
+        me: std::sync::OnceLock::new(),
+    });
     // 多电脑：secrets 里有中转令牌才起。起在自己的线程上（`link::spawn`），
     // 续期也在那条线程上——**不在下面那个 200ms 的 tick 里做任何网络 IO**。
     // 放在一个槽里活到进程结束：守护进程开着的时候 `dct login`，要在这里
     // 把连接（重新）起起来，不能等下次重启。
-    let mesh_inbox: Arc<dyn crate::mesh::deliver::Inbox> =
-        Arc::new(crate::mesh::deliver::LocalInbox::new(mgr.clone()));
     let mesh_ctl = Arc::new(MeshCtl {
         socket: socket.to_path_buf(),
         journal_path: mgr.journal.path(),
@@ -310,22 +340,6 @@ pub(crate) fn run_with_hooks(
         tick_mgr.tick();
     });
 
-    // 局域网手机端那个 HTTP 服务。**默认不开**——它是这台机器上唯一一个
-    // 对局域网敞口的东西，开不开是用户在设置页里的一次明确动作，
-    // 不是装了 dct 就有的默认行为。
-    let web: Arc<Mutex<Option<crate::web::Server>>> = Arc::new(Mutex::new(None));
-
-    // 正在进行的配对，按 profile 名。跟 `secrets`/`phone` 一样是长活在
-    // 这个进程里的共享状态，同样的理由：多个连接（桌面、后面 Task 6 的
-    // 网页）都可能问起同一条正在跑的配对。
-    let pairs: Arc<Mutex<PairTable>> = Arc::new(Mutex::new(BTreeMap::new()));
-
-    // 直播状态槽，跟 `pairs`/`web` 一样长活在这个进程里、每条连接共享同一份。
-    // `base`（学生链接的 origin）来自 `crate::live::relay_base()`——只看
-    // `DCT_RELAY` 环境变量，**没有默认值**：没设就没有中转，`LiveStart`
-    // 会被拒绝。见 `live.rs` 模块头「中转地址从哪来」。
-    let live: Arc<crate::live::LiveState> =
-        Arc::new(crate::live::LiveState::new(crate::live::relay_base()));
     // 推帧线程，整个守护进程生命周期只起一条：它自己每一轮去问「现在在播
     // 哪一场」，没播就什么也不做（见 `live::spawn_pusher` 的文档注释）。
     // 自己的线程——绝不能让这条线的网络 IO 混进上面那个 200ms 的 tick。
@@ -983,7 +997,7 @@ fn start_mesh(
     let mesh = match crate::mesh::Mesh::load(store) {
         Ok(m) => {
             let m = m.with_journal(journal.clone());
-            match inbox {
+            match inbox.clone() {
                 Some(i) => m.with_inbox(i),
                 None => m,
             }
@@ -1007,6 +1021,11 @@ fn start_mesh(
 
     let mesh = Arc::new(Mutex::new(mesh));
     let net: Arc<dyn crate::mesh::net::Net> = Arc::new(crate::mesh::net::LinkNet::new(cfg.clone()));
+    // 远程调用的被操作一方：执行走同一个收件口，答复经这个 `net` 发。没有
+    // 收件口（测试）就不接——不接就一律当开关关着。
+    if let Some(i) = &inbox {
+        crate::mesh::remote_host::attach(&mesh, i.clone(), net.clone());
+    }
 
     let renew = {
         let secrets = secrets.clone();
@@ -1690,6 +1709,108 @@ fn serve(
         out.flush()?;
     }
     Ok(())
+}
+
+/// 多电脑那一头的收件口：留言照旧交给 `LocalInbox`；远程调用先过授权表，
+/// 再走跟本机 socket 同一个 `handle`（`Origin::Remote`）——另写一份分派等于
+/// 养出第二套真相，远程看到的必须跟本机一致。
+struct MeshInbox {
+    local: crate::mesh::deliver::LocalInbox,
+    mgr: Arc<SessionManager>,
+    store: Arc<Mutex<Store>>,
+    secrets: Arc<Mutex<SecretStore>>,
+    profiles_dir: PathBuf,
+    phone: Arc<Mutex<PhoneStatus>>,
+    bridge: Arc<Mutex<Option<crate::bridge::BridgeHandle>>>,
+    // `Inbox` 要 `Sync`；包一层锁，用的时候克隆一份出来。
+    event_tx: Mutex<std::sync::mpsc::Sender<Event>>,
+    pairs: Arc<Mutex<PairTable>>,
+    live: Arc<crate::live::LiveState>,
+    /// 这台电脑自己的 endpoint（授权表里不给自己发证），第一次用时从钥匙算。
+    me: std::sync::OnceLock<String>,
+}
+
+impl MeshInbox {
+    /// 此刻的授权表和发件电脑的名字。**每次现读开关**：本机刚按了 `K`，
+    /// 排在后面还没执行的调用也得被拒。读不出来一律当关。
+    fn grants(&self, from: &str) -> (Vec<crate::mesh::remote::Grant>, String) {
+        let Some(home) = self.mgr.dct_home() else {
+            return (Vec::new(), from.to_string());
+        };
+        let st = crate::mesh::store::Store::at(home.join("mesh"));
+        let Ok(Some(roster)) = st.roster() else {
+            return (Vec::new(), from.to_string());
+        };
+        let name = roster
+            .roster
+            .member(from)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| from.to_string());
+        let me = match self.me.get() {
+            Some(me) => me.clone(),
+            None => match st.load_or_create_keys(&crate::mesh::os_rand) {
+                Ok(k) => self
+                    .me
+                    .get_or_init(|| dct_mesh::id::endpoint_for(&k.sign_pub()))
+                    .clone(),
+                Err(_) => return (Vec::new(), name),
+            },
+        };
+        let grants = crate::mesh::remote::grants_for(st.remote_control(), &roster.roster, &me);
+        (grants, name)
+    }
+}
+
+impl crate::mesh::deliver::Inbox for MeshInbox {
+    fn sessions(&self) -> Vec<crate::session::SessionInfo> {
+        self.local.sessions()
+    }
+
+    fn type_into(&self, id: u32, text: &str) -> Result<crate::mesh::deliver::Typed, String> {
+        self.local.type_into(id, text)
+    }
+
+    fn tentacles(&self) -> Vec<String> {
+        self.local.tentacles()
+    }
+
+    fn draining(&self) -> bool {
+        self.local.draining()
+    }
+
+    fn remote_call(&self, from: &str, req: Request) -> Response {
+        let (grants, name) = self.grants(from);
+        if let Err(code) = crate::mesh::remote::allowed(&req, &grants, from, &self.projects()) {
+            return Response::Error(code);
+        }
+        let event_tx = recover(self.event_tx.lock()).clone();
+        handle(
+            req,
+            &self.mgr,
+            &self.store,
+            &self.secrets,
+            &self.profiles_dir,
+            &self.phone,
+            &self.bridge,
+            &event_tx,
+            // 远端电脑碰不到局域网手机页的开关（`web` 的语义见 `handle`）。
+            None,
+            &self.pairs,
+            &self.live,
+            Origin::Remote { from: name },
+        )
+    }
+
+    fn projects(&self) -> Vec<PathBuf> {
+        // 跟 `Request::Projects` 回的是同一份字符串：`allowed` 拿 `Create.dir`
+        // 跟它逐个比。
+        let st = recover(self.store.lock());
+        st.list()
+            .into_iter()
+            .chain(st.pinned())
+            .map(PathBuf::from)
+            .collect()
+    }
 }
 
 /// 一条请求从哪条路进 `handle`。
@@ -4523,6 +4644,129 @@ mod tests {
     fn remote_origin_is_refused_off_whitelist_even_inside_handle() {
         let home = tempfile::tempdir().unwrap();
         let resp = handle_from(remote(), home.path(), Request::Kill { id: 1 });
+        assert!(matches!(resp, Response::Error(ErrorCode::RemoteForbidden)), "{resp:?}");
+    }
+
+    /// 一个 `MeshInbox`：家目录在临时目录，mesh 目录里有这台电脑的钥匙、
+    /// 一份「我 + 另一台 `c-other`（叫 Mac）」的名单，开关按 `on` 落盘。
+    /// 项目列表里有 `/w/recent`（最近）和 `/w/pinned`（钉住）。
+    fn mesh_inbox(home: &Path, on: bool) -> (MeshInbox, String, tempfile::TempDir) {
+        use dct_mesh::roster::{self, Member};
+        let (mgr, store, secrets, profiles_dir) = bare_handle_deps();
+        mgr.set_pair_models_home(home.to_path_buf());
+        {
+            let mut st = recover(store.lock());
+            st.touch(Path::new("/w/recent"));
+            st.pin(Path::new("/w/pinned"));
+        }
+        let ms = crate::mesh::store::Store::at(home.join("mesh"));
+        let keys = ms.load_or_create_keys(&crate::mesh::os_rand).unwrap();
+        let me_ep = dct_mesh::id::endpoint_for(&keys.sign_pub());
+        let me = Member {
+            name: "B".into(),
+            endpoint: me_ep.clone(),
+            sign_pub: String::new(),
+            kx_pub: String::new(),
+            added_at: 1,
+        };
+        let mut r = roster::genesis(me.clone(), "g".into(), &keys).roster;
+        r.members.push(Member {
+            name: "Mac".into(),
+            endpoint: "c-other".into(),
+            ..me.clone()
+        });
+        ms.save_roster(&roster::sign(r, &me, &keys)).unwrap();
+        ms.set_remote_control(on).unwrap();
+        let inbox = MeshInbox {
+            local: crate::mesh::deliver::LocalInbox::new(mgr.clone()),
+            mgr,
+            store,
+            secrets,
+            profiles_dir: profiles_dir.path().to_path_buf(),
+            phone: test_phone(),
+            bridge: test_bridge(),
+            event_tx: Mutex::new(test_event_tx()),
+            pairs: test_pairs(),
+            live: test_live(),
+            me: std::sync::OnceLock::new(),
+        };
+        (inbox, me_ep, profiles_dir)
+    }
+
+    #[test]
+    fn mesh_inbox_projects_are_recent_and_pinned_as_projects_reports_them() {
+        use crate::mesh::deliver::Inbox;
+        let home = tempfile::tempdir().unwrap();
+        let (inbox, _, _p) = mesh_inbox(home.path(), true);
+        let got = inbox.projects();
+        assert!(got.contains(&PathBuf::from("/w/recent")), "{got:?}");
+        assert!(got.contains(&PathBuf::from("/w/pinned")), "{got:?}");
+        // 钉住的项目远程也能在里面开会话。
+        let resp = inbox.remote_call(
+            "c-other",
+            Request::Create {
+                dir: "/w/pinned".into(),
+                profile: "no-such-profile".into(),
+                remember: false,
+            },
+        );
+        assert!(
+            !matches!(resp, Response::Error(ErrorCode::RemoteForbidden)),
+            "授权该放行（建不建得成是另一回事）：{resp:?}"
+        );
+    }
+
+    #[test]
+    fn mesh_inbox_runs_a_whitelisted_call_from_a_member_when_the_switch_is_on() {
+        use crate::mesh::deliver::Inbox;
+        let home = tempfile::tempdir().unwrap();
+        let (inbox, _, _p) = mesh_inbox(home.path(), true);
+        let resp = inbox.remote_call("c-other", Request::List);
+        assert!(matches!(resp, Response::Sessions(_)), "{resp:?}");
+    }
+
+    /// 开关是执行那一刻现读的：排在队里时被关掉，执行时就拒。
+    #[test]
+    fn mesh_inbox_refuses_everything_when_the_switch_is_off() {
+        use crate::mesh::deliver::Inbox;
+        let home = tempfile::tempdir().unwrap();
+        let (inbox, _, _p) = mesh_inbox(home.path(), false);
+        let resp = inbox.remote_call("c-other", Request::List);
+        assert!(matches!(resp, Response::Error(ErrorCode::RemoteControlOff)), "{resp:?}");
+    }
+
+    #[test]
+    fn mesh_inbox_refuses_off_whitelist_strangers_and_itself() {
+        use crate::mesh::deliver::Inbox;
+        let home = tempfile::tempdir().unwrap();
+        let (inbox, me, _p) = mesh_inbox(home.path(), true);
+        let kill = inbox.remote_call("c-other", Request::Kill { id: 1 });
+        assert!(matches!(kill, Response::Error(ErrorCode::RemoteForbidden)), "{kill:?}");
+        let set = inbox.remote_call("c-other", Request::RemoteControl { set: Some(false) });
+        assert!(matches!(set, Response::Error(ErrorCode::RemoteForbidden)), "{set:?}");
+        let stranger = inbox.remote_call("c-stranger", Request::List);
+        assert!(
+            matches!(stranger, Response::Error(ErrorCode::RemoteControlOff)),
+            "{stranger:?}"
+        );
+        let myself = inbox.remote_call(&me, Request::List);
+        assert!(matches!(myself, Response::Error(ErrorCode::RemoteControlOff)), "{myself:?}");
+    }
+
+    /// 远程只能在对方已有的项目里开会话。
+    #[test]
+    fn mesh_inbox_refuses_create_outside_the_projects() {
+        use crate::mesh::deliver::Inbox;
+        let home = tempfile::tempdir().unwrap();
+        let (inbox, _, _p) = mesh_inbox(home.path(), true);
+        let resp = inbox.remote_call(
+            "c-other",
+            Request::Create {
+                dir: "/etc".into(),
+                profile: "shell".into(),
+                remember: false,
+            },
+        );
         assert!(matches!(resp, Response::Error(ErrorCode::RemoteForbidden)), "{resp:?}");
     }
 
