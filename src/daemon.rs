@@ -1724,6 +1724,11 @@ fn handle(
         Request::Instance => Ok(Response::Instance {
             id: mgr.instance_id(),
         }),
+        // 占位：远程操作的执行入口在后面的任务里接上。在那之前一律拒绝，
+        // 绝不能让一条远程请求落进下面任何一支。
+        Request::RemoteCall { .. } | Request::RemoteControl { .. } => {
+            Ok(Response::Error(ErrorCode::RemoteForbidden))
+        }
         Request::List => Ok(Response::Sessions(mgr.list())),
         Request::Profiles { lang } => {
             let (all, mut warnings) = all_profiles(profiles_dir);

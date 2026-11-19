@@ -41,6 +41,10 @@ pub enum Kind {
     Receipt,
     StatusRequest,
     Status,
+    /// 远程操作：操作方电脑发来的一条 `proto::Request`（body 见 `CallBody`）。
+    RemoteCall,
+    /// 对 `RemoteCall` 的答复（body 见 `ReplyBody`）。
+    RemoteReply,
 }
 
 /// `from`/`to` 是收发双方的 endpoint，`from_session`/`to_session` 是各自机器

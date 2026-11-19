@@ -150,7 +150,11 @@ use crate::session::{ScrollBy, ScrollState, SessionInfo, SessionState};
 /// 26 = 会话一停就从名册上消失，问一个刚结束的会话不再只说「没有这个会话」：
 /// 多了 `ErrorCode::SessionEnded { id, how }`。**响应**里多了一个旧界面解不出
 /// 的变体，照 18 那次的规矩加一。
-pub const PROTOCOL_VERSION: u32 = 26;
+///
+/// 27 = 远程操作：多了 `Request::RemoteCall` / `RemoteControl`、
+/// `Response::RemoteControl`、`ErrorCode::RemoteControlOff` /
+/// `RemoteUnavailable` / `RemoteForbidden`。
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// 对面那个守护进程能不能用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,6 +604,19 @@ pub enum Request {
     /// 重连上之后拿它判断后台是不是换过了——换过的话，手里的会话编号
     /// 指的已经不是原来那些会话了。
     Instance,
+    /// 把 `req` 交给组里另一台电脑（`peer` 是电脑名）去执行，答复原样带回。
+    /// 能不能做由**对方**按白名单判（`mesh::remote::allowed`），这里不预判。
+    /// 会打网络，界面要放后台线程。
+    RemoteCall {
+        peer: String,
+        req: Box<Request>,
+    },
+    /// 看或改「允许我的其他电脑远程操作」这个开关：`None` = 只看，
+    /// `Some(b)` = 设成 `b`。只从本机答——不在远程白名单里，别的电脑
+    /// 不能替这台电脑把门打开。
+    RemoteControl {
+        set: Option<bool>,
+    },
 }
 
 /// 手写 `Debug`，不能靠 `derive`——`SetSecret`/`VerifySecret` 两个变体的
@@ -777,6 +794,14 @@ impl std::fmt::Debug for Request {
             }
             Request::DrainCancel => write!(f, "DrainCancel"),
             Request::Instance => write!(f, "Instance"),
+            Request::RemoteCall { peer, req } => f
+                .debug_struct("RemoteCall")
+                .field("peer", peer)
+                .field("req", req)
+                .finish(),
+            Request::RemoteControl { set } => {
+                f.debug_struct("RemoteControl").field("set", set).finish()
+            }
         }
     }
 }
@@ -894,6 +919,12 @@ pub enum Response {
     /// 或者催过停下的会话，dct 会再告诉它们「不重启了，接着做」。
     DrainCancelled {
         told: Vec<u32>,
+    },
+    /// 对 [`Request::RemoteControl`] 的回答：开关现在的值，以及眼下
+    /// 正在远程操作这台电脑的电脑名。
+    RemoteControl {
+        on: bool,
+        viewers: Vec<String>,
     },
     /// 对 [`Request::Instance`] 的回答。
     Instance {
@@ -1270,6 +1301,12 @@ pub enum ErrorCode {
     /// dct 正在准备重启，手机、语音这些自动来源这会儿不往会话里打字。
     /// 对方当场就该知道「稍后再发」，而不是悄悄被吞掉。
     RestartPending,
+    /// 对方电脑没开「允许远程操作」（或者根本没把我们列进授权）。
+    RemoteControlOff,
+    /// 对方电脑这会儿够不着（不在线、超时、答复解不出来）。
+    RemoteUnavailable { peer: String },
+    /// 对方开了远程操作，但这件事远程不让做（不在白名单、或没有对应能力）。
+    RemoteForbidden,
 }
 
 /// 见 [`ErrorCode::Mesh`]。句子在 `i18n::msg::error` 里组。
@@ -1693,14 +1730,19 @@ mod tests {
             Request::DrainStatus { renew: true },
             Request::DrainCancel,
             Request::Instance,
+            Request::RemoteCall {
+                peer: "p".into(),
+                req: Box::new(Request::List),
+            },
+            Request::RemoteControl { set: Some(true) },
         ];
 
         let shape = serde_json::to_string(&all).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                26,
-                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Submit":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}},{"Drain":{"wait_s":1,"nudge_wait_s":2,"initiator":3,"now":true,"exe":"/x/dct"}},{"DrainStatus":{"renew":true}},"DrainCancel","Instance"]"#
+                27,
+                r#"["Hello","List",{"Create":{"dir":"d","profile":"p","remember":true}},{"Input":{"id":1,"text":"t"}},{"Submit":{"id":1,"text":"t"}},{"Screen":{"id":1}},{"Screens":{"ids":[1]}},{"Resize":{"id":1,"rows":2,"cols":3}},{"Stop":{"id":1}},{"Kill":{"id":1}},"Prune",{"Undo":{"id":1}},{"Diff":{"id":1}},{"Profiles":{"lang":"Zh"}},"Projects",{"SetSecret":{"profile":"p","value":"v"}},{"DeleteSecret":{"profile":"p"}},{"LastProfile":{"dir":"d"}},{"PinProject":{"dir":"d"}},{"UnpinProject":{"dir":"d"}},{"VerifySecret":{"profile":"p","value":"v"}},{"PairStart":{"profile":"p","opt_in_llm":true}},{"PairPoll":{"profile":"p","opt_in_llm":true}},{"PairCancel":{"profile":"p"}},{"Explanation":{"id":1}},{"Scroll":{"id":1,"by":{"Rows":3}}},{"Mouse":{"id":1,"event":{"col":10,"row":20,"kind":{"Press":0},"shift":false,"alt":false,"ctrl":false}}},"PhoneStatus",{"PhoneSetToken":{"token":"t"}},"PhoneUnpair","PhoneDisable",{"Key":{"id":1,"name":"Up"}},{"WebStrings":{"lang":"zh-CN"}},"WebStatus","WebEnable","WebDisable",{"LiveStart":{"ids":[1],"names":["n"]}},{"LiveRestage":{"ids":[1],"names":["n"]}},"LiveStop","LiveStatus",{"LivePublish":{"title":"t"}},"LiveUnpublish","LivePublishGrant","MeshStatus","MeshLogin",{"MeshJoin":{"code":"482913","name":"n"}},"MeshInvite","MeshInviteCancel",{"MeshRemove":{"name":"n"}},"MeshPeers",{"MeshSend":{"to":"pc/s","text":"t","from_session":1}},{"Drain":{"wait_s":1,"nudge_wait_s":2,"initiator":3,"now":true,"exe":"/x/dct"}},{"DrainStatus":{"renew":true}},"DrainCancel","Instance",{"RemoteCall":{"peer":"p","req":"List"}},{"RemoteControl":{"set":true}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
@@ -1716,7 +1758,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
             (
-                26,
+                27,
                 r#"[{"DrainCancelled":{"told":[2,5]}},{"Instance":{"id":7}}]"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1756,7 +1798,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
             (
-                26,
+                27,
                 r#"{"DrainProgress":{"progress":{"waiting":[2],"remaining_s":9,"nudged":true},"done":false,"active":true}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1781,7 +1823,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, json.as_str()),
             (
-                26,
+                27,
                 r#"{"Done":{"anthropic_ready":true,"openai_ready":true,"llm_written":true}}"#
             ),
             "PairTick 的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1896,7 +1938,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, shape.as_str()),
             (
-                26,
+                27,
                 r#"{"id":1,"profile":"claude","dir":"/d","state":"Idle","activity":"a","is_agent":true,"tag":"","last_active_ms":0}"#
             ),
             "会话信息的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -1999,7 +2041,7 @@ mod tests {
         let r = Response::Error(ErrorCode::LiveRelayNotConfigured);
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
-            (26, r#"{"Error":"LiveRelayNotConfigured"}"#),
+            (27, r#"{"Error":"LiveRelayNotConfigured"}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里和 server.mjs 一起更新。"
         );
     }
@@ -2015,7 +2057,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&r).unwrap().as_str()),
             (
-                26,
+                27,
                 r#"{"Error":{"SessionEnded":{"id":3,"how":"ExitedOnItsOwn"}}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
@@ -2035,7 +2077,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
             (PROTOCOL_VERSION, s.as_str()),
-            (26, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
+            (27, r#"{"Projects":{"recent":["/a"],"pinned":["/b"]}}"#),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"
         );
     }
@@ -2112,7 +2154,7 @@ mod tests {
                 shape(&LivePublic::Listed { title: "课".into() })
             ),
             (
-                26,
+                27,
                 r#""Private""#.to_string(),
                 r#"{"Listed":{"title":"课"}}"#.to_string()
             )
@@ -2149,7 +2191,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, sent[0].as_str(), sent[1].as_str(), peers.as_str()),
             (
-                26,
+                27,
                 r#"{"MeshSent":"Delivered"}"#,
                 r##"{"MeshSent":{"NoSuchSession":["#3 a（b）"]}}"##,
                 r#"{"MeshPeers":[{"name":"A","online":true,"os":"macos","sessions":[{"name":"s","state":"闲","dir":"/d"}],"tentacles":["cam"]}]}"#
@@ -2188,7 +2230,7 @@ mod tests {
         assert_eq!(
             (PROTOCOL_VERSION, serde_json::to_string(&v).unwrap().as_str()),
             (
-                26,
+                27,
                 r#"{"Mesh":{"logged_in":true,"name":"A","endpoint":"c-a","in_group":true,"members":[{"name":"A","endpoint":"c-a","online":true,"is_me":true}],"messages":{"7":2},"invite":{"id":3,"code":"012345","expires_at":1800000600},"invite_note":{"id":2,"outcome":{"Joined":{"name":"公司电脑"}}}}}"#
             ),
             "协议的线上形状变了。把 PROTOCOL_VERSION 加一，再把这里的期望值更新成新的形状。"

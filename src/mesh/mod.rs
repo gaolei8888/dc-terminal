@@ -30,6 +30,7 @@ pub mod group;
 pub mod invite;
 pub mod login;
 pub mod net;
+pub mod remote;
 pub mod store;
 
 /// 中转的默认地址。`~/.dct/config.toml` 里 `[mesh] relay = "…"` 可以改。
@@ -436,6 +437,9 @@ impl Mesh {
             // 回执和状态只该作为 `ask` 的答复回来，不该从轮询里进来；进来了
             // 也不回——回的话两台电脑能互相回到天荒地老。
             Kind::Receipt | Kind::Status => Step::Done(None),
+            // 远程操作的收件路径是后面的任务接上的；在那之前收到就不执行、
+            // 不回——绝不能在没有授权判定的路径上碰会话。
+            Kind::RemoteCall | Kind::RemoteReply => Step::Done(None),
         }
     }
 

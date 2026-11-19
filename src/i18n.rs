@@ -2201,6 +2201,21 @@ pub mod msg {
                 en: "dct is getting ready to restart, please send that again in a moment".to_string(),
                 zh: "dct 正在准备重启，稍后再发".to_string(),
             ),
+            RemoteControlOff => t!(
+                lang,
+                en: "Remote control is off on that computer. Turn on \"allow my other computers to control this one\" in its settings".to_string(),
+                zh: "那台电脑没开远程操作。请在它的设置里打开「允许我的其他电脑远程操作」".to_string(),
+            ),
+            RemoteUnavailable { peer } => t!(
+                lang,
+                en: format!("Cannot reach {peer} right now. It may be offline"),
+                zh: format!("暂时够不着 {peer}，它可能不在线"),
+            ),
+            RemoteForbidden => t!(
+                lang,
+                en: "That action is not allowed remotely".to_string(),
+                zh: "这件事不允许远程做".to_string(),
+            ),
             DaemonNotResponding => t!(
                 lang,
                 en: "The dct service is not responding".to_string(),
@@ -3551,6 +3566,9 @@ mod tests {
             DaemonNotResponding,
             StillRestoring,
             RestartPending,
+            RemoteControlOff,
+            RemoteUnavailable { peer: "mac".into() },
+            RemoteForbidden,
             Mesh(crate::proto::MeshProblem::NotLoggedIn),
             Mesh(crate::proto::MeshProblem::NoDcAccount),
             Mesh(crate::proto::MeshProblem::AlreadyInGroup),
