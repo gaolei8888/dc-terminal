@@ -16,7 +16,8 @@
 
 - 配置：`src/config.rs` 的 `Config { llm, menu, mesh }`，`Config::load` 读 `~/.dct/config.toml`，**任何一处解析失败整份回到默认值**（`llm` 关掉）。多处按需重读，不常驻内存。没有 `deny_unknown_fields`，不认识的段会被忽略。
 - 开会话：`SessionManager::create` / `create_resuming` / `restore(dir, profile, secret, profiles, resume, restore_tag, conversation, want_id)`（`src/session.rs:1179-1270`）。`restore_tag` 给定时名字直接用它，并且不再自动起名。`want_id` 尽量沿用原编号。
-- 会话退出：`exited_on_its_own(id)` 区分「自己退出」和「被 stop/kill 叫停」；`conversation_of(id)` 拿当前对话 id；`discard(id)` 把格子从名册上拿掉。
+- 会话退出（2026-11-20 复核，main 上 2a07e01 之后）：**会话一停（自己退出或被叫停）就从名册上抹掉**，只在内存里留一份「最近结束」记录（目录、profile、怎么结束的、何时；**不含对话 id 和名字**）。`liveness(id)` 取代了原来的 `exited_on_its_own`；`conversation_of(id)` 只对还在名册上的会话有用；`discard(id)` 把格子从名册上拿掉。
+- agent 会话要求目录是 git 仓库（每轮对话前拍快照），不是的话开不起来。
 - 平稳重启：`last-sessions.toml` 记下每个会话（含名字和对话 id），新后台在 `restore` 线程里接回（`src/daemon.rs:163-205`），期间 `is_restoring()` 为真；准备重启期间 `is_draining()` 为真。
 - 接回失败兜底：`watch_resumed_by_id`（`src/daemon.rs:1480`）盯 20 秒，按 id 接回后马上退出的，`discard` 掉再开一个新的。
 - 留言：`dct send 电脑名/会话名` 按编号、看板名字或项目名找会话；名字重复报「有歧义」；会话在忙就排队，`Idle` 时一条条打进去（`src/mesh/deliver.rs`）；会话停了或不在，发送方会收到「停了 / 找不到」。
@@ -42,10 +43,10 @@ dir = "~/tutor"      # 在哪个文件夹开；~ = 家目录
 
 1. 正在接回上次会话（`is_restoring()`）或准备重启（`is_draining()`）时，这一轮什么都不做。前者避免跟接回线程抢着开同一个会话，后者避免重启前又开新的。
 2. 重读 `[[keep]]` 和 profile 列表（`all_profiles`）。改配置不用重启后台，最多 5 秒生效。
-3. 对每一条 keep，在名册里找**它的会话**：名字 = `name`、profile = `profile`、目录（规范化后）= `dir`，三项都对上。
-   - 找到且活着：不动。
-   - 找到但已经停了（自己退出，或被手动停掉）：记下它的编号和 `conversation_of`，`discard` 掉，用 `restore(dir, profile, secret, all, false, Some(name), 对话id, Some(原编号))` 重开。**编号不变、名字不变、接回原对话。**
-   - 没找到：用 `restore(..., Some(name), None, None)` 新开一个。
+3. 对每一条 keep，在名册里找**它的会话**：名字 = `name`、profile = `profile`、目录（规范化后）= `dir`，三项都对上，且状态不是「已停止」。
+   - 找到：不动，只**记下它的编号和此刻的对话 id**（`conversation_of`）。会话一停就从名册上消失、最近结束记录里也没有对话 id，所以必须趁它活着时每轮记一次。
+   - 没找到、以前见过：用记下的编号和对话 id 重开——`restore(dir, profile, secret, all, false, Some(name), 对话id, Some(原编号))`。**编号不变、名字不变、接回原对话。** 名册上如果还残留着那个编号的「已停止」格子（还没被抹掉），先 `discard` 再开。
+   - 没找到、从没见过（后台刚启动、配置刚加上）：用 `restore(..., Some(name), None, None)` 新开一个。
 4. 删掉一条 keep：看守线程不再管它。**不会**去停掉已经在跑的那个会话——只是以后停了不再重开。
 
 平稳重启不需要额外处理：常驻会话跟别的会话一样记进 `last-sessions.toml`，由接回线程按对话 id 接回；接回结束（`is_restoring()` 变假）之后看守线程才开始看，那时它已经在名册上了。
@@ -56,7 +57,7 @@ dir = "~/tutor"      # 在哪个文件夹开；~ = 家目录
 - 重开前等待：第 1 次 5 秒，之后每次翻倍，最长 5 分钟。
 - 按对话 id 接回后 20 秒内就退出（对话文件没了之类），下一次重开**不带对话 id**，从空白开始——跟 `watch_resumed_by_id` 一样的兜底。
 - 目录不存在、profile 不存在、开会话报错：不开，记一条警告，下一轮再看（同样按上面的等待时间）。目录**不自动创建**：写错路径时凭空多出一个文件夹更让人糊涂。
-- 警告走现有的 `push_resume_skip`（界面已经会显示），同一条 keep 同一种原因只报一次，恢复正常后再出问题才再报。需要新增警告码：常驻会话开不起来（目录不在 / agent 不在 / 启动失败）、常驻会话反复崩溃。
+- 警告走现有的 `push_resume_skip`（界面已经会显示），同一条 keep 同一种原因只报一次，恢复正常后再出问题才再报。需要新增警告码：常驻会话开不起来（目录不在 / agent 不在 / 启动失败）、常驻会话反复崩溃（连续失败 3 次报一次）、配置里某条写坏了。新增警告码会让旧界面解不开，`PROTOCOL_VERSION` 26 → 27。
 
 ### 4. 名字冲突
 
@@ -93,5 +94,5 @@ dir = "~/tutor"      # 在哪个文件夹开；~ = 家目录
 ## 上线
 
 1. 合并、推送、安装、重启后台都要用户点头（重启会连这个会话一起重启）。
-2. 用户同意后，在 `~/.dct/config.toml` 加一条家教的 `[[keep]]`，建好 `~/tutor` 文件夹。家教会话由此第一次真正启动——之前对 dc_classroom 的约定是「不要启动 agent」，这一步要用户当面确认。
+2. 用户同意后，在 `~/.dct/config.toml` 加一条家教的 `[[keep]]`，建好 `~/tutor` 文件夹并 `git init`（agent 会话要求是 git 仓库）。家教会话由此第一次真正启动——之前对 dc_classroom 的约定是「不要启动 agent」，这一步要用户当面确认。
 3. 真机核对：后台起来后看板出现「家教」；手动停掉，5 秒左右回来、编号不变；`dct send Mac/家教 "你好"` 送到。
