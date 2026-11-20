@@ -250,6 +250,8 @@ mod ps_and_stop {
                 "daemon": "up",
                 "dct_version": env!("CARGO_PKG_VERSION"),
                 "sessions": {"busy": 0, "idle": 0, "total": 0},
+                // 没登录多电脑、没人在远程操作：空数组（问得到，只是没有）。
+                "remote_viewers": [],
             })
         );
         let (plain, _, code) = d.run(&["status"]);

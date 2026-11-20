@@ -766,7 +766,7 @@ mod tests {
     fn esc_sends_a_cancel_and_leaves_the_view() {
         let (sock, _fake_dir, received) = fake_daemon();
         let (mut app, _dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
         app.view = View::Pair {
             profile: "dc".into(),
             phase: phase_waiting(),
@@ -856,7 +856,7 @@ mod tests {
     fn p_sends_a_cancel_too_before_switching_to_manual_entry() {
         let (sock, _fake_dir, received) = fake_daemon();
         let (mut app, _dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
         app.view = View::Pair {
             profile: "dc".into(),
             phase: phase_waiting(),
@@ -1091,7 +1091,7 @@ mod tests {
     fn a_pairing_started_from_the_picker_ends_in_the_session_it_was_started_for() {
         let (sock, _fake_dir, received) = fake_daemon();
         let (mut app, _dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
         app.view = View::Pair {
             profile: "dc".into(),
             phase: PairPhase::Done {
@@ -1166,7 +1166,7 @@ mod tests {
     fn a_pairing_started_from_the_key_page_does_not_open_a_session() {
         let (sock, _fake_dir, received) = fake_daemon();
         let (mut app, _dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
         app.view = View::Pair {
             profile: "dc".into(),
             phase: PairPhase::Done {

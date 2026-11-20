@@ -462,6 +462,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         open(&mut app);
 
@@ -488,6 +489,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
         app.list_state.select(Some(1));
         open(&mut app);

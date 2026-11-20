@@ -621,8 +621,9 @@ pub(crate) mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }]);
-        app.client = Some(crate::client::Client::connect(&app.socket).unwrap());
+        app.client = Some(crate::client::Client::connect(&app.socket).unwrap().into());
         app.view = View::Attached(1);
         crate::ui::dispatch_key(&mut app, key('a')).unwrap();
         std::thread::sleep(Duration::from_millis(200));

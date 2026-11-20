@@ -486,6 +486,15 @@ pub struct SessionInfo {
     /// 纯读字段：刷新规则一个字没动；`#[serde(default)]` 理由同 `tag`。0 = 不知道（旧守护进程）。
     #[serde(default)]
     pub last_active_ms: u64,
+    /// 这个会话在哪台电脑上：`None` = 本机，`Some(电脑名)` = 组里别的电脑。
+    ///
+    /// **只由界面填**（`ui::remote::Router` 合并远程列表时），守护进程永远
+    /// 发 `None`——守护进程不知道、也不该知道看板把谁的会话摆在一起。
+    /// `#[serde(default)]` 理由同 `tag`；`None` 不上线
+    /// （`skip_serializing_if`）——守护进程发出的形状一个字节都不变，
+    /// `the_session_info_shape_is_pinned_too` 照旧钉着。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 impl Session {
@@ -990,6 +999,11 @@ impl SessionManager {
     /// 同上面几个 setter 的模式，单元测试不装就是「没有任何配对模型名」。
     pub fn set_pair_models_home(&self, path: PathBuf) {
         *recover(self.pair_models_home.lock()) = Some(path);
+    }
+
+    /// dct 的家目录；没装过（单元测试默认）就是 `None`。
+    pub fn dct_home(&self) -> Option<PathBuf> {
+        recover(self.pair_models_home.lock()).clone()
     }
 
     /// 把自带运行时重新挂一遍守护进程的 PATH。
@@ -1684,6 +1698,7 @@ impl SessionManager {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64,
+                    machine: None,
                 }
             })
             .collect();

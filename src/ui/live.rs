@@ -700,7 +700,7 @@ mod tests {
         let has_key = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (sock, _fake, asked) = fake_live_daemon(answer.clone(), has_key);
         let (mut app, _dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
         app.connected = true;
         app.view = View::Attached(1);
         let t0 = std::time::Instant::now();
@@ -1033,7 +1033,7 @@ mod tests {
         )));
         let (sock, _fake, _asked) = fake_live_daemon(answer, has_key.clone());
         let (mut app, _dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
         app.connected = true;
         app.live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
         app.view = View::Live {
@@ -1100,7 +1100,7 @@ mod tests {
         )));
         let (sock, _fake, _asked) = fake_live_daemon(answer, has_key);
         let (mut app, _dir) = App::test_app();
-        app.client = Some(crate::client::Client::connect(&sock).unwrap());
+        app.client = Some(crate::client::Client::connect(&sock).unwrap().into());
         app.connected = true;
         let mut live = info(vec![(1, "一".into())], 0, LiveReadiness::Ready);
         live.public = LivePublic::Listed { title: "课".into() };

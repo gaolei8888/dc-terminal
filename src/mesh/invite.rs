@@ -1756,6 +1756,9 @@ mod tests {
             fn ask(&self, _: &str, _: Vec<u8>, _: Duration) -> Result<Vec<u8>, crate::link::LinkError> {
                 panic!("不该问任何一台")
             }
+            fn reply(&self, _: &str, _: u64, _: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                unreachable!("这个测试不答远程调用")
+            }
         }
         let hub = FakeHub::new();
         let b = Node::grouped(&hub, 2, "B");
@@ -1776,6 +1779,9 @@ mod tests {
             fn ask(&self, _: &str, _: Vec<u8>, _: Duration) -> Result<Vec<u8>, crate::link::LinkError> {
                 *self.0.lock().unwrap() += 1;
                 Ok(wire::encode(&Payload::NoInvite))
+            }
+            fn reply(&self, _: &str, _: u64, _: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                unreachable!("这个测试不答远程调用")
             }
         }
         let hub = FakeHub::new();

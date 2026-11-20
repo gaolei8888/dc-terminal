@@ -442,6 +442,9 @@ pub enum Key {
     /// 或者截图还没截成，这是最常见的一种「什么都没发生」，红字会把它说得
     /// 比实情严重。
     NoImageInClipboard,
+    /// 在别的电脑上的会话里按了 F5。图片要传文件，这一期不做；**不是红字**——
+    /// 用户没做错事，他需要知道的只是「这里只能粘文字」。
+    RemotePasteTextOnly,
     NoSessionSelected,
     DaemonUnreachable,
     StaleData,
@@ -997,6 +1000,11 @@ pub fn text(k: Key, lang: Lang) -> &'static str {
             lang,
             en: "The clipboard has no image",
             zh: "剪贴板里没有图片",
+        ),
+        RemotePasteTextOnly => t!(
+            lang,
+            en: "Sessions on another computer can only take pasted text",
+            zh: "远程会话只能粘文字",
         ),
         NoSessionSelected => t!(lang, en: "No session selected", zh: "没有选中会话"),
         DaemonUnreachable => t!(
@@ -1557,6 +1565,143 @@ pub mod msg {
 
     pub fn killed_session(lang: Lang, id: u32) -> String {
         t!(lang, en: format!("Killed session {id}"), zh: format!("已杀掉 {id} 号会话"))
+    }
+
+    /// 远程会话的画面还没取回来第一张时，画面里那一行。
+    pub fn remote_connecting(lang: Lang, peer: &str) -> String {
+        t!(lang, en: format!("Connecting to {peer}…"), zh: format!("正在连接 {peer}…"))
+    }
+
+    /// 看板上别的电脑那一组的组头：问不到它。
+    pub fn remote_peer_offline(lang: Lang) -> &'static str {
+        t!(lang, en: "offline", zh: "离线")
+    }
+
+    /// 组头：问到了，但它没开「允许我的其他电脑远程操作」。
+    pub fn remote_peer_control_off(lang: Lang) -> &'static str {
+        t!(lang, en: "remote control off", zh: "没开远程操作")
+    }
+
+    /// 组头：还没问到过。
+    pub fn remote_peer_connecting(lang: Lang) -> &'static str {
+        t!(lang, en: "connecting", zh: "正在连接")
+    }
+
+    /// 几台电脑名连成一句。
+    fn join_names(lang: Lang, names: &[String]) -> String {
+        names.join(t!(lang, en: ", ", zh: "、"))
+    }
+
+    /// 被操作的这台：看板顶栏和会话底栏上常亮的那一句。`K` 写进句子里——
+    /// 那是断开的唯一一个键，屏幕上不写就等于没有。
+    pub fn remote_viewers_banner(lang: Lang, names: &[String]) -> String {
+        let who = join_names(lang, names);
+        t!(
+            lang,
+            en: format!("{who} is controlling this computer · K on the board disconnects"),
+            zh: format!("{who} 正在远程操作这台电脑 · 看板上按 K 断开"),
+        )
+    }
+
+    /// 按了 `K`：开关关了，正连着的那几台被踢掉。
+    pub fn remote_kicked(lang: Lang, names: &[String]) -> String {
+        if names.is_empty() {
+            return remote_control_now(lang, false).to_string();
+        }
+        let who = join_names(lang, names);
+        t!(
+            lang,
+            en: format!("Disconnected {who}; remote control is off"),
+            zh: format!("已断开 {who}，远程操作已关"),
+        )
+    }
+
+    /// 设置页那一项。
+    pub fn remote_control_setting(lang: Lang) -> &'static str {
+        t!(lang, en: "Allow my other computers to control this one", zh: "允许我的其他电脑远程操作")
+    }
+
+    /// 开关现在的值，设置页那一项后面和切换之后的那句话共用。
+    pub fn remote_control_now(lang: Lang, on: bool) -> &'static str {
+        match on {
+            true => t!(lang, en: "Remote control is on", zh: "远程操作已开"),
+            false => t!(lang, en: "Remote control is off", zh: "远程操作已关"),
+        }
+    }
+
+    /// 一批按键没送到那台电脑，队列清空了。
+    pub fn remote_keys_lost(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Keys sent to {peer} did not get through"),
+            zh: format!("发往 {peer} 的按键没送到"),
+        )
+    }
+
+    /// 远程画面角上：这张画面是多久以前的。
+    pub fn remote_screen_age(lang: Lang, secs: u64) -> String {
+        t!(lang, en: format!("{secs}s ago"), zh: format!("{secs} 秒前"))
+    }
+
+    /// 远程会话上按了 `s`/`u`/`d`：已经排进去了，答复回来再说结果。
+    pub fn remote_sent(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Sent to {peer}, waiting for its answer…"),
+            zh: format!("已发给 {peer}，等它回话…"),
+        )
+    }
+
+    /// 在别的电脑上开会话：已经排进去了。
+    pub fn remote_creating(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Opening a session on {peer}…"),
+            zh: format!("正在 {peer} 上开会话…"),
+        )
+    }
+
+    /// 在别的电脑上开好了会话。
+    pub fn remote_created(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Opened a session on {peer}"),
+            zh: format!("已在 {peer} 上开好会话"),
+        )
+    }
+
+    /// 在别的电脑上开会话的选择框：标题。`dir` 为空 = 还在挑项目。
+    pub fn remote_pick_title(lang: Lang, peer: &str, dir: Option<&str>) -> String {
+        match dir {
+            None => t!(
+                lang,
+                en: format!("New session on {peer} · pick a project"),
+                zh: format!("在 {peer} 上开会话 · 选项目"),
+            ),
+            Some(d) => t!(
+                lang,
+                en: format!("New session on {peer} · {d} · pick an agent"),
+                zh: format!("在 {peer} 上开会话 · {d} · 选 agent"),
+            ),
+        }
+    }
+
+    /// 选择框里：对方的项目 / agent 列表还在路上。
+    pub fn remote_pick_loading(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Asking {peer} for its list…"),
+            zh: format!("正在向 {peer} 要列表…"),
+        )
+    }
+
+    /// 选择框里：对方一个项目都没有。远程只能开在对方已有的项目里。
+    pub fn remote_pick_no_projects(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("{peer} has no projects yet. Open one there first"),
+            zh: format!("{peer} 上还没有项目，先在那台电脑上开一个"),
+        )
     }
 
     pub fn pruned(lang: Lang, n: u32) -> String {
@@ -2200,6 +2345,21 @@ pub mod msg {
                 lang,
                 en: "dct is getting ready to restart, please send that again in a moment".to_string(),
                 zh: "dct 正在准备重启，稍后再发".to_string(),
+            ),
+            RemoteControlOff => t!(
+                lang,
+                en: "Remote control is off on that computer. Turn on \"allow my other computers to control this one\" in its settings".to_string(),
+                zh: "那台电脑没开远程操作。请在它的设置里打开「允许我的其他电脑远程操作」".to_string(),
+            ),
+            RemoteUnavailable { peer } => t!(
+                lang,
+                en: format!("Cannot reach {peer} right now. It may be offline"),
+                zh: format!("暂时够不着 {peer}，它可能不在线"),
+            ),
+            RemoteForbidden => t!(
+                lang,
+                en: "That action is not allowed remotely".to_string(),
+                zh: "这件事不允许远程做".to_string(),
             ),
             DaemonNotResponding => t!(
                 lang,
@@ -3431,6 +3591,7 @@ mod tests {
             PasteOrTypeKey,
             NoOtherRunningSession,
             NoImageInClipboard,
+            RemotePasteTextOnly,
             NoSessionSelected,
             DaemonUnreachable,
             StaleData,
@@ -3548,7 +3709,7 @@ mod tests {
     fn every_key_is_listed_for_the_guards() {
         // 这个数字改动时，请确认 ALL_KEYS 也补上了新变体——它不是凑出来的，
         // 而是「词条表里到底有多少条」这个事实。
-        assert_eq!(ALL_KEYS.len(), 222, "加了 Key 变体就要同步进 ALL_KEYS");
+        assert_eq!(ALL_KEYS.len(), 223, "加了 Key 变体就要同步进 ALL_KEYS");
         let mut seen: Vec<String> = ALL_KEYS.iter().map(|k| format!("{k:?}")).collect();
         seen.sort();
         let before = seen.len();
@@ -3628,6 +3789,9 @@ mod tests {
             DaemonNotResponding,
             StillRestoring,
             RestartPending,
+            RemoteControlOff,
+            RemoteUnavailable { peer: "mac".into() },
+            RemoteForbidden,
             Mesh(crate::proto::MeshProblem::NotLoggedIn),
             Mesh(crate::proto::MeshProblem::NoDcAccount),
             Mesh(crate::proto::MeshProblem::AlreadyInGroup),

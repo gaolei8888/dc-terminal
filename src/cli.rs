@@ -118,15 +118,18 @@ pub enum Probe {
     Reached {
         protocol: Option<u32>,
         sessions: Vec<SessionInfo>,
+        /// 此刻正在远程操作这台电脑的电脑名（`Request::RemoteControl`）。
+        /// 问不到（开关读不了、还没登录）就是空的。
+        remote_viewers: Vec<String>,
     },
 }
 
 /// 协议对不对先看握手，`stale` 的判断只在这一处，JSON 和人话共用。
 fn probe_kind(probe: &Probe) -> Option<&[SessionInfo]> {
     match probe {
-        Probe::Reached { protocol, sessions }
-            if crate::proto::daemon_status(*protocol) == crate::proto::DaemonStatus::Same =>
-        {
+        Probe::Reached {
+            protocol, sessions, ..
+        } if crate::proto::daemon_status(*protocol) == crate::proto::DaemonStatus::Same => {
             Some(sessions)
         }
         _ => None,
@@ -152,6 +155,10 @@ pub fn status_value(probe: &Probe) -> serde_json::Value {
                 .iter()
                 .filter(|x| x.state != SessionState::Stopped)
                 .count();
+            let viewers = match probe {
+                Probe::Reached { remote_viewers, .. } => remote_viewers.clone(),
+                Probe::Down => Vec::new(),
+            };
             json!({
                 "schema_version": 1,
                 "daemon": "up",
@@ -161,6 +168,9 @@ pub fn status_value(probe: &Probe) -> serde_json::Value {
                     "idle": count(SessionState::Idle),
                     "total": total,
                 },
+                // 谁正在远程操作这台电脑（10 秒内真在用的，设计第 3 节）。
+                // 没人就是空数组——这一版支持这个字段，空就是「没有」。
+                "remote_viewers": viewers,
             })
         }
     }
@@ -205,15 +215,28 @@ fn probe_daemon(sock: &Path) -> Option<Probe> {
         return Some(Probe::Reached {
             protocol,
             sessions: vec![],
+            remote_viewers: vec![],
         });
     }
     match c.call(Request::List) {
-        Ok(Response::Sessions(sessions)) => Some(Probe::Reached { protocol, sessions }),
+        Ok(Response::Sessions(sessions)) => {
+            // 问不到谁在远程操作（开关文件读不了之类）不影响其余几项：报空。
+            let remote_viewers = match c.call(Request::RemoteControl { set: None }) {
+                Ok(Response::RemoteControl { viewers, .. }) => viewers,
+                _ => vec![],
+            };
+            Some(Probe::Reached {
+                protocol,
+                sessions,
+                remote_viewers,
+            })
+        }
         // 握手对得上、会话列表却读不出来：它明明在跑，说 down 会让菜单栏给出
         // 「启动 dct」。按「在跑但读不了」报，协议填 None 就是 stale。
         _ => Some(Probe::Reached {
             protocol: None,
             sessions: vec![],
+            remote_viewers: vec![],
         }),
     }
 }
@@ -1744,6 +1767,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         };
         let live = vec![info(3, "codex"), info(4, "claude")];
         assert!(initiator_unresumable(&sock, &live, 3));
@@ -1980,6 +2004,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 
@@ -1993,6 +2018,7 @@ mod tests {
         Probe::Reached {
             protocol: Some(crate::proto::PROTOCOL_VERSION),
             sessions,
+            remote_viewers: vec![],
         }
     }
 
@@ -2024,12 +2050,24 @@ mod tests {
         let v = status_value(&up(vec![]));
         assert_eq!(
             keys(&v),
-            ["daemon", "dct_version", "schema_version", "sessions"]
+            ["daemon", "dct_version", "remote_viewers", "schema_version", "sessions"]
         );
+        assert_eq!(v["remote_viewers"], serde_json::json!([]));
         assert_eq!(keys(&v["sessions"]), ["busy", "idle", "total"]);
         assert_eq!(v["schema_version"], 1);
         assert_eq!(v["dct_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["sessions"]["total"], 0);
+    }
+
+    /// 谁正在远程操作这台电脑，原样列出来（菜单栏、dco 拿它提醒人）。
+    #[test]
+    fn status_json_lists_remote_viewers() {
+        let v = status_value(&Probe::Reached {
+            protocol: Some(crate::proto::PROTOCOL_VERSION),
+            sessions: vec![],
+            remote_viewers: vec!["Mac".into(), "办公室".into()],
+        });
+        assert_eq!(v["remote_viewers"], serde_json::json!(["Mac", "办公室"]));
     }
 
     #[test]
@@ -2050,6 +2088,7 @@ mod tests {
                 protocol,
                 // 就算调用方塞进来了会话，stale 也不许把它们报出去
                 sessions: vec![s(1, SessionState::Working, "")],
+                remote_viewers: vec!["Mac".into()],
             });
             assert_eq!(v["daemon"], "stale", "protocol {protocol:?}");
             assert_eq!(keys(&v), ["daemon", "dct_version", "schema_version"]);
@@ -2074,6 +2113,7 @@ mod tests {
             &Probe::Reached {
                 protocol: None,
                 sessions: vec![],
+                remote_viewers: vec![],
             },
             Lang::Zh,
         );

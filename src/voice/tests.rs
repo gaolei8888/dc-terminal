@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 fn sess(id: u32, tag: &str, state: SessionState, last: u64) -> SessionInfo {
-    SessionInfo { id, profile: "claude".into(), dir: "/d".into(), state, activity: String::new(), is_agent: true, tag: tag.into(), last_active_ms: last }
+    SessionInfo { id, profile: "claude".into(), dir: "/d".into(), state, activity: String::new(), is_agent: true, tag: tag.into(), last_active_ms: last, machine: None }
 }
 
 fn utt(seq: u64, text: &str, conf: f64) -> Utterance {

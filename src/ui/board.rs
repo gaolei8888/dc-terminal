@@ -11,6 +11,10 @@ use super::widgets::{
 use super::{
     accent, danger, dim, open_new_session, open_project_picker, open_secrets, session_action,
 };
+use super::remote::PeerStatus;
+use super::view::{RemotePick, View};
+use super::widgets::Msg;
+use ratatui::widgets::ListState;
 use crate::i18n::{msg, text, Key};
 
 /// 会话行上 activity 之前占几列：`highlight_symbol` 2、项目色条 1、
@@ -49,6 +53,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             let _ = super::unpin_current(app);
         }
         KeyCode::Char('c') if is_plain_key(&key) => open_secrets(app),
+        // 踢掉正在远程操作这台电脑的人，顺手关掉开关（九宫格也认）。大写：
+        // 不可撤销的一类动作（重开要进设置页），不跟任何顺手的小写键挨着。
+        KeyCode::Char('K') if is_plain_key(&key) => super::kick_remote(app),
         // 加电脑：要一个 6 位邀请码（不用 `i`：九宫格里 `i` 是开回复框）。
         KeyCode::Char('a') if is_plain_key(&key) => super::computers::start_invite(app),
         // `l` = language。设置页跟 `c 密钥` 挨着：两个都是「配置」类入口，
@@ -174,6 +181,12 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                 }
             };
             let g = &app.groups[gi];
+            // 别的电脑问不到、没开远程操作、还没问到：整组灰掉，组头上说为什么。
+            let peer_note = g
+                .machine
+                .as_deref()
+                .and_then(|m| peer_note(app.remote.status(m), app.lang));
+            let faded = peer_note.is_some();
             let mut spans = vec![Span::styled(bar, accent())];
             match row {
                 super::view::Row::Header(_) => {
@@ -188,7 +201,8 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     spans.push(Span::raw(if g.collapsed { "▸ " } else { "▾ " }));
                     // 目录被删了：名字标灰并点出来。会话本身还活着（进程的 cwd
                     // 已经打开），组照常留在看板上——让它消失才是真的找不回来了。
-                    let gone = !g.dir.exists();
+                    // 别的电脑的组没有本机目录可查，`dir` 只是个分组键。
+                    let gone = g.machine.is_none() && !g.dir.exists();
                     // **先截再补**，跟下面那行父目录一样。`pad_to` 只补不截，
                     // 光靠它的话一个长目录名（`我的自媒体电商代运营项目` 是
                     // 24 列，而中文项目名长成这样再普通不过）会把整行右推，
@@ -232,14 +246,16 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                     } else {
                         spans.push(Span::styled(
                             pad_to(&truncate(&g.name, 17), 18),
-                            if gone {
+                            if gone || faded {
                                 dim()
                             } else {
                                 Style::default().add_modifier(Modifier::BOLD)
                             },
                         ));
                     }
-                    spans.push(Span::styled(pad_to(&truncate(&g.parent, 16), 18), dim()));
+                    // 别的电脑的组：父目录那一格写它的状态（离线 / 没开远程操作）。
+                    let parent = peer_note.unwrap_or(&g.parent);
+                    spans.push(Span::styled(pad_to(&truncate(parent, 16), 18), dim()));
                     if gone {
                         spans.push(Span::styled(text(Key::ProjectDirGone, app.lang), dim()));
                     } else {
@@ -294,11 +310,32 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                             .saturating_sub(SESSION_PREFIX_COLS + marks_w + 1)
                             .min(70)
                     };
+                    // 别的电脑的组按电脑分，不按项目分：项目路径只能写在行里。
+                    // 从 activity 的预算里出，不加宽这一行。
+                    let activity_room = if g.machine.is_some() {
+                        let path = format!("{} · ", truncate(&s.dir, 28));
+                        let used = display_width(&path).min(activity_room);
+                        spans.push(Span::styled(path, dim()));
+                        activity_room - used
+                    } else {
+                        activity_room
+                    };
                     spans.push(Span::raw(truncate(&s.activity, activity_room)));
                     for m in marks {
                         spans.push(Span::styled(m, accent()));
                     }
                 }
+            }
+            if faded {
+                // 灰掉的是整行（光标那块牌子照旧反白，只是也灰了）：这一组的
+                // 数据是旧的，或者压根操作不了。
+                spans = spans
+                    .into_iter()
+                    .map(|sp| {
+                        let st = sp.style.patch(dim());
+                        sp.style(st)
+                    })
+                    .collect();
             }
             ListItem::new(Line::from(spans))
         })
@@ -348,6 +385,170 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(section), section_area);
 }
 
+/// `n`/`N` 落在别的电脑的组上：在那台电脑上开会话（`mod.rs::open_new_session`
+/// 分过来）。
+///
+/// - `n` 停在那台电脑的某个会话上：照着它开一个——同一个项目、同一个 agent。
+///   本机 `n` 的意思是「这个项目上次用的那个」，远程这边最接近的答案就在
+///   光标底下，不用再问一趟（对方的 `LastProfile` 要走一个来回）。
+/// - 其余（`N`、停在组头上）：开选择框，先挑那台电脑上的项目，再挑 agent。
+///   远程只能开在对方**已有的**项目里（对方按自己的 `Projects` 判，spec 第 2 节）。
+pub(crate) fn open_remote(app: &mut App, peer: String, code: KeyCode) {
+    if code == KeyCode::Char('n') {
+        let here = app
+            .selected_session()
+            .filter(|s| s.machine.as_deref() == Some(peer.as_str()))
+            .map(|s| (s.dir.clone(), s.profile.clone()));
+        if let Some((dir, profile)) = here {
+            create_remote(app, &peer, dir, profile);
+            return;
+        }
+    }
+    // 先问一句，让后台去取：选择框开出来的那一帧多半还是「正在要」。
+    if let Some(r) = app.client.as_mut() {
+        r.remote_projects(&peer);
+        r.remote_profiles(&peer);
+    }
+    let mut state = ListState::default();
+    state.select(Some(0));
+    app.view = View::PickRemote(RemotePick {
+        peer,
+        dir: None,
+        state,
+    });
+}
+
+/// 排一个 `Create` 进那台电脑的队列。结果是一条 `FeedEvent::Answer`，由
+/// `ui::apply_feed_event` 接（建好了就进去，跟本机 `n` 一样）。
+fn create_remote(app: &mut App, peer: &str, dir: String, profile: String) {
+    let lang = app.lang;
+    app.message = match app
+        .client()
+        .and_then(|c| c.create_on(peer, dir, profile))
+    {
+        Ok(()) => msg::remote_creating(lang, peer).into(),
+        Err(e) => match e.downcast_ref::<crate::proto::CodedError>() {
+            Some(crate::proto::CodedError(code)) => Msg::err(msg::error(lang, code)),
+            None => Msg::err(e.to_string()),
+        },
+    };
+    app.view = super::home_view(app);
+}
+
+/// 选择框这一步能选的（显示的字, 选中后用的值）。`None` = 对方的列表还在路上。
+fn remote_pick_rows(app: &mut App, pick: &RemotePick) -> Option<Vec<(String, String)>> {
+    let router = app.client.as_mut()?;
+    match &pick.dir {
+        None => {
+            let (recent, pinned) = router.remote_projects(&pick.peer)?;
+            let mut all = recent;
+            for p in pinned {
+                if !all.contains(&p) {
+                    all.push(p);
+                }
+            }
+            Some(all.into_iter().map(|d| (d.clone(), d)).collect())
+        }
+        // 只列现在就开得起来的 agent：密钥、安装都得在那台电脑上弄，
+        // 这边列出来也按不动。
+        Some(_) => {
+            let entries = router.remote_profiles(&pick.peer)?;
+            Some(
+                super::view::agent_rows(&entries)
+                    .into_iter()
+                    .filter(|e| e.status == crate::profile::ProfileStatus::Ready)
+                    .map(|e| (e.label, e.name))
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// 选择框的按键。**这个函数里永远不要 `continue`**，理由同 `handle_key`。
+pub(crate) fn handle_remote_pick_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let View::PickRemote(mut pick) = app.view.clone() else {
+        return Ok(());
+    };
+    let rows = remote_pick_rows(app, &pick).unwrap_or_default();
+    match key.code {
+        KeyCode::Esc => {
+            app.view = match pick.dir {
+                // 挑 agent 那一步退回挑项目，不是一步退到底。
+                Some(_) => {
+                    pick.dir = None;
+                    pick.state.select(Some(0));
+                    View::PickRemote(pick)
+                }
+                None => super::home_view(app),
+            };
+        }
+        KeyCode::Down | KeyCode::Up => {
+            let d = if key.code == KeyCode::Down { 1 } else { -1 };
+            super::move_sel_n(&mut pick.state, rows.len(), d);
+            app.view = View::PickRemote(pick);
+        }
+        KeyCode::Enter => {
+            let Some((_, value)) = pick.state.selected().and_then(|i| rows.get(i)).cloned()
+            else {
+                return Ok(());
+            };
+            match pick.dir.take() {
+                None => {
+                    pick.dir = Some(value);
+                    pick.state.select(Some(0));
+                    app.view = View::PickRemote(pick);
+                }
+                Some(dir) => create_remote(app, &pick.peer, dir, value),
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 选择框：浮在看板上，同 `PickProject`（`mod.rs::draw` 负责先画背后那一屏）。
+pub(crate) fn draw_remote_pick(f: &mut Frame, area: Rect, app: &mut App) {
+    let View::PickRemote(pick) = app.view.clone() else {
+        return;
+    };
+    let lang = app.lang;
+    let title = msg::remote_pick_title(lang, &pick.peer, pick.dir.as_deref());
+    let body = super::widgets::header(f, area, &title, dim());
+    match remote_pick_rows(app, &pick) {
+        None => f.render_widget(
+            Paragraph::new(msg::remote_pick_loading(lang, &pick.peer)),
+            body,
+        ),
+        Some(rows) if rows.is_empty() && pick.dir.is_none() => f.render_widget(
+            Paragraph::new(msg::remote_pick_no_projects(lang, &pick.peer)),
+            body,
+        ),
+        Some(rows) if rows.is_empty() => f.render_widget(
+            Paragraph::new(text(Key::CannotListAgents, lang)),
+            body,
+        ),
+        Some(rows) => {
+            let items: Vec<ListItem> = rows
+                .into_iter()
+                .map(|(label, _)| ListItem::new(Line::from(label)))
+                .collect();
+            let mut st = pick.state.clone();
+            f.render_stateful_widget(List::new(items).highlight_symbol("▶ "), body, &mut st);
+        }
+    }
+}
+
+/// 别的电脑那一组的组头上要说的话。在线就不说（`None`），组照常画。
+fn peer_note(status: Option<PeerStatus>, lang: crate::i18n::Lang) -> Option<&'static str> {
+    match status {
+        Some(PeerStatus::Online) => None,
+        Some(PeerStatus::Offline) => Some(msg::remote_peer_offline(lang)),
+        Some(PeerStatus::ControlOff) => Some(msg::remote_peer_control_off(lang)),
+        // 还没问到过，或者刚从名单上掉下去（这一帧的会话还是上一轮的）。
+        Some(PeerStatus::Connecting) | None => Some(msg::remote_peer_connecting(lang)),
+    }
+}
+
 /// 把标题下面那块分成三截：邀请码、列表、「我的电脑」。高度不够时先保
 /// 邀请码（码一位都不能丢），再给列表留至少一行，剩下的才给底部那一段。
 fn split(inner: Rect, prompt: usize, section: usize) -> (Rect, Rect, Rect) {
@@ -386,6 +587,7 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+            machine: None,
         }
     }
 
@@ -1141,6 +1343,7 @@ mod tests {
                     is_agent: true,
                     tag: String::new(),
                     last_active_ms: 0,
+                    machine: None,
                 })
                 .collect(),
         );
@@ -1332,5 +1535,228 @@ mod tests {
         assert!(row.trim_end().ends_with("✉ 3"), "{row:?}");
         assert!(row.contains("  1  "), "是会话 #1 那一行：{row:?}");
         assert_eq!(rows(&term).iter().filter(|l| l.contains('✉')).count(), 1);
+    }
+
+    // —— 远程操作：别的电脑的组、K、在别的电脑上开会话 ——
+
+    use super::super::remote::{test_support, PeerStatus, REMOTE_BASE};
+    use crate::proto::{Request, Response};
+
+    fn on(id: u32, dir: &str, machine: &str) -> SessionInfo {
+        SessionInfo {
+            machine: Some(machine.into()),
+            ..sess(id, dir)
+        }
+    }
+
+    /// 那台电脑问不到：组照样在（会话不从看板上抹掉），组头写「离线」，
+    /// 整组灰掉。没开远程操作的那台同理，写「没开远程操作」——哪怕它一个
+    /// 会话都报不上来。
+    #[test]
+    fn an_offline_machine_group_is_dimmed_and_labelled() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        app.remote.peers = vec![
+            ("mac".into(), PeerStatus::Offline),
+            ("pc".into(), PeerStatus::ControlOff),
+        ];
+        app.set_sessions(vec![sess(1, &proj), on(REMOTE_BASE, "/r/work", "mac")]);
+        let mut term = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+
+        // CJK 字后面那一格是空白，比之前先洗掉。
+        let squash = |r: String| r.replace(' ', "");
+        let header = squash(row_with(&term, "mac"));
+        assert!(header.contains("离线"), "{header:?}");
+        let pc = squash(row_with(&term, "pc"));
+        assert!(pc.contains("没开远程操作"), "空组也画出来并说明原因：{pc:?}");
+        let session = row_with(&term, "/r/work");
+        assert!(
+            session.contains(&REMOTE_BASE.to_string()),
+            "会话还在，行里写着它的项目路径：{session:?}"
+        );
+
+        // 组头上电脑名那几格是灰的；本机那一组不是。
+        let buf = term.backend().buffer();
+        let cell_of = |word: &str| {
+            let y = (0..14)
+                .find(|y| {
+                    (0..100)
+                        .filter_map(|x| buf.cell((x, *y)).map(|c| c.symbol().to_string()))
+                        .collect::<String>()
+                        .contains(word)
+                })
+                .unwrap();
+            let x = (0..100)
+                .find(|x| buf.cell((*x, y)).is_some_and(|c| c.symbol() == &word[..1]))
+                .unwrap();
+            buf.cell((x, y)).unwrap().clone()
+        };
+        let dimmed = crate::ui::dim();
+        let mac = cell_of("mac");
+        assert!(
+            mac.style().add_modifier.contains(dimmed.add_modifier),
+            "{:?}",
+            mac.style()
+        );
+        let local = cell_of("proj");
+        assert!(
+            !local.style().add_modifier.contains(Modifier::DIM),
+            "本机组不灰：{:?}",
+            local.style()
+        );
+
+        // 在线了就不写也不灰。
+        app.remote.peers = vec![("mac".into(), PeerStatus::Online)];
+        app.refresh_rows();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let header = squash(row_with(&term, "mac"));
+        assert!(!header.contains("离线"), "{header:?}");
+    }
+
+    /// `K`：关掉「允许我的其他电脑远程操作」（本机后台收到 `set: Some(false)`），
+    /// 底栏说断开了谁。
+    #[test]
+    fn k_turns_remote_control_off() {
+        let (router, seen) = test_support::router(
+            |req| match req {
+                Request::RemoteControl { .. } => Response::RemoteControl {
+                    on: false,
+                    viewers: vec![],
+                },
+                _ => Response::Ok,
+            },
+            |_| Response::Ok,
+        );
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(router);
+        app.remote.viewers = vec!["Mac".into()];
+        app.remote.on = Some(true);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT)).unwrap();
+        assert!(
+            seen.local
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == "RemoteControl { set: Some(false) }"),
+            "{:?}",
+            seen.local.lock().unwrap()
+        );
+        assert_eq!(app.message.text, "已断开 Mac，远程操作已关");
+        assert_eq!(app.remote.on, Some(false));
+        assert!(app.remote.viewers.is_empty(), "提示马上熄掉");
+    }
+
+    /// 光标在别的电脑的会话上按 `n`：在**那台**电脑上照着它开一个（同一个
+    /// 项目、同一个 agent）——那台电脑收到 `Create`，本机后台什么都没收到。
+    #[test]
+    fn n_on_a_remote_group_creates_on_that_machine() {
+        let (mut router, seen) = test_support::router(
+            |req| match req {
+                Request::List => Response::Sessions(vec![]),
+                _ => Response::Ok,
+            },
+            |req| match req {
+                Request::List => Response::Sessions(vec![]),
+                Request::Create { .. } => Response::Created { id: 7 },
+                _ => Response::Ok,
+            },
+        );
+        router.set_peers(&["mac".to_string()]);
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(router);
+        app.remote.peers = vec![("mac".into(), PeerStatus::Online)];
+        app.set_sessions(vec![on(REMOTE_BASE, "/r/work", "mac")]);
+        // 第 0 行是 mac 的组头，第 1 行是它的会话。
+        app.list_state.select(Some(1));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.message.text, "正在 mac 上开会话…");
+        assert!(
+            crate::client::wait_up_to(std::time::Duration::from_secs(5), || {
+                seen.remote
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.starts_with("mac Create") && r.contains("/r/work"))
+            }),
+            "{:?}",
+            seen.remote.lock().unwrap()
+        );
+        assert!(
+            !seen.local.lock().unwrap().iter().any(|r| r.contains("Create")),
+            "本机后台不该收到 Create：{:?}",
+            seen.local.lock().unwrap()
+        );
+    }
+
+    /// 停在别的电脑的组头上按 `n`：开选择框，项目来自那台电脑的 `Projects`；
+    /// 挑完项目挑 agent，Enter 之后在那台电脑上开。
+    #[test]
+    fn n_on_a_remote_header_picks_from_that_machines_projects() {
+        let (mut router, seen) = test_support::router(
+            |req| match req {
+                Request::List => Response::Sessions(vec![]),
+                _ => Response::Ok,
+            },
+            |req| match req {
+                Request::List => Response::Sessions(vec![]),
+                Request::Projects => Response::Projects {
+                    recent: vec!["/r/a".into(), "/r/b".into()],
+                    pinned: vec![],
+                },
+                Request::Profiles { .. } => Response::Profiles {
+                    entries: vec![crate::proto::ProfileEntry {
+                        name: "claude".into(),
+                        label: "Claude".into(),
+                        note: String::new(),
+                        status: crate::profile::ProfileStatus::Ready,
+                        secret: None,
+                        install: None,
+                        login: None,
+                        has_secret: false,
+                        backend_only: false,
+                        pairable: false,
+                    }],
+                    warnings: vec![],
+                },
+                _ => Response::Ok,
+            },
+        );
+        router.set_peers(&["mac".to_string()]);
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(router);
+        app.remote.peers = vec![("mac".into(), PeerStatus::Online)];
+        app.refresh_rows();
+        app.list_state.select(Some(0));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)).unwrap();
+        assert!(matches!(app.view, View::PickRemote(_)));
+        // 等两份列表进了缓存。
+        assert!(crate::client::wait_up_to(
+            std::time::Duration::from_secs(5),
+            || {
+                let r = app.client.as_mut().unwrap();
+                r.remote_projects("mac").is_some() && r.remote_profiles("mac").is_some()
+            }
+        ));
+        let press = |app: &mut App, code| {
+            handle_remote_pick_key(app, KeyEvent::new(code, KeyModifiers::NONE)).unwrap()
+        };
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&app.view, View::PickRemote(p) if p.dir.as_deref() == Some("/r/b")),
+            "选中了第二个项目"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.view, View::Board), "排进去了就回看板");
+        assert!(crate::client::wait_up_to(
+            std::time::Duration::from_secs(5),
+            || seen
+                .remote
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.starts_with("mac Create") && r.contains("/r/b") && r.contains("claude"))
+        ));
     }
 }

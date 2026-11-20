@@ -364,6 +364,9 @@ mod tests {
             ) -> Result<Vec<u8>, crate::link::LinkError> {
                 Err(crate::link::LinkError::Unreachable)
             }
+            fn reply(&self, _: &str, _: u64, _: Vec<u8>) -> Result<(), crate::link::LinkError> {
+                unreachable!("这个测试不答远程调用")
+            }
         }
         let mesh = Mutex::new(Mesh::new(keys(1), "A".into(), None));
         let to: Vec<String> = (0..6).map(|i| format!("c-{i:020x}")).collect();
