@@ -759,6 +759,10 @@ pub struct SessionManager {
     instance: u64,
     /// 刚重启、还在后台一个个接回上次的会话。这期间不接受再一次重启。
     restoring: AtomicBool,
+    /// 接回之后还在盯「按 id 接回的会不会马上退出」（`watch_resumed_by_id`）。
+    /// 那段时间里它会拿掉死格子、再开一个顶上；常驻会话的看守这时也开，
+    /// 就会多出一个同名会话。
+    resume_watching: AtomicBool,
     /// 最近结束、已经从名册上抹掉的会话，见 `ended` 模块。只在内存里。
     recently_ended: Mutex<crate::ended::RecentlyEnded>,
 }
@@ -838,6 +842,15 @@ impl SessionManager {
         self.restoring.load(Ordering::SeqCst)
     }
 
+    /// 开/关「还在盯按 id 接回的会话」，见 `resume_watching` 字段。
+    pub fn set_resume_watching(&self, on: bool) {
+        self.resume_watching.store(on, Ordering::SeqCst);
+    }
+
+    pub fn is_resume_watching(&self) -> bool {
+        self.resume_watching.load(Ordering::SeqCst)
+    }
+
     /// 测试用：把 `ready_for_keys` 要等的三段时间改短，不用每条测试干等五秒。
     #[cfg(test)]
     pub fn set_type_waits_for_test(&self, spawn: Duration, idle: Duration, quiet: Duration) {
@@ -852,6 +865,7 @@ impl SessionManager {
             type_waits: Mutex::new((TYPE_AFTER_SPAWN, TYPE_AFTER_IDLE, TYPE_AFTER_QUIET)),
             instance: new_instance_id(),
             restoring: AtomicBool::new(false),
+            resume_watching: AtomicBool::new(false),
             recently_ended: Mutex::new(crate::ended::RecentlyEnded::default()),
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
@@ -1360,6 +1374,16 @@ impl SessionManager {
     /// `set_resume_skips` 是整份覆盖，会把启动时那批冲掉。
     pub fn push_resume_skip(&self, w: crate::proto::WarningCode) {
         recover(self.resume_skips.lock()).push(w);
+    }
+
+    /// 同 `push_resume_skip`，但名单上已经有一模一样的一句就不再追加。
+    /// 常驻会话的问题会来来去去（撞名的会话走了又来、坏配置修好又写坏），
+    /// 名单在后台活着时从不清空，每来一次追加一句，选择器里就越堆越多。
+    pub fn push_resume_skip_once(&self, w: crate::proto::WarningCode) {
+        let mut list = recover(self.resume_skips.lock());
+        if !list.contains(&w) {
+            list.push(w);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2308,6 +2332,35 @@ mod tests {
     ///
     /// 关键在最后一行：用 `--dangerously-skip-permissions` 起的 Claude Code
     /// 底栏常驻「bypass permissions on」，把 `? for shortcuts` 顶掉了。
+    /// 常驻会话的警告来来去去（撞名的会话走了又来、坏配置修好又写坏）：
+    /// 名单上已经有一模一样的那句就不再追加，不然选择器里同一句越堆越多。
+    #[test]
+    fn push_resume_skip_once_does_not_repeat_an_equal_warning() {
+        use crate::proto::{KeptSessionReason, WarningCode};
+        let mgr = SessionManager::new();
+        let w = |name: &str| WarningCode::KeptSessionProblem {
+            name: name.into(),
+            reason: KeptSessionReason::NameClash,
+        };
+        mgr.push_resume_skip_once(w("家教"));
+        mgr.push_resume_skip_once(w("家教"));
+        mgr.push_resume_skip_once(w("别的"));
+        assert_eq!(mgr.resume_skips(), vec![w("家教"), w("别的")]);
+        // 老的那个照旧每次都追加：接回线程的警告各是各的事
+        mgr.push_resume_skip(w("家教"));
+        assert_eq!(mgr.resume_skips().len(), 3);
+    }
+
+    #[test]
+    fn the_resume_watch_flag_starts_off_and_follows_set() {
+        let mgr = SessionManager::new();
+        assert!(!mgr.is_resume_watching());
+        mgr.set_resume_watching(true);
+        assert!(mgr.is_resume_watching());
+        mgr.set_resume_watching(false);
+        assert!(!mgr.is_resume_watching());
+    }
+
     const CLAUDE_WAITING_FOR_YOU: &str = "\
 ● 362 个测试全绿，clippy 干净，已提交并重装到 ~/.local/bin/dct。
 

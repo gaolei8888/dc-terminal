@@ -2777,6 +2777,83 @@ pub mod msg {
                     zh: format!("没能接回 {dir} 的「{profile}」会话：{why}。"),
                 )
             }
+            KeepEntryInvalid {
+                reason: crate::proto::KeepEntryProblem::KeepNotAnArray,
+                ..
+            } => t!(
+                lang,
+                en: "The always-on sessions in the settings file are not written correctly: each one should start with [[keep]]. None of them were used.".to_string(),
+                zh: "设置文件里的 keep 写法不对，每个常驻会话都应该以 [[keep]] 开头，所以一个都没用上。".to_string(),
+            ),
+            KeepEntryInvalid { index, reason } => {
+                let why = match reason {
+                    crate::proto::KeepEntryProblem::MissingField(f) => t!(
+                        lang,
+                        en: format!("the “{f}” line is missing or wrong"),
+                        zh: format!("「{f}」没写或者写得不对"),
+                    ),
+                    crate::proto::KeepEntryProblem::EmptyName => t!(
+                        lang,
+                        en: "its name is empty".to_string(),
+                        zh: "名字是空的".to_string(),
+                    ),
+                    crate::proto::KeepEntryProblem::DuplicateName(n) => t!(
+                        lang,
+                        en: format!("the name “{n}” is already used by an earlier entry"),
+                        zh: format!("名字「{n}」前面已经用过了"),
+                    ),
+                    crate::proto::KeepEntryProblem::DirNotAbsolute => t!(
+                        lang,
+                        en: "the folder must be a full path or start with ~/".to_string(),
+                        zh: "文件夹要写完整路径或 ~/ 开头".to_string(),
+                    ),
+                    crate::proto::KeepEntryProblem::NotATable
+                    | crate::proto::KeepEntryProblem::KeepNotAnArray => t!(
+                        lang,
+                        en: "it is not written as an entry".to_string(),
+                        zh: "格式不对".to_string(),
+                    ),
+                };
+                t!(
+                    lang,
+                    en: format!("Skipped entry {index} of the always-on sessions in the settings file: {why}."),
+                    zh: format!("设置文件里第 {index} 个常驻会话没能用上：{why}。"),
+                )
+            }
+            KeptSessionProblem { name, reason } => {
+                let why = match reason {
+                    crate::proto::KeptSessionReason::DirGone => t!(
+                        lang,
+                        en: "its folder no longer exists",
+                        zh: "它的目录已经不在了",
+                    ),
+                    crate::proto::KeptSessionReason::ProfileGone => t!(
+                        lang,
+                        en: "its agent is no longer available",
+                        zh: "它的 agent 已经不在了",
+                    ),
+                    crate::proto::KeptSessionReason::StartFailed => t!(
+                        lang,
+                        en: "it could not be started",
+                        zh: "没能启动",
+                    ),
+                    crate::proto::KeptSessionReason::CrashLooping => t!(
+                        lang,
+                        en: "it keeps stopping; dct keeps restarting it, waiting longer each time (up to 5 minutes)",
+                        zh: "它一直在停；dct 会继续重开，每次多等一会儿（最多等 5 分钟）",
+                    ),
+                    crate::proto::KeptSessionReason::NameClash => t!(
+                        lang,
+                        en: "another session already has that name",
+                        zh: "已经有别的会话用了这个名字",
+                    ),
+                };
+                t!(
+                    lang,
+                    en: format!("The always-on session “{name}” has a problem: {why}."),
+                    zh: format!("常驻会话「{name}」出了问题：{why}。"),
+                )
+            }
             HeldMessageDropped { dir } => t!(
                 lang,
                 en: format!(
@@ -3795,6 +3872,50 @@ mod tests {
             },
             HandoffMissing {
                 dir: "/w/dc-terminal".into(),
+            },
+            KeepEntryInvalid {
+                index: 2,
+                reason: crate::proto::KeepEntryProblem::MissingField("profile".into()),
+            },
+            KeepEntryInvalid {
+                index: 1,
+                reason: crate::proto::KeepEntryProblem::EmptyName,
+            },
+            KeepEntryInvalid {
+                index: 3,
+                reason: crate::proto::KeepEntryProblem::DuplicateName("a".into()),
+            },
+            KeepEntryInvalid {
+                index: 2,
+                reason: crate::proto::KeepEntryProblem::NotATable,
+            },
+            KeepEntryInvalid {
+                index: 1,
+                reason: crate::proto::KeepEntryProblem::DirNotAbsolute,
+            },
+            KeepEntryInvalid {
+                index: 0,
+                reason: crate::proto::KeepEntryProblem::KeepNotAnArray,
+            },
+            KeptSessionProblem {
+                name: "a".into(),
+                reason: crate::proto::KeptSessionReason::DirGone,
+            },
+            KeptSessionProblem {
+                name: "a".into(),
+                reason: crate::proto::KeptSessionReason::ProfileGone,
+            },
+            KeptSessionProblem {
+                name: "a".into(),
+                reason: crate::proto::KeptSessionReason::StartFailed,
+            },
+            KeptSessionProblem {
+                name: "a".into(),
+                reason: crate::proto::KeptSessionReason::CrashLooping,
+            },
+            KeptSessionProblem {
+                name: "a".into(),
+                reason: crate::proto::KeptSessionReason::NameClash,
             },
         ];
         for c in &codes {
