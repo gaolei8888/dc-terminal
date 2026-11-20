@@ -399,15 +399,28 @@ impl Feed {
 
     /// 进队列，**前提是对方还是 `epoch` 那一代**——查和放在同一把锁里，
     /// 不然查完、放之前对方换了代，旧号的键就进了新一代的队列。
-    fn enqueue_in(&self, epoch: u32, op: Op) -> bool {
+    ///
+    /// 按键（不带答复的那些）还要看对方此刻的状态：离线、没开远程，当场
+    /// 拒掉，不排队。离线时排着的键要等退避过去（最长 `backoff_max`）才发，
+    /// 那时对方画面早变了，用户也早以为它们没了——同 `FeedEvent::KeysLost`
+    /// 「清空比稍后一股脑打进去安全」。新建、停止这些各自独立、有答复，
+    /// 照常排队。
+    fn enqueue_in(&self, epoch: u32, op: Op) -> Enqueued {
         let mut st = self.lock();
         if st.epoch != epoch {
-            return false;
+            return Enqueued::Retired;
+        }
+        if op.answer_of().is_none() {
+            match st.status {
+                PeerStatus::Offline => return Enqueued::Offline,
+                PeerStatus::ControlOff => return Enqueued::ControlOff,
+                PeerStatus::Connecting | PeerStatus::Online => {}
+            }
         }
         st.queue.push_back(op);
         drop(st);
         self.shared.wake.notify_all();
-        true
+        Enqueued::Queued
     }
 
     /// 第 `epoch` 代、真号 `id` 的画面是多久以前取回来的；还没取到过、或者
@@ -423,6 +436,18 @@ impl Feed {
     pub fn status(&self) -> PeerStatus {
         self.lock().status
     }
+}
+
+/// `Feed::enqueue_in` 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Enqueued {
+    Queued,
+    /// 那一代已经作废（对方重启过）。
+    Retired,
+    /// 按键，而对方此刻离线。
+    Offline,
+    /// 按键，而对方没开远程。
+    ControlOff,
 }
 
 impl Drop for Feed {
@@ -909,7 +934,8 @@ impl Router {
         })?;
         // 新建不指名会话，哪一代都一样。
         let epoch = feed.lock().epoch;
-        feed.enqueue_in(epoch, Op::new(0, OpKind::Create { dir, profile }));
+        // 新建不看对方状态，一定排得进去（见 `enqueue_in`）。
+        let _ = feed.enqueue_in(epoch, Op::new(0, OpKind::Create { dir, profile }));
         Ok(())
     }
 
@@ -1022,14 +1048,21 @@ impl Router {
                 peer: peer.to_string(),
             });
         };
-        if feed.enqueue_in(epoch, Op::new(real, kind)) {
-            return Response::Ok;
-        }
-        // 作废的号（对方重启过）：一个键都不发。答复里带「会话没了」，
-        // 再报一条事件——滚轮、鼠标这些调用点是不看答复的。
-        let code = ErrorCode::NoSuchSession(id);
+        // 没排进去的，答复里说为什么，再报一条事件——滚轮、鼠标这些调用点
+        // 是不看答复的。
+        let peer = peer.to_string();
+        let code = match feed.enqueue_in(epoch, Op::new(real, kind)) {
+            Enqueued::Queued => return Response::Ok,
+            // 作废的号（对方重启过）：一个键都不发。
+            Enqueued::Retired => ErrorCode::NoSuchSession(id),
+            Enqueued::ControlOff => ErrorCode::RemoteControlOff,
+            Enqueued::Offline => {
+                self.events.push(FeedEvent::KeysLost { peer: peer.clone() });
+                return Response::Error(ErrorCode::RemoteUnavailable { peer });
+            }
+        };
         self.events.push(FeedEvent::Refused {
-            peer: peer.to_string(),
+            peer,
             code: code.clone(),
         });
         Response::Error(code)
@@ -1538,8 +1571,13 @@ mod tests {
             "一次失败就清空，回车不能在清空之后再被打进去"
         );
 
-        // 清空之后队列重新可用：下一条照常送到
+        // 清空之后队列重新可用：对方回到在线（离线时的键当场拒，见
+        // `keys_typed_while_a_peer_is_offline_are_refused_not_held`），下一条照常送到
         refuse.store(false, Ordering::SeqCst);
+        assert!(wait_up_to(Duration::from_secs(5), || rig
+            .router
+            .status("mac")
+            == Some(PeerStatus::Online)));
         rig.router
             .call(Request::Input {
                 id,
@@ -1552,6 +1590,140 @@ mod tests {
         .last()
         .is_some_and(|s| s.contains("\"z\""))));
         assert_eq!(inputs(&rig.remote_seen).len(), 2);
+    }
+
+    /// 对方离线时打的键当场拒掉、报丢键，不排着等退避过去——不然对方一回来，
+    /// 这些键就晚几十秒一股脑打进那时候的画面里。新建/停止这类照常排队。
+    #[test]
+    fn keys_typed_while_a_peer_is_offline_are_refused_not_held() {
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = down.clone();
+        let r = remote(move |req| {
+            if d.load(Ordering::SeqCst) {
+                return Ok(Response::Error(ErrorCode::RemoteUnavailable {
+                    peer: "mac".into(),
+                }));
+            }
+            Ok(match req {
+                Request::List => Response::Sessions(vec![sess(7, "/r")]),
+                _ => Response::Ok,
+            })
+        });
+        let instance = r.instance.clone();
+        let mut pace = fast();
+        // 退避够长，打字时对方一定还标着离线。
+        pace.backoff_min = Duration::from_millis(300);
+        pace.backoff_max = Duration::from_millis(300);
+        let mut rig = rig(vec![], r, pace);
+        rig.router.set_peers(&["mac".to_string()]);
+        let id = first_remote_id(&mut rig.router, "mac");
+        rig.router.take_events();
+
+        down.store(true, Ordering::SeqCst);
+        instance.store(0, Ordering::SeqCst);
+        assert!(wait_up_to(Duration::from_secs(5), || rig
+            .router
+            .status("mac")
+            == Some(PeerStatus::Offline)));
+        let typed = rig
+            .router
+            .call(Request::Input {
+                id,
+                text: "y".into(),
+            })
+            .unwrap();
+        assert!(
+            matches!(typed, Response::Error(ErrorCode::RemoteUnavailable { ref peer }) if peer == "mac"),
+            "{typed:?}"
+        );
+        rig.router
+            .call(Request::Key {
+                id,
+                name: "Enter".into(),
+            })
+            .unwrap();
+        let events = rig.router.take_events();
+        assert!(
+            !events.is_empty()
+                && events
+                    .iter()
+                    .all(|e| matches!(e, FeedEvent::KeysLost { peer } if peer == "mac")),
+            "离线时打的键当场报丢：{events:?}"
+        );
+        // 管理类照常排队：答复（成也好败也好）经事件回来。
+        assert!(matches!(
+            rig.router.call(Request::Stop { id }).unwrap(),
+            Response::Ok
+        ));
+
+        down.store(false, Ordering::SeqCst);
+        instance.store(1, Ordering::SeqCst);
+        let mut events = Vec::new();
+        assert!(wait_up_to(Duration::from_secs(5), || {
+            events.extend(rig.router.take_events());
+            rig.router.status("mac") == Some(PeerStatus::Online)
+                && events
+                    .iter()
+                    .any(|e| matches!(e, FeedEvent::Answer { of: AnswerOf::Stop, .. }))
+        }));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            inputs(&rig.remote_seen)
+                .iter()
+                .all(|s| !s.starts_with("Input") && !s.starts_with("Key")),
+            "离线时打的键恢复之后也不许送过去：{:?}",
+            inputs(&rig.remote_seen)
+        );
+    }
+
+    /// 对方没开远程：打的键当场拒（报「没开」），一条都不发过去。
+    #[test]
+    fn keys_typed_while_a_peer_has_control_off_are_refused_locally() {
+        let lists = Arc::new(AtomicUsize::new(0));
+        let l = lists.clone();
+        let r = remote(move |req| match req {
+            // 第一次给列表（好拿到号），之后都是「没开」。
+            Request::List if l.fetch_add(1, Ordering::SeqCst) == 0 => {
+                Ok(Response::Sessions(vec![sess(7, "/r")]))
+            }
+            _ => Ok(Response::Error(ErrorCode::RemoteControlOff)),
+        });
+        let mut pace = fast();
+        // 一轮先问开机编号（答得上来就标在线）再取列表；隔开一点，
+        // 打字时稳稳落在「没开」那一段里。
+        pace.list_every = Duration::from_millis(300);
+        let mut rig = rig(vec![], r, pace);
+        rig.router.set_peers(&["mac".to_string()]);
+        let id = first_remote_id(&mut rig.router, "mac");
+        assert!(wait_up_to(Duration::from_secs(5), || rig
+            .router
+            .status("mac")
+            == Some(PeerStatus::ControlOff)));
+        let typed = rig
+            .router
+            .call(Request::Input {
+                id,
+                text: "y".into(),
+            })
+            .unwrap();
+        assert!(
+            matches!(typed, Response::Error(ErrorCode::RemoteControlOff)),
+            "{typed:?}"
+        );
+        let events = rig.router.take_events();
+        assert!(
+            matches!(
+                &events[..],
+                [FeedEvent::Refused { peer, code: ErrorCode::RemoteControlOff }] if peer == "mac"
+            ),
+            "{events:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            inputs(&rig.remote_seen).is_empty(),
+            "{:?}",
+            inputs(&rig.remote_seen)
+        );
     }
 
     /// 新建失败不重发：守护进程那一次里已经同 `seq` 试过三次，再发可能

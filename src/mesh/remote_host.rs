@@ -35,6 +35,13 @@ pub const PRESENCE_WINDOW: Duration = Duration::from_secs(10);
 /// 几十条足够盖住；再旧的 `seq` 回「不可用」，不再执行。
 pub const ANSWER_CACHE: usize = 64;
 
+/// 动手、管理类的调用排了这么久还没轮到，就不执行了：操作方最多问
+/// `REMOTE_CALL_ATTEMPTS` 次、每次等 `CALL_TIMEOUT`，过了这个时间它早已
+/// 放弃，跟用户说了「没送到」，用户多半已经重打了一遍。这时候再执行，
+/// 同样的字就打了两遍（或者打进了用户以为没送到之后的画面里）。
+pub const STALE_AFTER: Duration =
+    super::net::CALL_TIMEOUT.saturating_mul(super::REMOTE_CALL_ATTEMPTS as u32);
+
 /// 工作线程闲多久就退出（下一条调用来了再起）。
 const IDLE_EXIT: Duration = Duration::from_secs(30);
 
@@ -71,6 +78,8 @@ struct Job {
     req: Request,
     waiters: Vec<Waiter>,
     me_name: String,
+    /// 第一次收下的时刻（同 `seq` 的重试不刷新）：过没过 `STALE_AFTER` 按它算。
+    accepted: Instant,
 }
 
 /// 一台操作方电脑在这里的全部账。
@@ -83,7 +92,8 @@ struct Controller {
     answers: VecDeque<(Waiter, String)>,
     /// 正在执行的那条的 `seq`，和它执行期间又来的同 `seq` 信封。
     running: Option<(u64, Vec<Waiter>)>,
-    /// 最近执行完的 `(seq, 答复 body)`，最多 `ANSWER_CACHE` 条。
+    /// 最近执行完的 `(seq, 答复 body)`，最多 `ANSWER_CACHE` 条。排过期
+    /// 没执行的（`is_stale`）也记在这里，答复是「不可用」。
     done: VecDeque<(u64, String)>,
     /// 从 `done` 里挤出去过的最大 `seq`。不在 `done` 里、又不大于它的
     /// `seq`，要么执行过、答复已经忘了，要么旧得离谱——一律不再执行。
@@ -124,6 +134,7 @@ impl Controller {
             req,
             waiters: vec![w],
             me_name,
+            accepted: Instant::now(),
         };
         if is_view(&job.req) {
             // 积压时同一种「看」只留最新一条：旧画面没人要了。被顶掉的当场
@@ -167,6 +178,15 @@ impl Controller {
 
 fn is_view(req: &Request) -> bool {
     remote::capability_of(req) == Some(Capability::View)
+}
+
+/// 这条动手/管理类调用排得比操作方的放弃时间还久，见 `STALE_AFTER`。
+/// 「看」不算：晚了也只是多取一张没人要的画面，不改任何东西。
+fn is_stale(job: &Job, now: Instant) -> bool {
+    matches!(
+        remote::capability_of(&job.req),
+        Some(Capability::Operate | Capability::Manage)
+    ) && now.saturating_duration_since(job.accepted) > STALE_AFTER
 }
 
 #[derive(Default)]
@@ -325,6 +345,18 @@ fn work(shared: Arc<Shared>, from: String) {
                     break Next::Send(w, body);
                 }
                 if let Some(job) = c.queue.pop_front() {
+                    if is_stale(&job, Instant::now()) {
+                        // 操作方早放弃了：不执行，答「不可用」。记进 `done`——
+                        // 同一个 `seq` 再来（晚到的重试）照样回「不可用」，
+                        // 既不执行、也不会回一个成功。跟「执行过」走同一张表，
+                        // 「不丢、不重」那条规矩一处管。
+                        let body = unavailable(job.seq, &job.me_name);
+                        for w in job.waiters {
+                            c.answers.push_back((w, body.clone()));
+                        }
+                        c.remember(job.seq, body);
+                        continue;
+                    }
                     c.running = Some((job.seq, Vec::new()));
                     break Next::Run(job);
                 }
@@ -349,6 +381,7 @@ fn work(shared: Arc<Shared>, from: String) {
                 req,
                 waiters,
                 me_name,
+                ..
             }) => {
                 // 执行半路 panic 不能把这条线带走：`has_worker` 还标着，线一死
                 // 这台操作方电脑就再也没人服务了。
@@ -1093,6 +1126,74 @@ mod tests {
         ));
         rec.wait_for(n + 2);
         assert_eq!(inbox.remote_calls().len(), ran);
+    }
+
+    /// 排得太久的动手/管理类调用：操作方早已放弃、跟用户说了「没送到」，
+    /// 这里就不能再执行——答「不可用」、跳过；同一个 `seq` 再来也一样，
+    /// 不执行、不回成功。新排上的照常执行。
+    #[test]
+    fn a_job_queued_past_the_controllers_give_up_time_is_skipped() {
+        let (host, inbox, rec) = bare();
+        let (held, release) = hold_first(&inbox);
+        host.submit(call(1, Request::Hello));
+        wait_until(|| held.load(Ordering::SeqCst));
+        let key = |seq: u64| {
+            call(
+                seq,
+                Request::Input {
+                    id: 7,
+                    text: format!("k{seq}"),
+                },
+            )
+        };
+        host.submit(key(2));
+        host.submit(call(3, create()));
+        host.submit(key(4));
+        // 2、3 号排进来已经超过操作方的放弃时间；4 号是刚排上的。
+        {
+            let mut st = host.shared.state();
+            let c = st.controllers.get_mut("c-a").unwrap();
+            let old = Instant::now()
+                .checked_sub(STALE_AFTER + Duration::from_secs(1))
+                .expect("开机够久");
+            for j in c.queue.iter_mut().filter(|j| j.seq != 4) {
+                j.accepted = old;
+            }
+        }
+        release.store(true, Ordering::SeqCst);
+        rec.wait_for(4);
+        assert_eq!(
+            inbox.remote_calls(),
+            [
+                r#""Hello""#.to_string(),
+                r#"{"Input":{"id":7,"text":"k4"}}"#.into(),
+            ],
+            "过期的按键、新建都不执行，新的照常执行"
+        );
+        for s in [2, 3] {
+            assert!(
+                matches!(rec.answer(s).resp, Response::Error(ErrorCode::RemoteUnavailable { ref peer }) if peer == "B"),
+                "{s}: {:?}",
+                rec.answer(s).resp
+            );
+        }
+        assert!(matches!(rec.answer(4).resp, Response::Ok));
+
+        // 操作方（或者一封晚到的重试）再拿 2 号来：不执行，也不回成功。
+        host.submit(Call {
+            env_seq: 22,
+            ..key(2)
+        });
+        rec.wait_for(5);
+        assert!(
+            matches!(
+                rec.answer(22).resp,
+                Response::Error(ErrorCode::RemoteUnavailable { .. })
+            ),
+            "{:?}",
+            rec.answer(22).resp
+        );
+        assert_eq!(inbox.remote_calls().len(), 2, "过期跳过的号再来也不执行");
     }
 
     /// 执行半路 panic：答「不可用」，这条线还活着，下一条照常执行。
