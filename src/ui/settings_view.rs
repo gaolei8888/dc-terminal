@@ -29,6 +29,10 @@ pub(crate) enum SettingsItem {
     Theme,
     Phone,
     Web,
+    /// 「允许我的其他电脑远程操作」。**开关住在这里，不在 config.toml**：
+    /// 它只能从这台电脑自己改（`Origin::Local`），而设置页就是「这台电脑前
+    /// 的人亲手按下去」的那个地方。
+    RemoteControl,
 }
 
 impl SettingsItem {
@@ -38,6 +42,7 @@ impl SettingsItem {
             SettingsItem::Theme,
             SettingsItem::Phone,
             SettingsItem::Web,
+            SettingsItem::RemoteControl,
         ]
     }
 
@@ -53,6 +58,7 @@ impl SettingsItem {
             SettingsItem::Theme => text(Key::BarTheme, lang),
             SettingsItem::Phone => text(Key::Phone, lang),
             SettingsItem::Web => text(Key::WebSection, lang),
+            SettingsItem::RemoteControl => msg::remote_control_setting(lang),
         }
     }
 }
@@ -127,6 +133,10 @@ fn handle_top_key(app: &mut App, key: KeyEvent, mut state: ListState) -> Result<
             }
             Some(SettingsItem::Phone) => open_phone(app, state),
             Some(SettingsItem::Web) => open_web(app, state),
+            Some(SettingsItem::RemoteControl) => {
+                toggle_remote_control(app);
+                app.view = View::Settings { state, sub: None };
+            }
             None => {
                 app.view = View::Settings { state, sub: None };
             }
@@ -134,6 +144,39 @@ fn handle_top_key(app: &mut App, key: KeyEvent, mut state: ListState) -> Result<
         _ => app.view = View::Settings { state, sub: None },
     }
     Ok(())
+}
+
+/// 翻一下「允许我的其他电脑远程操作」。翻成什么以后台**现在**的值为准，
+/// 不拿 `App::remote.on` 那份 3 秒一刷的旧值去取反——那份可能刚被另一个
+/// 界面的 `K` 改过，取反就是把用户刚关掉的门又打开。
+fn toggle_remote_control(app: &mut App) {
+    let lang = app.lang;
+    let now = match app
+        .client()
+        .and_then(|c| c.call(Request::RemoteControl { set: None }))
+    {
+        Ok(Response::RemoteControl { on, .. }) => on,
+        Ok(Response::Error(ref e)) => {
+            app.message = Msg::err(msg::error(lang, e));
+            return;
+        }
+        _ => {
+            app.message = Msg::err(text(Key::RequestFailed, lang).into());
+            return;
+        }
+    };
+    app.message = match app
+        .client()
+        .and_then(|c| c.call(Request::RemoteControl { set: Some(!now) }))
+    {
+        Ok(Response::RemoteControl { on, viewers }) => {
+            app.remote.on = Some(on);
+            app.remote.viewers = viewers;
+            msg::remote_control_now(lang, on).into()
+        }
+        Ok(Response::Error(ref e)) => Msg::err(msg::error(lang, e)),
+        _ => Msg::err(text(Key::RequestFailed, lang).into()),
+    };
 }
 
 /// 拿一次当前的手机通知状态，进 `View::Phone`。拿不到就留在设置页给一句
@@ -259,7 +302,20 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 fn draw_settings_items(f: &mut Frame, area: Rect, app: &mut App, state: &ListState) {
     let items: Vec<ListItem> = SettingsItem::all()
         .iter()
-        .map(|item| ListItem::new(Line::from(Span::raw(item.label(app.lang)))))
+        .map(|item| {
+            let mut spans = vec![Span::raw(item.label(app.lang))];
+            // 开关的值就写在这一行后面：用户要知道按 Enter 之前它是什么样。
+            // 还没问到（`None`）就不写，不猜。
+            if *item == SettingsItem::RemoteControl {
+                if let Some(on) = app.remote.on {
+                    spans.push(Span::styled(
+                        format!("  {}", msg::remote_control_now(app.lang, on)),
+                        dim(),
+                    ));
+                }
+            }
+            ListItem::new(Line::from(spans))
+        })
         .collect();
 
     let mut s = state.clone();
@@ -802,5 +858,61 @@ mod tests {
             c.contains(env!("CARGO_PKG_VERSION")),
             "设置页第一行要印着运行中的版本号：{c}"
         );
+    }
+
+    /// 「允许我的其他电脑远程操作」：在设置页里，值写在这一行后面；Enter
+    /// 按后台**现在**的值翻（不拿界面手里那份旧值取反）。
+    #[test]
+    fn the_remote_control_switch_lives_here_and_flips_what_the_daemon_has() {
+        let on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let daemon = on.clone();
+        let (router, seen) = super::super::remote::test_support::router(
+            move |req| match req {
+                Request::RemoteControl { set } => {
+                    if let Some(v) = set {
+                        daemon.store(*v, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Response::RemoteControl {
+                        on: daemon.load(std::sync::atomic::Ordering::SeqCst),
+                        viewers: vec![],
+                    }
+                }
+                _ => Response::Ok,
+            },
+            |_| Response::Ok,
+        );
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(router);
+        // 界面手里那份是 3 秒前的旧值「开」，后台其实已经关了。
+        app.remote.on = Some(true);
+        on_settings_item(&mut app, SettingsItem::RemoteControl);
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(on.load(std::sync::atomic::Ordering::SeqCst), "关着的翻成开");
+        assert!(seen
+            .local
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r == "RemoteControl { set: Some(true) }"));
+        assert_eq!(app.remote.on, Some(true));
+        assert_eq!(app.message.text, "远程操作已开");
+        assert!(matches!(app.view, View::Settings { sub: None, .. }), "留在设置页");
+
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let c: String = buf
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(c.contains("允许我的其他电脑远程操作远程操作已开"), "{c}");
+
+        handle_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(!on.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(app.message.text, "远程操作已关");
     }
 }

@@ -151,6 +151,8 @@ pub(crate) enum View {
         no_git: bool,
     },
     PickProject(ProjectPicker),
+    /// 在别的电脑上开会话：先挑那台电脑上的项目，再挑 agent。见 `RemotePick`。
+    PickRemote(RemotePick),
     /// 设置页：一张「设置项」列表（`SettingsItem`，见 `settings_view.rs`），
     /// 不再是纯语言列表——语言现在是列表里的一项，选中它才进语言子列表。
     /// 跟 `Secrets` 分开是两码事——那边管的是「哪个 agent 用哪把密钥」，
@@ -268,6 +270,24 @@ pub(crate) enum View {
         /// 对第一天上课的人来说，那正是他判定「这东西没弄好」的地方。
         return_to: PairReturn,
     },
+}
+
+/// 在别的电脑上开会话的选择框（`n`/`N` 落在别的电脑的组上，见
+/// `board::open_remote`）。
+///
+/// **不复用 `PickProject`/`PickProfile`**：那两屏的每一步都长在本机上
+/// （浏览本机文件夹、判本机 git、填本机密钥、配对），换到别的电脑上一半的
+/// 键按下去都是错的。远程这一期只能开在对方**已有的**项目里（spec 第 2 节，
+/// `Create.dir` 必须在对方 `Projects` 里），用不上那些。
+///
+/// 列表本身不存在这里：项目和 agent 都是 `Router` 从对方取回来的缓存，每帧
+/// 现读（`Router::remote_projects`/`remote_profiles`），取回来之前画「正在要」。
+#[derive(Clone, Debug)]
+pub(crate) struct RemotePick {
+    pub peer: String,
+    /// `None` = 还在挑项目；`Some` = 项目挑好了，在挑 agent。
+    pub dir: Option<String>,
+    pub state: ListState,
 }
 
 /// 配对成功之后回哪儿。哪条路把学生领进配对屏，就由哪条路决定终点。
@@ -1039,6 +1059,18 @@ pub(crate) struct ProjectGroup {
     /// `x` 只能移除 pinned 且**没有在跑的会话**的组（`mod.rs::unpin_current`）。
     pub pinned: bool,
     pub collapsed: bool,
+    /// 别的电脑的组：`Some(电脑名)`。**一台电脑一个组**，不按项目分——组头写
+    /// 电脑名，项目路径写在会话行里（spec 第 4 节）。这时候 `dir` 只是个分组键
+    /// （见 `remote_group_key`），不是这台电脑上的路径，凡是要本机目录的地方
+    /// 都得先问这个字段。
+    pub machine: Option<String>,
+}
+
+/// 别的电脑那一组的分组键。**故意不是绝对路径**：本机组的键全是 canon 过的
+/// 绝对路径，两边永远撞不上；万一哪处漏判 `machine` 把它当目录用了，它也
+/// 指不到这台电脑上任何一个真实存在的项目。
+pub(crate) fn remote_group_key(machine: &str) -> PathBuf {
+    PathBuf::from(format!("dct-remote:{machine}"))
 }
 
 impl ProjectGroup {
@@ -1112,7 +1144,50 @@ impl ProjectGroup {
 /// 使用时间的排序，都会让行在用户没按键的时候移动，而「项目在我没
 /// 按键的时候变了」正是这一版要消灭的东西。组内会话按 `id` 升序，
 /// 同一个理由。
+///
+/// **别的电脑上的会话**（`machine` 有值）不进上面这套：一台电脑一个组，排在
+/// 本机所有组之后，按电脑名排（`peers` 里的每一台都有一组，哪怕一个会话都
+/// 没有——组头要写着它为什么是空的）。
 pub(crate) fn group_sessions(
+    sessions: &[crate::session::SessionInfo],
+    pinned: &[String],
+    profiles: &BTreeMap<String, String>,
+    peers: &[String],
+) -> Vec<ProjectGroup> {
+    let (local, remote): (Vec<_>, Vec<_>) = sessions
+        .iter()
+        .cloned()
+        .partition(|s| s.machine.is_none());
+    let mut groups = group_local_sessions(&local, pinned, profiles);
+    let mut machines: BTreeMap<String, Vec<crate::session::SessionInfo>> = peers
+        .iter()
+        .map(|p| (p.clone(), Vec::new()))
+        .collect();
+    for s in remote {
+        let name = s.machine.clone().unwrap_or_default();
+        machines.entry(name).or_default().push(s);
+    }
+    groups.extend(machines.into_iter().map(|(name, mut sessions)| {
+        sessions.sort_by_key(|s| s.id);
+        ProjectGroup {
+            dir: remote_group_key(&name),
+            display_dir: remote_group_key(&name),
+            name: name.clone(),
+            parent: String::new(),
+            sessions,
+            last_profile: None,
+            // 算作 pinned：组留不留由电脑在不在名单上决定，光标落上去时也
+            // 不该替它去本机后台 `PinProject` 一条假路径（`pin_cursor_group`）。
+            pinned: true,
+            collapsed: false,
+            machine: Some(name),
+        }
+    }));
+    groups
+}
+
+/// 本机会话的分组，规则见 `group_sessions`。
+fn group_local_sessions(
     sessions: &[crate::session::SessionInfo],
     pinned: &[String],
     profiles: &BTreeMap<String, String>,
@@ -1200,6 +1275,7 @@ pub(crate) fn group_sessions(
                 last_profile,
                 pinned,
                 collapsed: false,
+                machine: None,
             }
         })
         .collect()
@@ -1399,6 +1475,8 @@ pub(crate) fn escape_hint(view: &View, lang: Lang) -> String {
         View::Grid { .. } => format!("q {}", text(Key::Quit, lang)),
         // 全部按键浮层：`q` 在这里只是一张表上的一个字母，写「q 退出」是假的。
         View::Keys { .. } => format!("Esc {}", text(Key::Back, lang)),
+        // 在别的电脑上开会话：挑 agent 那一步 Esc 退回挑项目，不是回看板。
+        View::PickRemote(p) if p.dir.is_some() => format!("Esc {}", text(Key::Back, lang)),
         // 会话视图是唯一一个不写 Esc 的地方：Esc 必须原样发给 agent
         // （Claude Code 靠它取消/清空/关弹窗），所以逃生键是 F2，由
         // `attach.rs` 自己吃掉。其余视图没有 F2，不能照抄这句。
@@ -1782,6 +1860,14 @@ fn idle_help_for_terminal(view: &View, lang: Lang, ctx: HelpCtx, browser: bool) 
                 ("Enter", Key::Edit),
                 ("d", Key::Delete),
                 ("Esc", Key::Back),
+            ],
+            lang,
+        ),
+        View::PickRemote(_) => help_items(
+            &[
+                ("↑↓", Key::Select),
+                ("Enter", Key::Confirm),
+                ("Esc", Key::Cancel),
             ],
             lang,
         ),
@@ -3386,7 +3472,7 @@ mod tests {
             si(2, "/w/a", "codex"),
             si(5, "/w/a", "claude"),
         ];
-        let g = group_sessions(&all, &[], &BTreeMap::new());
+        let g = group_sessions(&all, &[], &BTreeMap::new(), &[]);
 
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].dir, PathBuf::from("/w/a"));
@@ -3398,11 +3484,45 @@ mod tests {
         );
     }
 
+    /// 别的电脑上的会话：一台电脑一组，组名是电脑名，排在本机所有组之后；
+    /// 名单上的电脑哪怕一个会话都没有也有一组（组头要写着它为什么空）。
+    #[test]
+    fn remote_sessions_group_under_their_machine_after_local_ones() {
+        let on = |id: u32, dir: &str, machine: &str| crate::session::SessionInfo {
+            machine: Some(machine.into()),
+            ..si(id, dir, "claude")
+        };
+        let base = crate::ui::remote::REMOTE_BASE;
+        let all = vec![
+            on(base + 1, "/z/proj", "mac"),
+            si(3, "/w/b", "claude"),
+            on(base, "/a/other", "mac"),
+            si(1, "/w/a", "claude"),
+        ];
+        let peers = vec!["mac".to_string(), "pc".to_string()];
+        let g = group_sessions(&all, &[], &BTreeMap::new(), &peers);
+
+        let names: Vec<&str> = g.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "mac", "pc"], "本机在前，别的电脑按名字在后");
+        assert_eq!(g[2].machine.as_deref(), Some("mac"));
+        assert_eq!(g[0].machine, None);
+        assert_eq!(
+            g[2].sessions.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![base, base + 1],
+            "不同项目的会话都在同一台电脑的组里，按 id 排"
+        );
+        assert!(g[3].sessions.is_empty(), "没有会话的电脑也有一组");
+        assert!(
+            !g[2].dir.is_absolute(),
+            "分组键撞不上本机任何一个项目路径"
+        );
+    }
+
     /// 规则 1：看板上的项目 = 有会话的 ∪ pinned 的。pinned 但没有会话的
     /// 项目必须以空组出现，否则光标没地方落、`n` 无处可去。
     #[test]
     fn a_pinned_project_with_no_sessions_still_gets_a_group() {
-        let g = group_sessions(&[], &["/w/empty".to_string()], &BTreeMap::new());
+        let g = group_sessions(&[], &["/w/empty".to_string()], &BTreeMap::new(), &[]);
 
         assert_eq!(g.len(), 1);
         assert!(g[0].sessions.is_empty());
@@ -3412,7 +3532,7 @@ mod tests {
     #[test]
     fn a_project_that_is_both_pinned_and_busy_appears_once() {
         let all = vec![si(1, "/w/a", "claude")];
-        let g = group_sessions(&all, &["/w/a".to_string()], &BTreeMap::new());
+        let g = group_sessions(&all, &["/w/a".to_string()], &BTreeMap::new(), &[]);
 
         assert_eq!(g.len(), 1, "pinned 和有会话是并集，不是两行");
         assert!(g[0].pinned);
@@ -3427,7 +3547,7 @@ mod tests {
             si(3, "/w/a", "codex"),
         ];
         all[2].state = SessionState::Failed;
-        let g = group_sessions(&all, &[], &BTreeMap::new());
+        let g = group_sessions(&all, &[], &BTreeMap::new(), &[]);
 
         assert_eq!(
             g[0].agent_counts(),
@@ -3441,14 +3561,14 @@ mod tests {
     fn a_group_carries_the_agent_that_project_used_last() {
         let mut profiles = BTreeMap::new();
         profiles.insert("/w/a".to_string(), "kimi".to_string());
-        let g = group_sessions(&[], &["/w/a".to_string()], &profiles);
+        let g = group_sessions(&[], &["/w/a".to_string()], &profiles, &[]);
 
         assert_eq!(g[0].last_profile.as_deref(), Some("kimi"));
     }
 
     #[test]
     fn the_name_is_the_last_path_component_and_the_parent_is_shortened() {
-        let g = group_sessions(&[], &["/w/dc/dc-terminal".to_string()], &BTreeMap::new());
+        let g = group_sessions(&[], &["/w/dc/dc-terminal".to_string()], &BTreeMap::new(), &[]);
 
         assert_eq!(g[0].name, "dc-terminal");
         assert_eq!(g[0].parent, "/w/dc");
@@ -3456,7 +3576,7 @@ mod tests {
 
     #[test]
     fn grouping_nothing_at_all_yields_nothing() {
-        assert!(group_sessions(&[], &[], &BTreeMap::new()).is_empty());
+        assert!(group_sessions(&[], &[], &BTreeMap::new(), &[]).is_empty());
     }
 
     /// `canon()` 自己的文档写得很清楚：归一化只能用来比较，不能用来显示——
@@ -3479,7 +3599,7 @@ mod tests {
 
         // 会话的 dir 是用户敲的那条链接路径，不是解析后的真实路径。
         let all = vec![si(1, &link.display().to_string(), "claude")];
-        let g = group_sessions(&all, &[], &BTreeMap::new());
+        let g = group_sessions(&all, &[], &BTreeMap::new(), &[]);
 
         assert_eq!(g.len(), 1);
         // 分组/比较键必须是归一化后的真实路径。
@@ -3516,7 +3636,7 @@ mod tests {
             si(1, &real.display().to_string(), "claude"),
             si(2, &link.display().to_string(), "claude"),
         ];
-        let g = group_sessions(&all, &[], &BTreeMap::new());
+        let g = group_sessions(&all, &[], &BTreeMap::new(), &[]);
 
         assert_eq!(g.len(), 1, "两种拼法指的是同一个项目，不能劈成两组");
         assert_eq!(
@@ -3525,14 +3645,14 @@ mod tests {
             "两个会话都要归在这一个组底下"
         );
         // pinned 那一半同样要认得出：pin 的是链接、会话是用真实路径建的
-        let g = group_sessions(&all, &[link.display().to_string()], &BTreeMap::new());
+        let g = group_sessions(&all, &[link.display().to_string()], &BTreeMap::new(), &[]);
         assert_eq!(g.len(), 1, "pin 的拼法跟会话的拼法不同，也是同一个项目");
         assert!(g[0].pinned);
     }
 
     fn grp(dir: &str, ids: &[u32]) -> ProjectGroup {
         let sessions: Vec<_> = ids.iter().map(|i| si(*i, dir, "claude")).collect();
-        let mut g = group_sessions(&sessions, &[dir.to_string()], &BTreeMap::new());
+        let mut g = group_sessions(&sessions, &[dir.to_string()], &BTreeMap::new(), &[]);
         g.remove(0)
     }
 

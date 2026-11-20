@@ -448,7 +448,12 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .find(|s| s.id == id)
         .map(|s| {
-            let project = short_path(&s.dir);
+            // 别的电脑上的会话：路径前面带上电脑名——那条路径在这台电脑上
+            // 不存在，不说是哪台的，用户会以为自己在本机。
+            let project = match &s.machine {
+                Some(m) => format!("{m}:{}", s.dir),
+                None => short_path(&s.dir),
+            };
             // 断连时这一行的预算全部让给警告和退路：`session_title_disconnected`
             // 已经比连上时多出一整句「连接已断开，画面可能过期」，名字这时候
             // 是这一行里最不要紧的东西——用户正盯着这个会话看，早就知道自己
@@ -506,6 +511,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         if let Some(pick) = &app.theme_pick {
             draw_theme_pick(f, inner, app, pick);
         }
+        draw_stale_note(f, rows[0], app, id);
         return;
     }
     // 内容区左上角/宽高**从 `header()` 的返回值拿**，不手算表头高度——这正是
@@ -531,6 +537,34 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(pick) = &app.theme_pick {
         draw_theme_pick(f, inner, app, pick);
     }
+    draw_stale_note(
+        f,
+        Rect {
+            height: 1,
+            ..area
+        },
+        app,
+        id,
+    );
+}
+
+/// 远程画面旧过 2 秒：标题那一行的右角写「n 秒前」。画在标题行上而不是
+/// 画面里——画面是 agent 的，盖住它一格就是盖住它一个字。
+fn draw_stale_note(f: &mut Frame, title_row: Rect, app: &App, id: u32) {
+    let Some(note) = super::grid::stale_note(app.remote.ages.get(&id).copied(), app.lang) else {
+        return;
+    };
+    let note = format!(" {note} ");
+    let w = (display_width(&note) as u16).min(title_row.width);
+    let at = Rect {
+        x: title_row.x + title_row.width - w,
+        width: w,
+        ..title_row
+    };
+    f.render_widget(
+        Paragraph::new(note).style(Style::default().add_modifier(Modifier::REVERSED)),
+        at,
+    );
 }
 
 /// **这个函数里不许改 `app.message`。** 主循环在调用它之后可能直接
@@ -1535,5 +1569,75 @@ mod tests {
             mouse_ev(MouseEventKind::Down(MouseButton::Left), 5, 5)
         ));
         assert!(app.message.text.is_empty());
+    }
+
+    // ———— 远程会话 ————
+
+    fn remote_session(id: u32, machine: &str) -> SessionInfo {
+        SessionInfo {
+            dir: "/r/work".into(),
+            machine: Some(machine.into()),
+            ..session(id, SessionState::Idle)
+        }
+    }
+
+    /// 远程画面旧过 2 秒：标题那一行右角写「n 秒前」；2 秒以内不写。
+    /// 标题里带着那台电脑的名字。
+    #[test]
+    fn a_stale_remote_screen_says_how_old_it_is() {
+        let base = crate::ui::remote::REMOTE_BASE;
+        for solid in [false, true] {
+            let (mut app, _dir) = App::test_app();
+            if solid {
+                app.bar = BarTheme::all()
+                    .iter()
+                    .copied()
+                    .find(|t| super::super::bar_style(*t).is_some())
+                    .unwrap();
+            }
+            app.set_sessions(vec![remote_session(base, "mac")]);
+            app.view = View::Attached(base);
+            let draw_it = |app: &mut App| {
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+                term.draw(|f| draw(f, f.area(), app)).unwrap();
+                screen_text(&term)
+            };
+            app.remote
+                .ages
+                .insert(base, std::time::Duration::from_millis(3400));
+            let text = draw_it(&mut app);
+            assert!(text.contains("3秒前"), "solid={solid}: {text}");
+            assert!(text.contains("mac:/r/work"), "solid={solid}: {text}");
+            app.remote
+                .ages
+                .insert(base, std::time::Duration::from_secs(1));
+            assert!(!draw_it(&mut app).contains("秒前"), "solid={solid}");
+        }
+    }
+
+    /// F3 轮转把别的电脑上的会话也算进去：它们就排在看板上本机那几组后面。
+    #[test]
+    fn f3_rotates_through_remote_sessions_too() {
+        let base = crate::ui::remote::REMOTE_BASE;
+        let (mut app, _dir) = App::test_app();
+        app.remote.peers = vec![("mac".into(), crate::ui::remote::PeerStatus::Online)];
+        app.set_sessions(vec![
+            session(1, SessionState::Working),
+            remote_session(base, "mac"),
+        ]);
+        app.view = View::Attached(1);
+        handle_key(&mut app, key(KeyCode::F(3))).unwrap();
+        assert!(
+            matches!(app.view, View::Attached(id) if id == base),
+            "下一个是 mac 上那个"
+        );
+        assert_eq!(
+            app.current_group().and_then(|g| g.machine.as_deref()),
+            Some("mac"),
+            "光标跟着进了 mac 那一组"
+        );
+        handle_key(&mut app, key(KeyCode::F(3))).unwrap();
+        assert!(matches!(app.view, View::Attached(1)), "转一圈回到本机");
     }
 }

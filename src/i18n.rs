@@ -1572,6 +1572,138 @@ pub mod msg {
         t!(lang, en: format!("Connecting to {peer}…"), zh: format!("正在连接 {peer}…"))
     }
 
+    /// 看板上别的电脑那一组的组头：问不到它。
+    pub fn remote_peer_offline(lang: Lang) -> &'static str {
+        t!(lang, en: "offline", zh: "离线")
+    }
+
+    /// 组头：问到了，但它没开「允许我的其他电脑远程操作」。
+    pub fn remote_peer_control_off(lang: Lang) -> &'static str {
+        t!(lang, en: "remote control off", zh: "没开远程操作")
+    }
+
+    /// 组头：还没问到过。
+    pub fn remote_peer_connecting(lang: Lang) -> &'static str {
+        t!(lang, en: "connecting", zh: "正在连接")
+    }
+
+    /// 几台电脑名连成一句。
+    fn join_names(lang: Lang, names: &[String]) -> String {
+        names.join(t!(lang, en: ", ", zh: "、"))
+    }
+
+    /// 被操作的这台：看板顶栏和会话底栏上常亮的那一句。`K` 写进句子里——
+    /// 那是断开的唯一一个键，屏幕上不写就等于没有。
+    pub fn remote_viewers_banner(lang: Lang, names: &[String]) -> String {
+        let who = join_names(lang, names);
+        t!(
+            lang,
+            en: format!("{who} is controlling this computer · K on the board disconnects"),
+            zh: format!("{who} 正在远程操作这台电脑 · 看板上按 K 断开"),
+        )
+    }
+
+    /// 按了 `K`：开关关了，正连着的那几台被踢掉。
+    pub fn remote_kicked(lang: Lang, names: &[String]) -> String {
+        if names.is_empty() {
+            return remote_control_now(lang, false).to_string();
+        }
+        let who = join_names(lang, names);
+        t!(
+            lang,
+            en: format!("Disconnected {who}; remote control is off"),
+            zh: format!("已断开 {who}，远程操作已关"),
+        )
+    }
+
+    /// 设置页那一项。
+    pub fn remote_control_setting(lang: Lang) -> &'static str {
+        t!(lang, en: "Allow my other computers to control this one", zh: "允许我的其他电脑远程操作")
+    }
+
+    /// 开关现在的值，设置页那一项后面和切换之后的那句话共用。
+    pub fn remote_control_now(lang: Lang, on: bool) -> &'static str {
+        match on {
+            true => t!(lang, en: "Remote control is on", zh: "远程操作已开"),
+            false => t!(lang, en: "Remote control is off", zh: "远程操作已关"),
+        }
+    }
+
+    /// 一批按键没送到那台电脑，队列清空了。
+    pub fn remote_keys_lost(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Keys sent to {peer} did not get through"),
+            zh: format!("发往 {peer} 的按键没送到"),
+        )
+    }
+
+    /// 远程画面角上：这张画面是多久以前的。
+    pub fn remote_screen_age(lang: Lang, secs: u64) -> String {
+        t!(lang, en: format!("{secs}s ago"), zh: format!("{secs} 秒前"))
+    }
+
+    /// 远程会话上按了 `s`/`u`/`d`：已经排进去了，答复回来再说结果。
+    pub fn remote_sent(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Sent to {peer}, waiting for its answer…"),
+            zh: format!("已发给 {peer}，等它回话…"),
+        )
+    }
+
+    /// 在别的电脑上开会话：已经排进去了。
+    pub fn remote_creating(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Opening a session on {peer}…"),
+            zh: format!("正在 {peer} 上开会话…"),
+        )
+    }
+
+    /// 在别的电脑上开好了会话。
+    pub fn remote_created(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Opened a session on {peer}"),
+            zh: format!("已在 {peer} 上开好会话"),
+        )
+    }
+
+    /// 在别的电脑上开会话的选择框：标题。`dir` 为空 = 还在挑项目。
+    pub fn remote_pick_title(lang: Lang, peer: &str, dir: Option<&str>) -> String {
+        match dir {
+            None => t!(
+                lang,
+                en: format!("New session on {peer} · pick a project"),
+                zh: format!("在 {peer} 上开会话 · 选项目"),
+            ),
+            Some(d) => t!(
+                lang,
+                en: format!("New session on {peer} · {d} · pick an agent"),
+                zh: format!("在 {peer} 上开会话 · {d} · 选 agent"),
+            ),
+        }
+    }
+
+    /// 选择框里：对方的项目 / agent 列表还在路上。
+    pub fn remote_pick_loading(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("Asking {peer} for its list…"),
+            zh: format!("正在向 {peer} 要列表…"),
+        )
+    }
+
+    /// 选择框里：对方一个项目都没有。远程只能开在对方已有的项目里。
+    pub fn remote_pick_no_projects(lang: Lang, peer: &str) -> String {
+        t!(
+            lang,
+            en: format!("{peer} has no projects yet. Open one there first"),
+            zh: format!("{peer} 上还没有项目，先在那台电脑上开一个"),
+        )
+    }
+
     pub fn pruned(lang: Lang, n: u32) -> String {
         t!(
             lang,

@@ -494,6 +494,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent) -> Result<()> {
         View::Board => board::handle_key(app, key)?,
         View::PickProfile { .. } => pick::handle_key(app, key)?,
         View::PickProject(_) => pick::handle_key(app, key)?,
+        View::PickRemote(_) => board::handle_remote_pick_key(app, key)?,
         View::Attached(_) if key.code == KeyCode::F(7) => live::open(app),
         View::Attached(_) => attach::handle_key(app, key)?,
         View::Grid { .. } => grid::handle_key(app, key)?,
@@ -848,6 +849,9 @@ pub fn run(
         computers::poll(&mut app, std::time::Instant::now());
         // dct 是不是正在准备重启——每一屏都要，同 `live::poll_status`。
         poll_drain(&mut app, std::time::Instant::now());
+        // 别的电脑：起停后台线程、告诉它们在看哪几个、收它们的消息；这台
+        // 被谁操作着。每一屏都要——会话底栏也亮在场提示。
+        poll_remote(&mut app, std::time::Instant::now());
 
         let attached = matches!(app.view, View::Attached(_));
         if app.need_sessions || !attached {
@@ -1077,6 +1081,14 @@ pub fn run(
                         app.view = home_view(&app);
                         app.need_sessions = true;
                         app.message = notice.into();
+                        app.sent_size = None;
+                    }
+                    // 别的电脑那头不让看了（关了开关、够不着）：本机后台好好的，
+                    // 标成「断开」是假话。回看板，把那台电脑的原话说出来。
+                    None if id >= remote::REMOTE_BASE => {
+                        app.view = home_view(&app);
+                        app.need_sessions = true;
+                        app.message = Msg::err(crate::i18n::msg::error(app.lang, &code));
                         app.sent_size = None;
                     }
                     None => app.connected = false,
@@ -1489,7 +1501,7 @@ fn help_ctx_for(app: &App, view: &View) -> view::HelpCtx {
         // `has_live_session`，不是另写一个 `sessions.is_empty()`。
         can_remove: app
             .current_group()
-            .map(|g| g.pinned && !g.has_live_session())
+            .map(|g| g.machine.is_none() && g.pinned && !g.has_live_session())
             .unwrap_or(false),
         // 跟 `jump_project` 逐条对上：0 个组直接 return，1 个组
         // `rem_euclid(1)` 恒为 0（原地不动）。两种都不该写这个键。
@@ -1556,6 +1568,7 @@ pub(crate) fn adopt_pinned(app: &mut App, fresh: Vec<String>) {
     // 那个组可能就查不到了。
     let keep = app
         .current_group()
+        .filter(|g| g.machine.is_none())
         .map(|g| g.display_dir.display().to_string());
     app.pinned = fresh;
     if let Some(d) = keep {
@@ -1595,7 +1608,8 @@ pub(crate) fn pin_cursor_group(app: &mut App) {
     let Some(g) = app.current_group() else {
         return;
     };
-    if g.pinned {
+    // 别的电脑的组不在本机的 pinned 里（它的 `dir` 不是本机路径）。
+    if g.pinned || g.machine.is_some() {
         return;
     }
     // 存**原始拼写**，同 `add_project`：`pinned` 同时是组头 name/parent 的
@@ -1659,6 +1673,10 @@ pub(crate) fn unpin_current(app: &mut App) -> bool {
     let Some(g) = app.current_group() else {
         return false;
     };
+    // 别的电脑的组跟着组里的名单走，不是 pin 上来的，`x` 拿不掉它。
+    if g.machine.is_some() {
+        return false;
+    }
     if g.has_live_session() {
         app.message = Msg::err(crate::i18n::text(crate::i18n::Key::GroupNotEmpty, app.lang).into());
         return false;
@@ -1718,6 +1736,7 @@ fn projects_changed(have: &[String], fresh: &[String]) -> bool {
 fn profiles_to_fetch(app: &App) -> Vec<String> {
     app.groups
         .iter()
+        .filter(|g| g.machine.is_none())
         .map(|g| g.dir.display().to_string())
         .filter(|d| !app.profiles.contains_key(d) && !app.profiles_asked.contains(d))
         .collect()
@@ -2296,6 +2315,12 @@ pub(crate) fn sync_board_cursor_from_grid(app: &mut App) {
 /// （`n`/`N`/`p`/`c`）在两边必须一模一样，所以整段逻辑只留一份。
 /// `code` 区分大小写 n：小写才去问 daemon 上次记的是哪个 agent。
 pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
+    // 光标在别的电脑的组上：开在那台电脑上。下面这一整套（本机 agent 列表、
+    // 本机 git、本机密钥）一样都用不上。
+    if let Some(peer) = app.current_group().and_then(|g| g.machine.clone()) {
+        board::open_remote(app, peer, code);
+        return;
+    }
     // entries 带的是完整信息（label/note/status/密钥提示/安装提示），
     // 渲染时把置灰项和原因画出来、四种状态各自路由到哪，见
     // pick_action 和 View::PickProfile 的按键分支。n 和 N 都要这份
@@ -2393,6 +2418,7 @@ pub(crate) fn open_new_session(app: &mut App, code: KeyCode) {
 fn browse_start_dir(app: &App) -> PathBuf {
     let cur = app
         .current_group()
+        .filter(|g| g.machine.is_none())
         .map(|g| g.display_dir.clone())
         // 一个组都没有（还没拉到列表的头一帧）：退回启动目录，同 `current_dir`。
         .unwrap_or_else(|| app.start_dir.clone());
@@ -2479,10 +2505,28 @@ pub(crate) fn session_action(app: &mut App, code: KeyCode, id: u32) -> Msg {
         KeyCode::Char('d') => Request::Diff { id },
         _ => return "".into(),
     };
-    match app.client().and_then(|c| c.call(req)) {
-        Ok(Response::Ok) => crate::i18n::text(crate::i18n::Key::ActionDone, app.lang).into(),
+    // 别的电脑上的会话：这一下只是排进了那台电脑的队列（`Router::call` 立刻
+    // 答 `Ok`），真结果过一会儿作为 `FeedEvent::Answer` 回来，由
+    // `apply_feed_event` 用下面同一个 `action_message` 说出来。
+    let peer = app
+        .client
+        .as_ref()
+        .and_then(|r| r.machine_of(id))
+        .map(str::to_string);
+    let r = app.client().and_then(|c| c.call(req));
+    match (peer, r) {
+        (Some(peer), Ok(Response::Ok)) => crate::i18n::msg::remote_sent(app.lang, &peer).into(),
+        (_, r) => action_message(app.lang, r),
+    }
+}
+
+/// `s`/`u`/`d` 的答复说成一句话。本机的当场说，别的电脑的等答复回来再说——
+/// 两条路共用这一份，措辞不会分叉。
+fn action_message(lang: crate::i18n::Lang, r: Result<Response>) -> Msg {
+    match r {
+        Ok(Response::Ok) => crate::i18n::text(crate::i18n::Key::ActionDone, lang).into(),
         Ok(Response::Diff(v)) if v.is_empty() => {
-            crate::i18n::text(crate::i18n::Key::NoChanges, app.lang).into()
+            crate::i18n::text(crate::i18n::Key::NoChanges, lang).into()
         }
         Ok(Response::Diff(v)) => v
             .iter()
@@ -2490,8 +2534,8 @@ pub(crate) fn session_action(app: &mut App, code: KeyCode, id: u32) -> Msg {
             .collect::<Vec<_>>()
             .join("  ")
             .into(),
-        Ok(Response::Error(ref e)) => Msg::err(crate::i18n::msg::error(app.lang, e)),
-        _ => Msg::err(crate::i18n::text(crate::i18n::Key::RequestFailed, app.lang).into()),
+        Ok(Response::Error(ref e)) => Msg::err(crate::i18n::msg::error(lang, e)),
+        _ => Msg::err(crate::i18n::text(crate::i18n::Key::RequestFailed, lang).into()),
     }
 }
 
@@ -2614,6 +2658,166 @@ fn poll_drain(app: &mut App, now: std::time::Instant) {
     );
 }
 
+/// 多久问一次本机的「远程操作」开关和在场名单。本机调用，便宜；在场窗口是
+/// 10 秒，3 秒一问够让提示跟得上。
+const REMOTE_POLL_EVERY: Duration = Duration::from_secs(3);
+
+/// 主循环每轮一次，「远程操作」两头的事都在这：
+///
+/// - 操作别人：组里的别的电脑（`MeshStatus` 现成的名单，本机除外）交给
+///   `Router` 起停后台线程；告诉它此刻在看哪些远程会话（只取这些的画面——
+///   每台电脑每秒 2 问的预算，见 `remote.rs` 文件头）；把它们的状态、画面
+///   新旧抄进 `App::remote` 给绘制用；收它们攒下的事说给用户。
+/// - 被别人操作：3 秒问一次本机开关和在场名单。
+///
+/// 这里**不打网络**：`Router` 的这几样只碰缓存和锁，开关是本机调用。
+fn poll_remote(app: &mut App, now: std::time::Instant) {
+    let names: Vec<String> = app
+        .mesh
+        .view
+        .as_ref()
+        .map(|v| {
+            v.members
+                .iter()
+                .filter(|m| !m.is_me)
+                .map(|m| m.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let watched = watched_remote_ids(app);
+    if let Some(router) = app.client.as_mut() {
+        router.set_peers(&names);
+        router.watch(&watched);
+        let peers: Vec<(String, remote::PeerStatus)> = names
+            .iter()
+            .map(|n| {
+                let st = router.status(n).unwrap_or(remote::PeerStatus::Connecting);
+                (n.clone(), st)
+            })
+            .collect();
+        app.remote.ages = watched
+            .iter()
+            .filter_map(|&id| router.age(id).map(|a| (id, a)))
+            .collect();
+        let events = router.take_events();
+        let regroup = app.remote.peers.len() != peers.len()
+            || app
+                .remote
+                .peers
+                .iter()
+                .zip(&peers)
+                .any(|(a, b)| a.0 != b.0);
+        app.remote.peers = peers;
+        // 名单变了，空着的那几组要出现 / 消失。
+        if regroup {
+            app.refresh_rows();
+        }
+        for e in events {
+            apply_feed_event(app, e);
+        }
+    }
+    if !app.connected
+        || app
+            .remote
+            .last_fetch
+            .is_some_and(|t| now.saturating_duration_since(t) < REMOTE_POLL_EVERY)
+    {
+        return;
+    }
+    app.remote.last_fetch = Some(now);
+    match app
+        .client()
+        .and_then(|c| c.call(Request::RemoteControl { set: None }))
+    {
+        Ok(Response::RemoteControl { on, viewers }) => {
+            app.remote.on = Some(on);
+            app.remote.viewers = viewers;
+        }
+        // 老后台不认这条、或者这一下没问到：不猜，提示不亮。
+        _ => {
+            app.remote.on = None;
+            app.remote.viewers.clear();
+        }
+    }
+}
+
+/// 此刻屏幕上看得见的远程会话：贴着的那一个，或者九宫格这一页上的。
+/// 只有这些要取画面。
+fn watched_remote_ids(app: &App) -> Vec<u32> {
+    let ids: Vec<u32> = match &app.view {
+        View::Attached(id) => vec![*id],
+        View::Grid { focus, .. } => {
+            let start = grid::page_of(*focus) * grid::TILES_PER_PAGE;
+            app.grid_sessions()
+                .iter()
+                .skip(start)
+                .take(grid::TILES_PER_PAGE)
+                .map(|s| s.id)
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    ids.into_iter()
+        .filter(|&id| id >= remote::REMOTE_BASE)
+        .collect()
+}
+
+/// 别的电脑的后台线程报上来的一件事，说给用户。
+fn apply_feed_event(app: &mut App, e: remote::FeedEvent) {
+    use remote::{AnswerOf, FeedEvent};
+    let lang = app.lang;
+    match e {
+        FeedEvent::KeysLost { peer } => {
+            app.message = Msg::err(crate::i18n::msg::remote_keys_lost(lang, &peer));
+        }
+        FeedEvent::Refused { code, .. } => {
+            app.message = Msg::err(crate::i18n::msg::error(lang, &code));
+        }
+        FeedEvent::Answer {
+            peer,
+            of: AnswerOf::Create,
+            resp,
+            ..
+        } => match resp {
+            Response::Created { id } => {
+                app.message = crate::i18n::msg::remote_created(lang, &peer).into();
+                app.need_sessions = true;
+                // 跟本机 `n` 一样建好就进去——但只在用户还站在看板上等的时候。
+                // 他已经进了别的会话、开了设置页的话，不把他拽走。
+                if matches!(
+                    app.view,
+                    View::Board | View::Grid { .. } | View::PickRemote(_)
+                ) {
+                    point_cursor_at_session(app, id);
+                    enter_session(app, id);
+                }
+            }
+            other => app.message = action_message(lang, Ok(other)),
+        },
+        // `s`/`u`/`d` 的真结果：跟本机那一路同一句话。
+        FeedEvent::Answer { resp, .. } => app.message = action_message(lang, Ok(resp)),
+    }
+}
+
+/// `K`（看板、九宫格）：关掉「允许我的其他电脑远程操作」，正在操作这台的
+/// 全部断开。重开在设置页。
+pub(crate) fn kick_remote(app: &mut App) {
+    let lang = app.lang;
+    let names = app.remote.viewers.clone();
+    app.message = match app
+        .client()
+        .and_then(|c| c.call(Request::RemoteControl { set: Some(false) }))
+    {
+        Ok(Response::RemoteControl { on, viewers }) => {
+            app.remote.on = Some(on);
+            app.remote.viewers = viewers;
+            crate::i18n::msg::remote_kicked(lang, &names).into()
+        }
+        Ok(Response::Error(ref e)) => Msg::err(crate::i18n::msg::error(lang, e)),
+        _ => Msg::err(crate::i18n::text(crate::i18n::Key::RequestFailed, lang).into()),
+    };
+}
+
 /// 后台的回答 → 要不要画横幅。有一场排空在进行（`active`）就画，包括
 /// 没有会话可等、正在收尾的那一段；旧后台不认这条请求（回一个错误）、
 /// 连不上，都安静地不画。
@@ -2685,6 +2889,17 @@ fn draw(f: &mut Frame, app: &mut App) {
             BarContent::Text(live::live_banner(&app.live, app.lang)),
             bar_live_style(&app.live, app.bar),
         )
+    } else if matches!(app.view, View::Attached(_)) && !app.remote.viewers.is_empty() {
+        // 被别的电脑操作着：会话里也要常亮（spec 第 3 节）——这台电脑前的人
+        // 最可能正在会话里打字，跟远程那边同时敲。压过滚动提示和按键表，
+        // 但不吞掉 `message`：两句接着说。
+        let banner = crate::i18n::msg::remote_viewers_banner(app.lang, &app.remote.viewers);
+        let text = if app.message.text.is_empty() {
+            banner
+        } else {
+            format!("{banner} · {}", app.message.text)
+        };
+        (BarContent::Text(text), bar_danger(app.bar))
     } else if app.message.text.is_empty() {
         // 会话视图里，滚动提示是持续状态（「翻到哪儿了」「下面有新内容」），
         // 按键表是「还能干什么」——两者抢的是同一行，而滚动提示更具体。
@@ -2808,6 +3023,19 @@ fn draw(f: &mut Frame, app: &mut App) {
             f.render_widget(ratatui::widgets::Clear, popup);
             pick::draw(f, popup, app);
         }
+        // 在别的电脑上开会话的选择框，同上一支：浮在家视图上。
+        View::PickRemote(_) => {
+            let home = home_view(app);
+            let saved = std::mem::replace(&mut app.view, home);
+            match app.view {
+                View::Grid { .. } => grid::draw(f, chunks[0], app),
+                _ => board::draw(f, chunks[0], app),
+            }
+            app.view = saved;
+            let popup = popup_area(chunks[0]);
+            f.render_widget(ratatui::widgets::Clear, popup);
+            board::draw_remote_pick(f, popup, app);
+        }
         // 全部按键也是**浮层**，跟项目选择器同一种呈现：背后留着按 `?` 之前
         // 那一屏，用户看得出自己只是叠了一层。背后画的是 `from` 而不是
         // `home_view()`——从九宫格进来就该看见九宫格，连焦点格都不该动。
@@ -2842,6 +3070,27 @@ fn draw(f: &mut Frame, app: &mut App) {
             } else {
                 crate::i18n::msg::restart_pending_banner(app.lang, p.waiting.len())
             })
+            .style(bar_danger(app.bar)),
+            top,
+        );
+    }
+
+    // 被别的电脑操作着：看板、九宫格顶上**盖**一行，同上面排空那一行（排空
+    // 更要紧，有它就让它）。会话里的那一份在底栏，见上面 `bar` 那条链。
+    if app.drain.is_none()
+        && !app.remote.viewers.is_empty()
+        && matches!(app.view, View::Board | View::Grid { .. })
+    {
+        let top = Rect {
+            height: 1,
+            ..chunks[0]
+        };
+        f.render_widget(ratatui::widgets::Clear, top);
+        f.render_widget(
+            Paragraph::new(crate::i18n::msg::remote_viewers_banner(
+                app.lang,
+                &app.remote.viewers,
+            ))
             .style(bar_danger(app.bar)),
             top,
         );
@@ -5910,5 +6159,212 @@ is_agent = true
             LiveInput::Title(t) => assert_eq!(t, "ab"),
             LiveInput::Key { .. } => panic!("还是 Title 变体"),
         }
+    }
+
+    // ———— 远程操作 ————
+
+    fn first_line(term: &Terminal<ratatui::backend::TestBackend>) -> String {
+        buffer_text(term.backend().buffer())
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// 被别的电脑操作着：看板顶上、九宫格顶上，以及会话底栏，都写着谁在操作、
+    /// 按什么断开。没人连着就哪儿都不写。
+    #[test]
+    fn the_presence_banner_shows_on_the_board_and_inside_a_session() {
+        for (name, view) in [
+            ("board", View::Board),
+            ("grid", View::grid(0)),
+            ("attached", View::Attached(1)),
+        ] {
+            let attached = matches!(view, View::Attached(_));
+            let (mut app, _dir) = app_with_one_agent_session(view);
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(
+                !bar_text(&term).contains("正在远程操作"),
+                "没人连着不亮：{name}"
+            );
+
+            app.remote.viewers = vec!["Mac".into()];
+            // 换一块新屏再画：同一块屏上第二帧只送变了的格子，宽字符后面那一格
+            // 会留着上一帧的字，读出来是串的（真终端不会）。
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let screen = bar_text(&term);
+            assert!(
+                screen.contains("Mac正在远程操作这台电脑·看板上按K断开"),
+                "{name}: {screen}"
+            );
+            // 会话里不盖 agent 的画面，写在底栏；看板和九宫格盖在顶上那一行。
+            assert_eq!(
+                first_line(&term).contains("正在远程操作"),
+                !attached,
+                "顶上那一行：{name}"
+            );
+        }
+    }
+
+    /// 会话里亮着提示的时候，别的消息不被吞掉，接在后面。
+    #[test]
+    fn the_presence_banner_does_not_swallow_a_message_inside_a_session() {
+        let (mut app, _dir) = app_with_one_agent_session(View::Attached(1));
+        app.remote.viewers = vec!["Mac".into()];
+        app.message = Msg::err("粘贴没送出去".into());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = bar_text(&term);
+        assert!(screen.contains("正在远程操作"), "{screen}");
+        assert!(screen.contains("粘贴没送出去"), "{screen}");
+    }
+
+    /// 后台线程报上来的事都说给用户：按键没送到、`d` 的结果（跟本机同一句）。
+    #[test]
+    fn feed_events_become_the_same_messages_local_ones_would() {
+        let (mut app, _dir) = App::test_app();
+        apply_feed_event(
+            &mut app,
+            remote::FeedEvent::KeysLost {
+                peer: "mac".into(),
+            },
+        );
+        assert_eq!(app.message.text, "发往 mac 的按键没送到");
+        assert!(app.message.error);
+
+        apply_feed_event(
+            &mut app,
+            remote::FeedEvent::Answer {
+                peer: "mac".into(),
+                id: Some(remote::REMOTE_BASE),
+                of: remote::AnswerOf::Diff,
+                resp: Response::Diff(vec![crate::git::FileStat {
+                    path: "a.rs".into(),
+                    added: 3,
+                    removed: 1,
+                }]),
+            },
+        );
+        assert_eq!(
+            app.message.text,
+            action_message(
+                app.lang,
+                Ok(Response::Diff(vec![crate::git::FileStat {
+                    path: "a.rs".into(),
+                    added: 3,
+                    removed: 1,
+                }]))
+            )
+            .text
+        );
+        assert_eq!(app.message.text, "a.rs +3 -1");
+
+        apply_feed_event(
+            &mut app,
+            remote::FeedEvent::Refused {
+                peer: "mac".into(),
+                code: crate::proto::ErrorCode::RemoteControlOff,
+            },
+        );
+        assert!(app.message.text.contains("没开远程操作"), "{}", app.message.text);
+    }
+
+    /// 远程会话上按 `d`：当场只说「已发给 mac」，不能说「完成」——这时候
+    /// 什么都还没发生。
+    #[test]
+    fn a_remote_action_says_it_was_sent_not_that_it_is_done() {
+        let (mut router, _seen) = remote::test_support::router(
+            |req| match req {
+                Request::List => Response::Sessions(vec![]),
+                _ => Response::Ok,
+            },
+            |req| match req {
+                Request::List => Response::Sessions(vec![SessionInfo {
+                    id: 4,
+                    profile: "claude".into(),
+                    dir: "/r/work".into(),
+                    state: SessionState::Idle,
+                    activity: String::new(),
+                    is_agent: true,
+                    tag: String::new(),
+                    last_active_ms: 0,
+                    machine: None,
+                }]),
+                _ => Response::Ok,
+            },
+        );
+        router.set_peers(&["mac".to_string()]);
+        let mut id = None;
+        assert!(crate::client::wait_up_to(Duration::from_secs(5), || {
+            if let Ok(Response::Sessions(v)) = router.call(Request::List) {
+                id = v.first().map(|s| s.id);
+            }
+            id.is_some()
+        }));
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(router);
+        let m = session_action(&mut app, KeyCode::Char('d'), id.unwrap());
+        assert_eq!(m.text, "已发给 mac，等它回话…");
+    }
+
+    /// 主循环那一步：组里的别的电脑（不含本机）交给 `Router`，在场名单从
+    /// 本机后台抄过来。
+    #[test]
+    fn polling_starts_feeds_for_the_other_computers_and_reads_presence() {
+        let (router, seen) = remote::test_support::router(
+            |req| match req {
+                Request::RemoteControl { .. } => Response::RemoteControl {
+                    on: true,
+                    viewers: vec!["Mac".into()],
+                },
+                Request::List => Response::Sessions(vec![]),
+                _ => Response::Ok,
+            },
+            |req| match req {
+                Request::List => Response::Sessions(vec![]),
+                _ => Response::Ok,
+            },
+        );
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(router);
+        app.mesh.view = Some(computers::tests::mesh_view(
+            true,
+            &[("这台", true, true), ("mac", true, false)],
+        ));
+        poll_remote(&mut app, std::time::Instant::now());
+        assert_eq!(app.remote.viewers, vec!["Mac".to_string()]);
+        assert_eq!(app.remote.on, Some(true));
+        assert_eq!(
+            app.remote.peers.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["mac"],
+            "本机不算"
+        );
+        assert!(
+            app.groups.iter().any(|g| g.machine.as_deref() == Some("mac")),
+            "mac 那一组立刻出现"
+        );
+        assert!(crate::client::wait_up_to(Duration::from_secs(5), || seen
+            .remote
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.starts_with("mac ")
+                && !r.starts_with("mac Screen"))));
+        // 3 秒之内不再问开关。
+        let asked = |seen: &remote::test_support::Seen| {
+            seen.local
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with("RemoteControl"))
+                .count()
+        };
+        let before = asked(&seen);
+        poll_remote(&mut app, std::time::Instant::now());
+        assert_eq!(asked(&seen), before);
     }
 }

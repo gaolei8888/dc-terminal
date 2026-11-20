@@ -58,7 +58,8 @@ project `n` opens in.
 - **[No more "press `g`"](#it-never-asks-is-this-okay).** A folder that isn't a
   git repository becomes one by itself, and a machine without git is offered it.
 - **[Several computers](#several-computers).** Agents on different machines
-  leave each other messages; the relay can't read them.
+  leave each other messages; the relay can't read them. One computer's board can
+  also [control](#remote-control) the sessions on another.
 - **[Publish a live session to a fixed address](#live-to-a-room).** `p` in the
   live panel puts it on the relay's public list.
 - **[dct in a browser](#dct-in-a-browser),** for machines that can't install
@@ -1068,6 +1069,37 @@ dct send Mac/#3 "run the Windows tests"
 - The relay defaults to `https://dataclue.cn/dct-relay`; override with
   `[mesh] relay = "…"` in `~/.dct/config.toml`.
 
+### Remote control
+
+Switched computers? Carry on with the work on the old one: the code and the agents
+stay there, and you drive them from this computer's board as if they were local.
+
+- **Turn it on on the computer being controlled**: press `l` on the board for
+  Settings, pick "Allow my other computers to control this one", Enter turns it on or
+  off. It is off by default. The switch lives on the Settings page, **not in
+  `~/.dct/config.toml`**: only someone sitting at that computer can turn it on, and no
+  other computer can turn it on for it.
+- **The board**: each other computer in the group gets one group, after your own
+  projects; the header is the computer's name and each session row shows its project
+  path. A computer that can't be reached says "offline", one with the switch off says
+  "remote control off", and the group is greyed out; its sessions stay on the board.
+- **Entering a session**: Enter goes in; screen, keys, wheel, mouse, F3/F8, F4 copy
+  and pasting text work as they do locally, F2 comes back. The screen travels
+  through the relay one question at a time, a frame or two per second; when it is
+  more than 2 seconds old the title's right corner says "3s ago". Keys that didn't
+  arrive are reported as "Keys sent to Mac did not get through".
+- **Opening a session over there**: on one of its sessions, `n` opens another just
+  like it (same project, same agent); on the group header press `n`, or `N`
+  anywhere, to pick one of that computer's projects and then an agent. Only projects
+  that computer already has. `s`/`u`/`d` work too; their result shows once it
+  comes back.
+- **The controlled computer can see it**: while someone is controlling it, the top
+  of the board and the session's bottom bar both say "Mac is controlling this
+  computer". `K` on the board or the grid disconnects everyone at once and turns the
+  switch off; turn it back on in Settings.
+- **Only computers in your group** (the same DC account); keys and screens are
+  sealed end to end like messages, the relay can't read them.
+
 **Not yet:**
 
 - the other computer offline → not sent (you are told); nothing is held for later;
@@ -1078,7 +1110,8 @@ dct send Mac/#3 "run the Windows tests"
   offline computer misses list changes;
 - any computer on your account can keep burning your codes with wrong guesses
   (it cannot get in, but it is annoying); this version does not stop that;
-- you can't open another computer's session yet — that's the next step.
+- remote sessions take pasted text but not images; kill and live streaming are for
+  local sessions only; computers on someone else's account can't be controlled yet.
 
 ### Deploying
 

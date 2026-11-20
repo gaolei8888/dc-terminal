@@ -325,6 +325,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('p') if is_plain_key(&key) => super::open_project_picker(app),
         KeyCode::Char('c') if is_plain_key(&key) => super::open_secrets(app),
+        // 踢掉正在远程操作这台电脑的人，同看板（`board::handle_key`）。
+        KeyCode::Char('K') if is_plain_key(&key) => super::kick_remote(app),
         // `l` = language。设置页跟 `c 密钥` 挨着：两个都是「配置」类入口，
         // 而且跟 a/g 一样，两个视图共用同一个键。
         KeyCode::Char('l') if is_plain_key(&key) => super::open_settings(app),
@@ -440,6 +442,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         Chrome {
             connected: app.connected,
             lang: app.lang,
+            ages: &app.remote.ages,
         },
         !app.sessions.is_empty(),
     );
@@ -474,9 +477,22 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 /// 而不是继续往参数表上加：它们总是一起传、一起来自 `App`，而八个位置参数
 /// 里传错顺序（两个 bool、两个枚举）编译器是拦不住的。
 #[derive(Clone, Copy)]
-pub(crate) struct Chrome {
+pub(crate) struct Chrome<'a> {
     pub connected: bool,
     pub lang: Lang,
+    /// 远程会话的画面有多旧（合成号 → 多久以前取回的），见 `App::remote`。
+    /// 超过 `STALE_AFTER` 的格子标题上写「n 秒前」。
+    pub ages: &'a std::collections::HashMap<u32, std::time::Duration>,
+}
+
+/// 远程画面旧过这么久，角上就写「n 秒前」（spec 第 4 节）。一问一答的线路
+/// 上 1–2 帧/秒是常态，2 秒以内不算旧，写了只是噪音。
+pub(crate) const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 画面是不是旧到该说一声了；该说就给那句话。
+pub(crate) fn stale_note(age: Option<std::time::Duration>, lang: Lang) -> Option<String> {
+    age.filter(|a| *a > STALE_AFTER)
+        .map(|a| crate::i18n::msg::remote_screen_age(lang, a.as_secs()))
 }
 
 fn draw_grid(
@@ -489,7 +505,11 @@ fn draw_grid(
     // 看板上有会话，只是全停了——空状态那句话要说得不一样
     has_stopped: bool,
 ) {
-    let Chrome { connected, lang } = chrome;
+    let Chrome {
+        connected,
+        lang,
+        ages,
+    } = chrome;
     if area.width < MIN_COLS || area.height < MIN_ROWS {
         // 说人话说清下一步做什么：这是用户自己能修好的事
         f.render_widget(
@@ -587,7 +607,16 @@ fn draw_grid(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| info.dir.clone());
+        // 别的电脑上的会话：项目前面带上电脑名，不然九个格子里分不出哪几个
+        // 是别处的。
+        let project = match &info.machine {
+            Some(m) => format!("{m}:{project}"),
+            None => project,
+        };
         title.push(Span::styled(format!("{project} "), dim()));
+        if let Some(note) = stale_note(ages.get(&info.id).copied(), lang) {
+            title.push(Span::styled(format!("{note} "), dim()));
+        }
         // 焦点格的标题反色成一条**铺满整格宽度**的实心色块。
         //
         // 只把标题文字反色不够：文字才占十来列，格子宽三四十列，剩下的还是
@@ -2091,6 +2120,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2126,6 +2156,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2181,6 +2212,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2227,6 +2259,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2284,6 +2317,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2324,6 +2358,7 @@ mod tests {
                 Chrome {
                     connected: false,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2387,6 +2422,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2415,6 +2451,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2434,6 +2471,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2454,6 +2492,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2478,6 +2517,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2504,6 +2544,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2539,6 +2580,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2572,6 +2614,7 @@ mod tests {
                 Chrome {
                     connected: true,
                     lang: Lang::Zh,
+                    ages: &Default::default(),
                 },
                 false,
             )
@@ -2843,5 +2886,63 @@ mod tests {
             .collect();
         assert!(!screen.contains("窗口太小"), "开框不该把格子挤没：{screen}");
         assert!(screen.contains("claude"), "格子该还在：{screen}");
+    }
+
+    // ———— 远程操作 ————
+
+    /// 九宫格里也认 `K`（spec 第 3 节：看板和九宫格都认）。
+    #[test]
+    fn k_in_the_grid_turns_remote_control_off_too() {
+        let (router, seen) = crate::ui::remote::test_support::router(
+            |req| match req {
+                crate::proto::Request::RemoteControl { .. } => {
+                    crate::proto::Response::RemoteControl {
+                        on: false,
+                        viewers: vec![],
+                    }
+                }
+                _ => crate::proto::Response::Ok,
+            },
+            |_| crate::proto::Response::Ok,
+        );
+        let (mut app, _dir) = App::test_app();
+        app.client = Some(router);
+        app.set_sessions(vec![session(1, SessionState::Idle)]);
+        app.view = View::grid(0);
+        app.remote.viewers = vec!["Mac".into()];
+        handle_key(&mut app, key(KeyCode::Char('K'))).unwrap();
+        assert!(seen
+            .local
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r == "RemoteControl { set: Some(false) }"));
+        assert_eq!(app.message.text, "已断开 Mac，远程操作已关");
+    }
+
+    /// 别的电脑上的会话：格子标题写「电脑:项目」；画面旧过 2 秒写「n 秒前」。
+    #[test]
+    fn a_remote_tile_names_its_machine_and_says_how_old_it_is() {
+        let base = crate::ui::remote::REMOTE_BASE;
+        let (mut app, _dir) = App::test_app();
+        app.remote.peers = vec![("mac".into(), crate::ui::remote::PeerStatus::Online)];
+        app.set_sessions(vec![
+            session(1, SessionState::Idle),
+            SessionInfo {
+                machine: Some("mac".into()),
+                ..session_in(base, "/r/work")
+            },
+        ]);
+        app.view = View::grid(0);
+        app.remote
+            .ages
+            .insert(base, std::time::Duration::from_secs(5));
+        let screen = grid_text(&mut app);
+        assert!(screen.contains("mac:work"), "{screen}");
+        assert!(screen.contains("5秒前"), "{screen}");
+        app.remote
+            .ages
+            .insert(base, std::time::Duration::from_millis(1500));
+        assert!(!grid_text(&mut app).contains("秒前"), "2 秒以内不算旧");
     }
 }

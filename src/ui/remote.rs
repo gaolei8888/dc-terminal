@@ -1123,6 +1123,88 @@ impl Router {
     }
 }
 
+/// 给看板、九宫格这些界面模块的单测用：一个两头都是假的 `Router`，本机和
+/// 远程收到的每一条都记下来，界面测试只断言「发出去了什么」。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    type Answer = dyn Fn(&Request) -> Response + Send + Sync;
+
+    /// 两头各收到了什么，`{req:?}` 的样子。远程那头记成 `"{电脑} {req:?}"`。
+    #[derive(Clone, Default)]
+    pub(crate) struct Seen {
+        pub local: Arc<Mutex<Vec<String>>>,
+        pub remote: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct Local {
+        seen: Arc<Mutex<Vec<String>>>,
+        answer: Arc<Answer>,
+    }
+
+    impl Line for Local {
+        fn call(&mut self, req: Request) -> Result<Response> {
+            self.seen.lock().unwrap().push(format!("{req:?}"));
+            Ok((self.answer)(&req))
+        }
+        fn call_within(&mut self, req: Request, _t: Duration) -> Result<Response> {
+            self.call(req)
+        }
+    }
+
+    #[derive(Clone)]
+    struct Remote {
+        seen: Arc<Mutex<Vec<String>>>,
+        answer: Arc<Answer>,
+    }
+
+    impl Line for Remote {
+        fn call(&mut self, req: Request) -> Result<Response> {
+            self.call_within(req, Duration::from_secs(5))
+        }
+        fn call_within(&mut self, req: Request, _t: Duration) -> Result<Response> {
+            let Request::RemoteCall { peer, req } = req else {
+                panic!("Feed 只该发 RemoteCall");
+            };
+            self.seen.lock().unwrap().push(format!("{peer} {req:?}"));
+            Ok(match *req {
+                // 对方一直是同一次开机，号不会作废。
+                Request::Instance => Response::Instance { id: 1 },
+                ref other => (self.answer)(other),
+            })
+        }
+    }
+
+    pub(crate) fn router(
+        local: impl Fn(&Request) -> Response + Send + Sync + 'static,
+        remote: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) -> (Router, Seen) {
+        let seen = Seen::default();
+        let r = Remote {
+            seen: seen.remote.clone(),
+            answer: Arc::new(remote),
+        };
+        let dial: Dial = Arc::new(move || Ok(Box::new(r.clone()) as Box<dyn Line>));
+        let pace = Pace {
+            gap: Duration::from_millis(1),
+            list_every: Duration::from_millis(20),
+            backoff_min: Duration::from_millis(1),
+            backoff_max: Duration::from_millis(5),
+            catalog_every: Duration::from_secs(60),
+        };
+        let router = Router::with_parts(
+            Box::new(Local {
+                seen: seen.local.clone(),
+                answer: Arc::new(local),
+            }),
+            dial,
+            pace,
+        );
+        (router, seen)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -230,6 +230,42 @@ pub struct App {
     /// （见 `attach::handle_key`）。跨会话粘着的话，用户会在另一个会话里
     /// 发现鼠标莫名其妙不归 agent 管，而屏幕上没有任何东西解释为什么。
     pub(crate) copy_mode: bool,
+    /// 看板上「远程操作」那几样，见 `RemoteBoard`。
+    pub(crate) remote: RemoteBoard,
+}
+
+/// 看板上「远程操作」那几样：别的电脑此刻怎样、这台正被谁操作着、正在看的
+/// 远程画面有多旧。
+///
+/// **全是从 `Router` / 本机后台抄来的现成数据，画的时候只读这里。** 主循环
+/// 每帧抄一遍（`ui::poll_remote`），绘制路径上不碰 `Router`——跟
+/// `MeshPanel` 一个规矩，也让界面测试不用造一个真的 `Router` 就能摆出
+/// 「那台离线了」「有人连着」这些样子。
+#[derive(Default)]
+pub(crate) struct RemoteBoard {
+    /// 组里**别的**电脑（不含本机）和它们此刻的状态，按名字排好。看板上每台
+    /// 一个分组，哪怕它一个会话都没有——没开远程操作的那台也要灰着摆出来，
+    /// 不然用户不知道为什么看不见它。
+    pub peers: Vec<(String, super::remote::PeerStatus)>,
+    /// 这台电脑「允许我的其他电脑远程操作」的开关。`None` = 还没问到
+    /// （刚启动、后台太老）。
+    pub on: Option<bool>,
+    /// 此刻正在远程操作这台电脑的电脑名。非空就在看板顶栏、会话底栏亮提示。
+    pub viewers: Vec<String>,
+    /// 上次问开关和在场名单的时刻，压到 3 秒一次。
+    pub last_fetch: Option<std::time::Instant>,
+    /// 正在看的远程会话（合成号）的画面是多久以前取回来的。
+    pub ages: std::collections::HashMap<u32, std::time::Duration>,
+}
+
+impl RemoteBoard {
+    /// 这台电脑在看板上的状态；不在名单上（刚被移出组）是 `None`。
+    pub(crate) fn status(&self, peer: &str) -> Option<super::remote::PeerStatus> {
+        self.peers
+            .iter()
+            .find(|(name, _)| name == peer)
+            .map(|(_, st)| *st)
+    }
 }
 
 impl App {
@@ -310,6 +346,7 @@ impl App {
             quit: false,
             explained_failure: None,
             copy_mode: false,
+            remote: RemoteBoard::default(),
         }
     }
 
@@ -426,8 +463,13 @@ impl App {
             .map(|g| g.dir.clone())
             .collect();
 
-        self.groups = super::view::group_sessions(&self.sessions, &self.pinned, &self.profiles);
-        self.groups.retain(|g| !g.sessions.is_empty());
+        let peers: Vec<String> = self.remote.peers.iter().map(|(n, _)| n.clone()).collect();
+        self.groups =
+            super::view::group_sessions(&self.sessions, &self.pinned, &self.profiles, &peers);
+        // 别的电脑的组空着也留：组头上写着它为什么空（离线、没开远程操作），
+        // 光标停在上面按 `n` 也能在那台电脑上开一个。
+        self.groups
+            .retain(|g| !g.sessions.is_empty() || g.machine.is_some());
         for g in &mut self.groups {
             g.collapsed = collapsed.contains(&g.dir);
         }
@@ -475,10 +517,18 @@ impl App {
     }
 
     /// 创建中的会话使用明确选定的目录，否则使用光标所在项目或启动目录。
+    ///
+    /// **别的电脑的组不算**：它的 `dir` 只是个分组键，不是这台电脑上的路径。
+    /// 光标停在那儿时，凡是要一个本机目录的地方（`p` 浏览、本机建会话）都
+    /// 退回启动目录——在那台电脑上开会话走的是另一条路（`board::open_remote`）。
     pub fn current_dir(&self) -> PathBuf {
         self.pending_project
             .clone()
-            .or_else(|| self.current_group().map(|g| g.dir.clone()))
+            .or_else(|| {
+                self.current_group()
+                    .filter(|g| g.machine.is_none())
+                    .map(|g| g.dir.clone())
+            })
             .unwrap_or_else(|| self.start_dir.clone())
     }
 
