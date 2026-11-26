@@ -161,6 +161,31 @@ pub(crate) fn run_with_hooks(
         HANDOFF_KEEP,
         std::time::SystemTime::now(),
     );
+    // 多电脑：secrets 里有中转令牌才起。起在自己的线程上（`link::spawn`），
+    // 续期也在那条线程上——**不在下面那个 200ms 的 tick 里做任何网络 IO**。
+    // 放在一个槽里活到进程结束：守护进程开着的时候 `dct login`，要在这里
+    // 把连接（重新）起起来，不能等下次重启。
+    let mesh_inbox: Arc<dyn crate::mesh::deliver::Inbox> =
+        Arc::new(crate::mesh::deliver::LocalInbox::new(mgr.clone()));
+    let mesh_ctl = Arc::new(MeshCtl {
+        socket: socket.to_path_buf(),
+        journal_path: mgr.journal.path(),
+        inbox: Some(mesh_inbox.clone()),
+        slot: Mutex::new(start_mesh(
+            socket,
+            &secrets,
+            &profiles_dir,
+            mgr.journal.path(),
+            Some(mesh_inbox),
+        )),
+    });
+    // 这台电脑在组里叫什么，开会话时要写进给 agent 的留言说明
+    // （`session::peer_note`）。**必须在下面接回线程起来之前填好**：接回的
+    // 会话也要带说明，晚一步的话平稳重启接回来的全都漏掉。所以多电脑那块
+    // 挪到了接回前面——`start_mesh` 不打网络（连接在 `link::spawn` 的线程上
+    // 慢慢连），挪上来不拖慢启动；接回本来就在后台，留言先到、会话还没回来
+    // 的那一小段，挪之前也一样存在。之后每拍刷新一次，见下面投递线程。
+    refresh_peer_note(&mesh_ctl, &mgr);
     if !last_sessions_records.is_empty() {
         // 记下来的会话编号先让出来：恢复期间用户新开的会话从更大的号开始，
         // 不抢马上要接回来的「3 号」。
@@ -275,30 +300,15 @@ pub(crate) fn run_with_hooks(
     }
     crate::bridge::spawn_event_consumer(event_rx, bridge.clone());
 
-    // 多电脑：secrets 里有中转令牌才起。起在自己的线程上（`link::spawn`），
-    // 续期也在那条线程上——**不在下面那个 200ms 的 tick 里做任何网络 IO**。
-    // 放在一个槽里活到进程结束：守护进程开着的时候 `dct login`，要在这里
-    // 把连接（重新）起起来，不能等下次重启。
-    let mesh_inbox: Arc<dyn crate::mesh::deliver::Inbox> =
-        Arc::new(crate::mesh::deliver::LocalInbox::new(mgr.clone()));
-    let mesh_ctl = Arc::new(MeshCtl {
-        socket: socket.to_path_buf(),
-        journal_path: mgr.journal.path(),
-        inbox: Some(mesh_inbox.clone()),
-        slot: Mutex::new(start_mesh(
-            socket,
-            &secrets,
-            &profiles_dir,
-            mgr.journal.path(),
-            Some(mesh_inbox),
-        )),
-    });
     // 留言的投递线程：每秒看一眼排着队的留言，会话空下来就送一条。槽是空的
     // （还没登录）就什么都不做；登录之后槽里换上的那一份下一拍就接上。
     {
         let mc = mesh_ctl.clone();
+        let note_mgr = mgr.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(crate::mesh::deliver::TICK);
+            // 登录、退出、改名都在这一拍里跟上。
+            refresh_peer_note(&mc, &note_mgr);
             if let Some((m, n)) = mc.running() {
                 // 一拍里敲字 panic 了，这条线不能跟着死（`tick_catching`）。
                 crate::mesh::deliver::tick_catching(&m);
@@ -823,6 +833,20 @@ impl MeshCtl {
             .as_ref()
             .map(|rt| (rt.mesh.clone(), rt.net.clone()))
     }
+}
+
+/// 把「这台电脑在组里叫什么」和「说明用哪种语言」交给 `SessionManager`，
+/// 开会话时写进给 agent 的留言说明（`session::peer_note`）。没登录（槽是空的）
+/// 就是 `None`——那时 `dct send` 只会答「没登录」，说明一个字都不该给。
+///
+/// 名字在多电脑的锁里读、**放开锁之后**才交给会话那边：多电脑的代码会反过来
+/// 调进会话（敲留言），拿着这把锁去碰会话就是两头互等。
+fn refresh_peer_note(ctl: &MeshCtl, mgr: &SessionManager) {
+    let name = ctl
+        .running()
+        .and_then(|(m, _)| recover(m.lock()).address_name());
+    mgr.set_machine_name(name);
+    mgr.set_agent_lang(crate::drain::agent_lang(&ctl.socket));
 }
 
 /// `Mesh*` 请求。只从本机 socket 上来（见 `Request::MeshStatus` 的文档）。
@@ -4141,6 +4165,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -4370,6 +4395,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -5062,6 +5088,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -6065,6 +6092,37 @@ mod mesh_tests {
         assert_eq!(rt.token.get(), "tok-1", "在跑的连接换上了新令牌");
         assert_eq!(rt.mesh.lock().unwrap().roster.as_ref().unwrap().roster.version, 1);
         rt.link.stop();
+    }
+
+    /// 开会话时那段留言说明要的名字：没登录是 `None`（盖掉旧值），登录之后
+    /// 就是名单上这台电脑的名字，语言跟着 `settings.json`。
+    #[test]
+    fn refresh_peer_note_follows_the_mesh_login() {
+        let (t, socket, secrets) = home();
+        let ctl = ctl_for(&socket);
+        let mgr = SessionManager::new();
+        mgr.set_machine_name(Some("stale".into()));
+        refresh_peer_note(&ctl, &mgr);
+        assert_eq!(mgr.machine_name(), None, "没登录就不该有名字");
+
+        secrets.lock().unwrap().set("dc", "sk-dc").unwrap();
+        let fake = |_: &str, _: &str, _: &str| {
+            Ok((200, format!(r#"{{"token":"tok","exp":{}}}"#, u64::MAX / 2)))
+        };
+        let r = mesh_call(
+            Request::MeshLogin,
+            &ctl,
+            &secrets,
+            &t.path().join("profiles"),
+            &fake,
+        );
+        let Response::Mesh(v) = r else {
+            panic!("{r:?}")
+        };
+        assert!(!v.name.is_empty());
+        refresh_peer_note(&ctl, &mgr);
+        assert_eq!(mgr.machine_name(), Some(v.name.clone()));
+        recover(ctl.slot.lock()).as_ref().unwrap().link.stop();
     }
 
     #[test]
