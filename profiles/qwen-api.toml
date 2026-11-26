@@ -35,6 +35,9 @@ resume_id_args = ["--resume", "{id}"]
 # 读不到就照旧。实测：claude 2.1.302（2026-10-18）。
 conversation_file = "~/.claude/sessions/{pid}.json"
 conversation_file_key = "sessionId"
+# 开会话时告诉 agent 怎么给别的会话留言（`session::peer_note`），追加在系统
+# 提示词后面。实测：claude 2.1.332（2026-11-26），多行中文原样读到。
+note_args = ["--append-system-prompt", "{note}"]
 
 [label]
 zh = "Qwen API"

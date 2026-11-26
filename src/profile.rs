@@ -196,11 +196,26 @@ pub struct Profile {
     /// 跟 `conversation_file` 两个都写了才读，见 `learns_conversation_from_file`。
     #[serde(default)]
     pub conversation_file_key: String,
+    /// 开会话时交给 agent 的「附加说明」参数，`{note}` 由 dct 换成那段说明
+    /// （见 `session::peer_note`：告诉它怎么用 `dct send` 给别的会话留言）。
+    /// 不管是新开、按 id 接回还是 `--continue` 接回都带上——说明是 dct 给的，
+    /// 不在对话里，接回的对话也要重新告诉一遍。
+    ///
+    /// **只给实测过「agent 真的读到了这段话」的 profile 写**：编一个出来，
+    /// 轻则 agent 不认这个参数、整个会话起不来，重则把说明当成用户的第一句话。
+    /// 这台电脑没登录多电脑（`dct send` 会答「没登录」）时什么都不加。
+    #[serde(default)]
+    pub note_args: Vec<String>,
 }
 
 /// 把参数里的 `{id}` 换成真正的 id。
 pub fn fill_id(args: &[String], id: &str) -> Vec<String> {
     args.iter().map(|a| a.replace("{id}", id)).collect()
+}
+
+/// 把参数里的 `{note}` 换成那段说明，同 `fill_id`。
+pub fn fill_note(args: &[String], note: &str) -> Vec<String> {
+    args.iter().map(|a| a.replace("{note}", note)).collect()
 }
 
 impl Profile {
@@ -1730,9 +1745,34 @@ mod tests {
     }
 
     #[test]
+    fn fill_note_replaces_placeholder_only() {
+        let args = vec!["-c".to_string(), "developer_instructions={note}".to_string()];
+        assert_eq!(
+            fill_note(&args, "a\nb"),
+            vec!["-c", "developer_instructions=a\nb"]
+        );
+    }
+
+    /// 实测过的六个带 `{note}`；其余没测过的一条都不许编。
+    #[test]
+    fn only_tested_builtins_declare_note_args() {
+        for name in ["claude", "kimi", "glm", "deepseek", "qwen-api"] {
+            let p = Profile::builtin(name).unwrap();
+            assert_eq!(p.note_args, vec!["--append-system-prompt", "{note}"], "{name}");
+        }
+        let codex = Profile::builtin("codex").unwrap();
+        assert_eq!(codex.note_args, vec!["-c", "developer_instructions={note}"]);
+        for name in ["qwen", "dc", "opencode", "shell"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(p.note_args.is_empty(), "{name}: 没实测过，不该编 note_args");
+        }
+    }
+
+    #[test]
     fn profile_without_new_fields_still_parses() {
         let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\n").unwrap();
         assert!(p.session_id_args.is_empty() && p.resume_id_args.is_empty());
+        assert!(p.note_args.is_empty());
     }
 
     /// `pairable` 的默认值必须是 `false`：用户自己写的 profile 没提这个

@@ -25,6 +25,14 @@ pub fn launch_argv(argv: &[String]) -> Vec<String> {
     imp::launch_argv(argv)
 }
 
+/// 交给这条命令的参数能不能**原样**到它手里。Unix 上恒为真。Windows 上
+/// 命令是 `.cmd`/`.bat`（npm 装的 `claude`、`codex` 都是）时为假：参数要
+/// 先过一遍 cmd.exe，换行会截断整行，`\"` 它不认、会把引号配错，一段话
+/// 就被拆成好几个参数——agent 会把后半截当成用户的第一句话。
+pub fn args_reach_program_intact(argv: &[String]) -> bool {
+    imp::args_reach_program_intact(argv)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
@@ -52,6 +60,10 @@ mod imp {
 
     pub fn launch_argv(argv: &[String]) -> Vec<String> {
         argv.to_vec()
+    }
+
+    pub fn args_reach_program_intact(_argv: &[String]) -> bool {
+        true
     }
 }
 
@@ -118,6 +130,13 @@ mod imp {
         out.push(path.to_string_lossy().into_owned());
         out.extend(argv[1..].iter().cloned());
         out
+    }
+
+    pub fn args_reach_program_intact(argv: &[String]) -> bool {
+        match argv.first().and_then(|c| find_command(c.as_str())) {
+            Some(path) => !is_script(&path),
+            None => true,
+        }
     }
 }
 

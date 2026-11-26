@@ -20,6 +20,10 @@ is_agent = true
 # 剩下那 1 秒左右的空当没有任何标记，靠平稳重启那边「连续空闲 3 秒才算
 # 停下」兜住（`drain::IDLE_SETTLE`）。
 busy_pattern = "esc to interrupt|tab to queue|· [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"
+# 开会话时告诉 agent 怎么给别的会话留言（`session::peer_note`）。实测
+# codex-cli 0.172.0（2026-11-26）：`developer_instructions=` 后面直接跟多行
+# 中文，codex 当成一段字面字符串收下，模型看得到。
+note_args = ["-c", "developer_instructions={note}"]
 
 [label]
 zh = "Codex"

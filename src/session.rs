@@ -748,6 +748,16 @@ pub struct SessionManager {
     resume_watching: AtomicBool,
     /// 最近结束、已经从名册上抹掉的会话，见 `ended` 模块。只在内存里。
     recently_ended: Mutex<crate::ended::RecentlyEnded>,
+    /// 这台电脑在多电脑组里的名字——`dct send "<名字>/#3"` 认的那个。`None` =
+    /// 没登录（`dct send` 会答「没登录」），开会话时就不交那段留言说明
+    /// （`peer_note`）：说明不能许一个做不到的诺。
+    ///
+    /// 由守护进程填（`daemon.rs`，起来时一次、之后每拍一次），**开会话这条路
+    /// 绝不去锁多电脑那边**：那边的代码会反过来调进会话（敲留言），两头互相
+    /// 等就是死锁。
+    machine_name: Mutex<Option<String>>,
+    /// 那段说明用哪种语言（`drain::agent_lang`），同样由守护进程填。
+    agent_lang: Mutex<crate::i18n::Lang>,
 }
 
 /// 见 `SessionManager::liveness`。
@@ -795,6 +805,12 @@ pub(crate) fn recover<T>(r: std::sync::LockResult<T>) -> T {
     r.unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// 开会话时交给 agent 的那段说明：它是电脑 `machine` 上的 `id` 号会话，
+/// 怎么用 `dct send` 给别的会话留言。文案在 `i18n::msg::peer_note`。
+pub fn peer_note(machine: &str, id: u32, lang: crate::i18n::Lang) -> String {
+    crate::i18n::msg::peer_note(lang, machine, id)
+}
+
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
@@ -834,6 +850,20 @@ impl SessionManager {
         self.resume_watching.load(Ordering::SeqCst)
     }
 
+    /// 记下这台电脑在组里的名字，见 `machine_name` 字段。
+    pub fn set_machine_name(&self, name: Option<String>) {
+        *recover(self.machine_name.lock()) = name;
+    }
+
+    pub fn machine_name(&self) -> Option<String> {
+        recover(self.machine_name.lock()).clone()
+    }
+
+    /// 那段说明用哪种语言，见 `agent_lang` 字段。
+    pub fn set_agent_lang(&self, lang: crate::i18n::Lang) {
+        *recover(self.agent_lang.lock()) = lang;
+    }
+
     /// 测试用：把 `ready_for_keys` 要等的三段时间改短，不用每条测试干等五秒。
     #[cfg(test)]
     pub fn set_type_waits_for_test(&self, spawn: Duration, idle: Duration, quiet: Duration) {
@@ -850,6 +880,8 @@ impl SessionManager {
             restoring: AtomicBool::new(false),
             resume_watching: AtomicBool::new(false),
             recently_ended: Mutex::new(crate::ended::RecentlyEnded::default()),
+            machine_name: Mutex::new(None),
+            agent_lang: Mutex::new(crate::i18n::Lang::Zh),
             sessions: Mutex::new(HashMap::new()),
             extra_profiles: Mutex::new(HashMap::new()),
             journal: crate::journal::Journal::new(),
@@ -1515,6 +1547,18 @@ impl SessionManager {
                 }
             }
         };
+
+        // 告诉 agent 怎么给别的会话留言。接回的也带：说明不在对话里。
+        // 没登录（不知道名字）就不说——`dct send` 那时只会答「没登录」。
+        if !profile.note_args.is_empty()
+            && crate::sys::shell::args_reach_program_intact(&command)
+        {
+            if let Some(machine) = self.machine_name() {
+                let lang = *recover(self.agent_lang.lock());
+                let note = peer_note(&machine, id, lang);
+                command.extend(crate::profile::fill_note(&profile.note_args, &note));
+            }
+        }
 
         let pty = PtySession::spawn(&command, &env, dir, 40, 120)?;
 
@@ -2604,6 +2648,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -2676,6 +2721,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -2709,6 +2755,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -2743,6 +2790,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
             backend_only: false,
         }
@@ -3510,6 +3558,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
         });
         m.set_backend(Some(Arc::new(ByScreenTail)));
@@ -5505,6 +5554,99 @@ mod tests {
         ));
         mgr.register_profile(p.clone());
         mgr.create(dir, &p.name, empty_secrets(), &[]).unwrap()
+    }
+
+    /// 把收到的参数一行一个写进工作目录下的 `args.txt`，写完印一句 `DONE`。
+    /// 不看屏幕：那段说明又长又是双宽字，在 120 列里会折行。
+    fn note_probe_profile(note_args: &str) -> Profile {
+        Profile::from_toml(&crate::sys::testing::toml_with_sh(&format!(
+            r#"
+            name = "note-probe"
+            command = ["/bin/sh", "-c", "printf '[%s]\n' \"$@\" > args.txt; echo DONE; sleep 5", "sh"]
+            is_agent = false
+            session_id_args = ["--session-id", "{{id}}"]
+            resume_id_args = ["--resume", "{{id}}"]
+            {note_args}
+            "#
+        )))
+        .unwrap()
+    }
+
+    fn probe_args(mgr: &SessionManager, id: u32, dir: &Path) -> String {
+        wait_for_screen(mgr, id, "DONE");
+        std::fs::read_to_string(dir.join("args.txt")).unwrap()
+    }
+
+    #[test]
+    fn spawn_passes_the_peer_note_when_the_machine_name_is_known() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.set_machine_name(Some("Mac 2".into()));
+        mgr.register_profile(note_probe_profile(r#"note_args = ["--note", "{note}"]"#));
+
+        let id = mgr.create(tmp.path(), "note-probe", None, &[]).unwrap();
+        let args = probe_args(&mgr, id, tmp.path());
+        assert!(args.contains("[--note]"), "{args}");
+        assert!(args.contains(&format!("是电脑「Mac 2」上的 {id} 号会话")), "{args}");
+        assert!(args.contains("dct send \"Mac 2/#编号\""), "{args}");
+        assert!(args.contains(&peer_note("Mac 2", id, crate::i18n::Lang::Zh)), "{args}");
+    }
+
+    #[test]
+    fn spawn_passes_no_note_when_not_logged_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.register_profile(note_probe_profile(r#"note_args = ["--note", "{note}"]"#));
+
+        let id = mgr.create(tmp.path(), "note-probe", None, &[]).unwrap();
+        let args = probe_args(&mgr, id, tmp.path());
+        assert!(!args.contains("--note"), "没登录不该交说明：{args}");
+        assert!(!args.contains("dct send"), "{args}");
+    }
+
+    #[test]
+    fn spawn_passes_no_note_for_a_profile_without_note_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.set_machine_name(Some("Mac 2".into()));
+        mgr.register_profile(note_probe_profile(""));
+
+        let id = mgr.create(tmp.path(), "note-probe", None, &[]).unwrap();
+        let args = probe_args(&mgr, id, tmp.path());
+        assert!(args.contains("[--session-id]"), "{args}");
+        assert!(!args.contains("dct send"), "{args}");
+    }
+
+    #[test]
+    fn a_resumed_session_also_gets_the_peer_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new();
+        mgr.set_machine_name(Some("Mac 2".into()));
+        mgr.register_profile(note_probe_profile(r#"note_args = ["--note", "{note}"]"#));
+
+        let id = mgr
+            .create_resuming(tmp.path(), "note-probe", None, &[], false, None, Some("abc"))
+            .unwrap();
+        let args = probe_args(&mgr, id, tmp.path());
+        assert!(args.contains("[--resume]\n[abc]\n[--note]"), "{args}");
+        assert!(args.contains(&format!("是电脑「Mac 2」上的 {id} 号会话")), "{args}");
+    }
+
+    #[test]
+    fn peer_note_names_the_machine_the_address_and_the_session() {
+        use crate::i18n::Lang;
+        let zh = peer_note("Mac 2", 7, Lang::Zh);
+        let en = peer_note("Mac 2", 7, Lang::En);
+        assert!(zh.contains("「Mac 2」上的 7 号会话"), "{zh}");
+        assert!(zh.contains("dct send \"Mac 2/#编号\" \"内容\""), "{zh}");
+        assert!(zh.contains("dct ps") && zh.contains("dct peers"), "{zh}");
+        assert!(zh.contains("「[来自 …」"), "{zh}");
+        assert_eq!(zh.lines().count(), 6, "{zh}");
+        assert!(en.contains("session 7") && en.contains("\"Mac 2\""), "{en}");
+        assert!(en.contains("dct send \"Mac 2/#<number>\""), "{en}");
+        assert!(en.contains("[来自 …"), "留言标记两种语言都一样：{en}");
+        assert_eq!(en.lines().count(), 6, "{en}");
+        assert_ne!(zh, en);
     }
 
     fn wait_for_screen(mgr: &SessionManager, id: u32, needle: &str) {
