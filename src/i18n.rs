@@ -1993,6 +1993,27 @@ pub mod msg {
 
     /// 组头上的「N 个出错」。会话静默失败是 dct 最贵的失败模式，
     /// 组头上必须一眼看得见。
+    /// 看板状态栏里的「空闲 3分钟」。`secs` 是离上次真的被用过多久，`None`
+    /// 是不知道（旧守护进程不带这个时刻）。不到一分钟只写「空闲」：秒数每帧
+    /// 都在跳，看着像出了什么事，而它说的只是「刚停下」。
+    pub fn idle_for(lang: Lang, secs: Option<u64>) -> String {
+        let base = text(Key::StatusIdle, lang);
+        let Some(secs) = secs.filter(|s| *s >= 60) else {
+            return base.to_string();
+        };
+        let (n, zh, en) = if secs < 3600 {
+            (secs / 60, "分钟", "m")
+        } else if secs < 86_400 {
+            (secs / 3600, "小时", "h")
+        } else {
+            (secs / 86_400, "天", "d")
+        };
+        match lang {
+            Lang::En => format!("{base} {n}{en}"),
+            Lang::Zh => format!("{base} {n}{zh}"),
+        }
+    }
+
     pub fn failed_count(lang: Lang, n: usize) -> String {
         match lang {
             Lang::En => format!("{n} failed"),
@@ -3547,6 +3568,20 @@ mod tests {
             ManualEntry,
         ]
     };
+
+    /// 「空闲」后面跟多久：不到一分钟不写，然后分钟、小时、天各取整。
+    #[test]
+    fn idle_for_says_how_long_in_the_largest_whole_unit() {
+        use super::msg::idle_for;
+        assert_eq!(idle_for(Lang::Zh, None), "空闲");
+        assert_eq!(idle_for(Lang::Zh, Some(59)), "空闲");
+        assert_eq!(idle_for(Lang::Zh, Some(3 * 60 + 5)), "空闲 3分钟");
+        assert_eq!(idle_for(Lang::Zh, Some(2 * 3600 + 59 * 60)), "空闲 2小时");
+        assert_eq!(idle_for(Lang::Zh, Some(3 * 86_400)), "空闲 3天");
+        assert_eq!(idle_for(Lang::En, Some(3 * 60)), "idle 3m");
+        assert_eq!(idle_for(Lang::En, Some(2 * 3600)), "idle 2h");
+        assert_eq!(idle_for(Lang::En, Some(3 * 86_400)), "idle 3d");
+    }
 
     /// 英文词条里不许出现汉字。批量加词条时最容易犯的错就是把中文那行抄过去——
     /// profile 那边已经踩过一次（`shell` 的 label 变成 `en = "命令行"`）。

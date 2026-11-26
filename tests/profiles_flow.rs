@@ -138,6 +138,7 @@ fn two_projects_each_keep_their_own_agent_over_the_wire() {
         idle_pattern: None,
         busy_pattern: None,
         error_pattern: None,
+        activity_noise: Vec::new(),
         env: Default::default(),
         secret: None,
         install: None,

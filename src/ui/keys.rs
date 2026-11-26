@@ -457,7 +457,8 @@ mod tests {
             id: 1,
             profile: "claude".into(),
             dir: "/w/proj".into(),
-            state: crate::session::SessionState::Idle,
+            // 干活中：空闲的会话在看板上不写 activity（它停着，那一行说明不了什么）
+            state: crate::session::SessionState::Working,
             activity: "背后的看板".into(),
             is_agent: true,
             tag: String::new(),
@@ -489,7 +490,7 @@ mod tests {
             tag: String::new(),
             last_active_ms: 0,
         }]);
-        app.list_state.select(Some(1));
+        app.list_state.select(Some(0));
         open(&mut app);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| super::super::draw(f, &mut app)).unwrap();
