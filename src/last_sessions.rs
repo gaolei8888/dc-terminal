@@ -74,6 +74,12 @@ pub struct RecordedSession {
     /// 整句）。重启后等会话空下来照常送。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held_messages: Vec<String>,
+    /// 这个会话从没提交过一句话（`Session::submitted` 为假）：agent 那边没有
+    /// 对话可接，重启后从空白开始，**不**带 `--continue`——不然 claude 印一句
+    /// 「No conversation found to continue」就退出，或者接到同目录别的会话
+    /// 留下的旧对话上。见 `continue_flags`。旧文件没有这一项 = 用过，照旧。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unused: bool,
 }
 
 /// 磁盘格式。跟 `secrets.rs` 一样包一层表，留出将来加别的段的余地。
@@ -229,6 +235,8 @@ pub fn continue_flags(
         .iter()
         .map(|r| will_resume_by_id(r, profiles))
         .collect();
+    // 没用过的会话不进任何一组：它自己不接，也不跟真有对话的兄弟抢「最新」。
+    let unused: Vec<bool> = sessions.iter().map(|r| r.unused).collect();
     let sibling_has_id = |i: usize| {
         (0..sessions.len()).any(|j| {
             by_id[j] && sessions[j].dir == sessions[i].dir && sessions[j].profile == sessions[i].profile
@@ -237,13 +245,14 @@ pub fn continue_flags(
     let newest_in_group = |i: usize| {
         (0..sessions.len()).all(|j| {
             j == i
+                || unused[j]
                 || sessions[j].dir != sessions[i].dir
                 || sessions[j].profile != sessions[i].profile
                 || sessions[j].last_active < sessions[i].last_active
         })
     };
     let idx: Vec<usize> = (0..sessions.len())
-        .filter(|&i| !by_id[i] && !sibling_has_id(i))
+        .filter(|&i| !by_id[i] && !unused[i] && !sibling_has_id(i))
         .collect();
     let sub: Vec<RecordedSession> = idx.iter().map(|&i| sessions[i].clone()).collect();
     let flags = group_for_resume(&sub);
@@ -252,7 +261,7 @@ pub fn continue_flags(
         out[i] = flags[k];
     }
     for i in 0..sessions.len() {
-        if !by_id[i] && sibling_has_id(i) && newest_in_group(i) {
+        if !by_id[i] && !unused[i] && sibling_has_id(i) && newest_in_group(i) {
             out[i] = true;
         }
     }
@@ -303,6 +312,7 @@ mod tests {
             id: Some(7),
             restart_initiator: true,
             held_messages: vec!["[来自 pc] 你好".into()],
+            unused: false,
         };
         save(&p, std::slice::from_ref(&r)).unwrap();
         assert_eq!(load(&p), vec![r]);
@@ -326,6 +336,46 @@ mod tests {
             continue_flags(&sessions, &profiles),
             vec![false, false, false, false, true]
         );
+    }
+
+    /// 从没提交过一句话的会话（比如常驻的家教，没人叫过它）：agent 那边根本
+    /// 没有对话，`claude --continue` 只会印「No conversation found to
+    /// continue」然后退出——实测 2026-11-26，家教每次平稳重启都这样死一回，
+    /// 再被常驻看守换个新号开出来。这种一律从空白开始；它也不该挡住同组里
+    /// 真有对话的那条拿到 `--continue`。
+    #[test]
+    fn an_unused_record_never_continues_and_does_not_block_its_group() {
+        let profiles = vec![crate::profile::Profile::builtin("claude").unwrap()];
+        let mut unused = rec("/w/t", "claude", 9);
+        unused.unused = true;
+        assert_eq!(continue_flags(&[unused.clone()], &profiles), vec![false]);
+        let older = rec("/w/t", "claude", 3);
+        assert_eq!(
+            continue_flags(&[unused.clone(), older], &profiles),
+            vec![false, true]
+        );
+        // 兄弟按 id 接回时，没 id 的那条最新才带 `--continue`：没用过的那条
+        // 再新也不算数。
+        let mut by_id = rec("/w/t", "claude", 5);
+        by_id.conversation_id = Some("b".into());
+        let continued = rec("/w/t", "claude", 7);
+        assert_eq!(
+            continue_flags(&[unused, by_id, continued], &profiles),
+            vec![false, false, true]
+        );
+    }
+
+    #[test]
+    fn unused_round_trips_and_old_files_default_to_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("last-sessions.toml");
+        let mut r = rec("/tmp", "claude", 1);
+        r.unused = true;
+        save(&p, &[r, rec("/tmp", "claude", 2)]).unwrap();
+        let v = load(&p);
+        assert!(v[0].unused);
+        assert!(!v[1].unused);
+        assert!(!std::fs::read_to_string(&p).unwrap().contains("unused = false"));
     }
 
     /// I2：没 id 的会话（上次是 `--continue` 接回来的）跟有 id 的兄弟在同一个
