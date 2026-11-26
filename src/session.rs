@@ -1296,6 +1296,7 @@ impl SessionManager {
                     id: Some(s.id),
                     restart_initiator: marks.initiator == Some(s.id),
                     held_messages: marks.held.get(&s.id).cloned().unwrap_or_default(),
+                    unused: !s.submitted,
                 })
             })
             .collect();
@@ -1681,7 +1682,9 @@ impl SessionManager {
             id,
             profile,
             conversation_id,
-            submitted: existing_conversation,
+            // 走 `--continue` 接回来的也算用过：接得回来就说明那边有对话，下次
+            // 重启照样该接（profile 不按 id 接回时，这是它唯一的标记）。
+            submitted: existing_conversation || continuing,
             requested_end: None,
             dir: dir.to_path_buf(),
             is_agent,
@@ -2462,6 +2465,14 @@ mod tests {
         }
         assert_eq!(
             clean_activity("← for agents · ? for shortcuts", &noise_of("codex")),
+            ""
+        );
+        // 2026-11-26 重启后三个 codex 会话的真实末行：右边多了一段警告提示。
+        assert_eq!(
+            clean_activity(
+                "← for agents · ? for shortcuts                ⚠ 1 warning · f2 to view",
+                &noise_of("codex")
+            ),
             ""
         );
     }
