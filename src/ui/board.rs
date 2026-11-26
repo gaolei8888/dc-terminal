@@ -377,8 +377,8 @@ fn group_labels(groups: &[ProjectGroup], cap: usize) -> Vec<String> {
 /// - `Row::Single`：一个会话的组，项目和会话合成一行——绝大多数项目就是这样。
 /// - `Row::Header`：两个以上会话的组的标题，只写项目名；有出错的会话时在
 ///   状态那一列写红色的「N 个出错」。
-/// - `Row::Session`：标题下面那几行，项目那一列空着，行首一个 `├`/`└` 把它们
-///   挂在标题下面。
+/// - `Row::Session`：标题下面那几行，项目那一列空着，末尾一个 `├`/`└` 紧贴
+///   会话号，把它们挂在标题下面。
 ///
 /// **红字永远不能被挤下屏幕。** 会话静默失败是 dct 最贵的失败模式：组头的
 /// 「N 个出错」写在状态那一列，前面只有长度封了顶的项目名；单会话行的
@@ -454,13 +454,10 @@ fn rows_for(
                 _ => "   ".into(),
             };
             line.push(num, dim());
-            // 组里的会话行挂一个 `├`/`└`，把它们跟上面那行标题连起来。
             let fold = match row {
                 Row::Header(_) if g.collapsed => "▸",
                 Row::Header(_) => "▾",
-                Row::Single(_) => " ",
-                Row::Session(_, si) if *si + 1 == g.sessions.len() => "└",
-                Row::Session(..) => "├",
+                Row::Single(_) | Row::Session(..) => " ",
             };
             line.push(fold.into(), dim());
 
@@ -468,7 +465,14 @@ fn rows_for(
             // 打开），组照常留在看板上——让它消失才是真的找不回来了。
             let gone = !g.dir.exists();
             match row {
-                Row::Session(..) => line.push(" ".repeat(cols.proj), Style::default()),
+                // 组里的会话行：项目那一格空着，末尾挂一个 `├`/`└` 紧贴会话号，
+                // 把这几行跟上面那行标题连起来。挂在行首的话，它跟会话号之间
+                // 隔着一整列空白，看着像飘在那儿，什么都没连上。
+                Row::Session(_, si) => {
+                    let branch = if *si + 1 == g.sessions.len() { "└" } else { "├" };
+                    line.push(" ".repeat(cols.proj - 2), Style::default());
+                    line.push(format!("{branch} "), dim());
+                }
                 // 当前项目的名字**反白成一块牌子**，不是加粗了事：屏幕上每个
                 // 项目名都是加粗的，加粗认不出哪个是自己那个。用 `REVERSED`
                 // 而不是挑一个具名色，理由跟底栏那块牌子一样（`ui/mod.rs`）：
@@ -1656,8 +1660,9 @@ mod tests {
         // 第 0 行是标题；列表从第 1 行开始
         assert!(r[1].contains("aaa-one") && r[1].contains("  1  "), "aaa 合成一行：{r:#?}");
         assert!(r[2].contains("bbb-two") && !r[2].contains("  2  "), "bbb 的标题行：{r:#?}");
-        assert!(r[3].contains("├") && r[3].contains("  2  "), "{r:#?}");
-        assert!(r[4].contains("└") && r[4].contains("  3  "), "{r:#?}");
+        // 树枝紧贴会话号，不是飘在行首
+        assert!(r[3].contains("├   2  "), "{r:#?}");
+        assert!(r[4].contains("└   3  "), "{r:#?}");
         assert!(r[5].is_empty(), "三个会话、两个项目，一共四行：{r:#?}");
         assert!(!r.iter().any(|l| l.contains('×')), "不再数智能体：{r:#?}");
     }
