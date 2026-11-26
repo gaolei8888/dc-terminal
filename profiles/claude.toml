@@ -23,6 +23,20 @@ busy_pattern = "esc to interrupt"
 # 判定退回「不表态」——保持原状态，不会退回到谎称空闲。
 idle_pattern = "(?m)^❯|bypass permissions on"
 error_pattern = "API Error|Connection closed mid-response"
+# 看板 activity 那一列要丢掉的底栏噪音（见 `profile.rs::Profile::activity_noise`）。
+# 每条整段匹配一段 ` · ` 切开的文字（开头的 `⏵⏵`、`←` 这类符号去掉后再比一次）。都是本机真实看板上抄下来的（claude 2.1.33x，
+# 2026-11-26）：空闲时整行就是这些，干活时夹在中间的 `1 shell` 才是有用的那段。
+activity_noise = [
+  "(?:bypass permissions|accept edits|plan mode|don't ask) on(?: \\(shift\\+tab to cycle\\))?",
+  "\\(?shift\\+tab to cycle\\)?",
+  "\\? for shortcuts",
+  "← \\d+ agents?",
+  "← for agents",
+  "\\(?esc to interrupt\\)?",
+  "↓ to manage",
+  "⚠ \\d+ warnings?",
+  "f2 to view",
+]
 # 恢复守护进程重启前的会话时用：`claude --continue` 接回这个目录下
 # 最近一次对话。实测过，不是猜的。
 resume_args = ["--continue"]

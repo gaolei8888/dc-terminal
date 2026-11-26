@@ -2148,7 +2148,7 @@ pub(crate) fn goto_project(app: &mut App, gi: usize) {
         return;
     }
     app.pending_project = None;
-    if let Some(i) = app.rows.iter().position(|r| *r == view::Row::Header(gi)) {
+    if let Some(i) = view::head_row(&app.rows, gi) {
         app.list_state.select(Some(i));
     }
 }
@@ -2209,7 +2209,7 @@ pub(crate) fn point_cursor_at_session(app: &mut App, id: u32) {
     if let Some(i) = app
         .rows
         .iter()
-        .position(|r| *r == view::Row::Session(gi, si))
+        .position(|r| r.session_index() == Some((gi, si)))
     {
         app.list_state.select(Some(i));
     }
@@ -3187,8 +3187,8 @@ mod tests {
     fn pointing_at_a_session_inside_a_collapsed_group_opens_that_group() {
         let (mut app, _d) = App::test_app();
         app.set_sessions(vec![sess_at(1, "/w/a"), sess_at(2, "/w/b")]);
-        // 光标停到 b 的组头上，把 b 折起来
-        app.list_state.select(Some(2));
+        // 光标停到 b 那一行上，把 b 折起来
+        app.list_state.select(Some(1));
         toggle_collapse(&mut app);
         assert!(app.groups[1].collapsed, "前提：b 是折叠的");
         // 回到 a
@@ -3805,6 +3805,7 @@ is_agent = true
             idle_pattern: None,
             busy_pattern: None,
             error_pattern: None,
+            activity_noise: Vec::new(),
             env,
             secret: None,
             install: None,
@@ -4224,9 +4225,9 @@ is_agent = true
             tag: String::new(),
             last_active_ms: 0,
         }]);
-        // 第 0 行是组头，第 1 行才是那个会话。停在组头上等于「没选中会话」，
-        // s/u/d 也就都不该写在底栏上——那是对的行为，但不是这些测试要问的。
-        app.list_state.select(Some(1));
+        // 一个项目一个会话，看板上合成一行（`Row::Single`），光标停在它上面
+        // 就是选中了那个会话——s/u/d 才会写在底栏上，这些测试要问的是那个。
+        app.list_state.select(Some(0));
         app.view = view;
         (app, dir)
     }
@@ -4261,8 +4262,8 @@ is_agent = true
                 last_active_ms: 0,
             },
         ]);
-        // 行序：组头 a / 会话 1 / 组头 b / 会话 2
-        app.list_state.select(Some(1));
+        // 行序：a（会话 1）/ b（会话 2），各合成一行——光标停在第一个项目上
+        app.list_state.select(Some(0));
         app.view = view;
         (app, dir)
     }
@@ -4395,7 +4396,7 @@ is_agent = true
             tag: String::new(),
             last_active_ms: 0,
         }]);
-        app.list_state.select(Some(1));
+        app.list_state.select(Some(0));
         app.view = View::Board;
 
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -4435,7 +4436,9 @@ is_agent = true
     #[test]
     fn a_header_row_does_not_advertise_entering_a_session() {
         let (mut app, _d) = app_with_one_agent_session(View::Board);
+        // 单会话的项目合成一行、那一行就是会话；折起来才剩一个纯组头
         app.list_state.select(Some(0));
+        toggle_collapse(&mut app);
         assert!(app.selected_session().is_none(), "第 0 行该是组头");
         let items = idle_help(&app.view, app.lang, help_ctx(&app));
         let joined = crate::i18n::help_text(&items);
@@ -4796,7 +4799,8 @@ is_agent = true
             id: 1,
             profile: "claude".into(),
             dir: "/w/proj".into(),
-            state: SessionState::Idle,
+            // 干活中：空闲的会话在看板上不写 activity（它停着，那一行说明不了什么）
+            state: SessionState::Working,
             activity: "背后的看板".into(),
             is_agent: true,
             tag: String::new(),

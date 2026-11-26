@@ -1,21 +1,22 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, HighlightSpacing, List, ListItem, Paragraph};
 
 use super::app::App;
 use super::view::is_plain_key;
 use super::widgets::{
     display_width, pad_to, project_label, session_label, status_label, status_style, truncate,
 };
+use super::view::{ProjectGroup, Row};
+use crate::session::{SessionInfo, SessionState};
 use super::{
     accent, danger, dim, open_new_session, open_project_picker, open_secrets, session_action,
 };
 use crate::i18n::{msg, text, Key};
 
-/// 会话行上 activity 之前占几列：`highlight_symbol` 2、项目色条 1、
-/// `  {id:>3}  ` 7、状态 8、智能体 10、名字 16。
-const SESSION_PREFIX_COLS: usize = 2 + 1 + 7 + 8 + 10 + 16;
+/// `▶ ` 那个高亮记号占的列数。
+const SYMBOL_COLS: usize = 2;
 
 /// **这个函数里永远不要 `continue`。** 它是从主循环的 `match` 里抽出来的，
 /// 循环末尾还有一段清理陈旧 `message` 的逻辑；早年这些代码还在循环体里时，
@@ -164,146 +165,6 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let show_version = (area.width as usize)
         >= used + MIN_GAP_BEFORE_VERSION + version_width + MIN_RULE_AFTER_VERSION;
 
-    let items: Vec<ListItem> = app
-        .rows
-        .iter()
-        .map(|row| {
-            let (gi, bar) = match row {
-                super::view::Row::Header(g) | super::view::Row::Session(g, _) => {
-                    (*g, if Some(*g) == current { "┃" } else { " " })
-                }
-            };
-            let g = &app.groups[gi];
-            let mut spans = vec![Span::styled(bar, accent())];
-            match row {
-                super::view::Row::Header(_) => {
-                    // 序号只给前九个组：`1`…`9` 直达。第十个起靠 Tab，
-                    // 印一个按不动的号码等于在屏幕上说谎。
-                    let num = if gi < 9 {
-                        format!(" {} ", gi + 1)
-                    } else {
-                        "   ".to_string()
-                    };
-                    spans.push(Span::styled(num, dim()));
-                    spans.push(Span::raw(if g.collapsed { "▸ " } else { "▾ " }));
-                    // 目录被删了：名字标灰并点出来。会话本身还活着（进程的 cwd
-                    // 已经打开），组照常留在看板上——让它消失才是真的找不回来了。
-                    let gone = !g.dir.exists();
-                    // **先截再补**，跟下面那行父目录一样。`pad_to` 只补不截，
-                    // 光靠它的话一个长目录名（`我的自媒体电商代运营项目` 是
-                    // 24 列，而中文项目名长成这样再普通不过）会把整行右推，
-                    // 80 列上先被吃掉的正是行尾那个红色的「N 个出错」——
-                    // 一个坏掉的项目于是看起来一切正常，而这是 dct 最贵的
-                    // 失败模式。名字裁短了还看得出是哪个项目，出错的红字被
-                    // 裁掉了就什么都没有了。
-                    //
-                    // 上限取 17 不是 18：`truncate` 裁完会补一个 `…`，17 列
-                    // 的内容加那一个字符正好 18，列宽分毫不动。名字比父目录
-                    // 那一列（16）宽一格是有意的——认项目靠的是名字。
-                    //
-                    // 当前项目的名字**反白成一块牌子**，不是加粗了事：屏幕上
-                    // 每个项目名都是加粗的，加粗认不出哪个是自己那个。反白是
-                    // 这一屏里唯一一块底色反过来的地方，不需要先知道「左边那
-                    // 条竖线是什么意思」就跳得出来——而不知道这件事的人正是
-                    // 找不到自己在哪的那个人。用 `REVERSED` 而不是挑一个具名
-                    // 色的理由跟底栏那块牌子一样（见 `ui/mod.rs` 里那段）：
-                    // 六档底栏配色里任何写死的前景色都会在某一档上糊掉。
-                    //
-                    // 列宽分毫不动：牌子前后各垫一个空格，所以名字的预算从
-                    // 17 收到 15（15 列内容 + `truncate` 可能补的那一个 `…`
-                    // + 两个空格 = 18）。这一格右边是 agent 统计和行尾那个
-                    // 红色的「N 个出错」——它被挤掉是 dct 最贵的失败模式，
-                    // 牌子绝不能从别人的列里借宽度。
-                    //
-                    // 目录没了的组不贴牌子：那一行整行标灰是在说「这东西现在
-                    // 是坏的」，反白会把它重新变成屏幕上最显眼的东西。
-                    if Some(gi) == current && !gone {
-                        // 牌子**只包住名字**，右边补的空白照旧是普通底色：
-                        // 反白连着补到 18 列的话，短名字后面会拖出一条长
-                        // 尾巴，看着像进度条而不像一块牌子。补白单独一段，
-                        // 两段加起来仍然是 18 列。
-                        let chip = format!(" {} ", truncate(&g.name, 15));
-                        let w = display_width(&chip);
-                        spans.push(Span::styled(
-                            chip,
-                            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
-                        ));
-                        spans.push(Span::raw(" ".repeat(18usize.saturating_sub(w))));
-                    } else {
-                        spans.push(Span::styled(
-                            pad_to(&truncate(&g.name, 17), 18),
-                            if gone {
-                                dim()
-                            } else {
-                                Style::default().add_modifier(Modifier::BOLD)
-                            },
-                        ));
-                    }
-                    spans.push(Span::styled(pad_to(&truncate(&g.parent, 16), 18), dim()));
-                    if gone {
-                        spans.push(Span::styled(text(Key::ProjectDirGone, app.lang), dim()));
-                    } else {
-                        let agents: Vec<String> = g
-                            .agent_counts()
-                            .into_iter()
-                            .map(|(name, n)| format!("{name}×{n}"))
-                            .collect();
-                        spans.push(Span::raw(pad_to(&agents.join(" "), 22)));
-                        let failed = g.failed();
-                        if failed > 0 {
-                            spans.push(Span::styled(msg::failed_count(app.lang, failed), danger()));
-                        }
-                    }
-                }
-                super::view::Row::Session(_, si) => {
-                    let s = &g.sessions[*si];
-                    spans.push(Span::raw(format!("  {:>3}  ", s.id)));
-                    spans.push(Span::styled(
-                        pad_to(status_label(s.state, app.lang), 8),
-                        status_style(s.state),
-                    ));
-                    // 名字比原来的 profile 那一格宽（10 → 16）：profile 名最长
-                    // 8 列，名字是 12 个汉字。多出来的 6 列从 activity 那边收，
-                    // 整行总宽不变。传 15 给 truncate 而不是 16 —— 它真裁了的
-                    // 时候返回的是 max + 1 列（那个 `…` 是长度判断之后才追加的），
-                    // 照 16 传的话省略号会把列宽顶宽一格。
-                    spans.push(Span::styled(pad_to(&truncate(&s.profile, 9), 10), dim()));
-                    let name = if s.tag.is_empty() { "" } else { session_label(s) };
-                    spans.push(Span::raw(pad_to(&truncate(name, 15), 16)));
-                    // 行尾的标记：上架（在播）和别的电脑送来的留言条数。
-                    let mut marks: Vec<String> = Vec::new();
-                    // 上架标记接在最末尾，不抢前面任何一列的宽度：老师切到
-                    // 别的会话时，得一眼认出「还在播的是这几路」，而这件事
-                    // 只有在直播面板上勾过的那几行才成立（`App::live.staged`）。
-                    if app.live.staged.iter().any(|(id, _)| *id == s.id) {
-                        marks.push(format!(" {}", text(Key::LiveOnAirMark, app.lang)));
-                    }
-                    // 「✉ N」：这次运行期间别的电脑送进这个会话几条留言。
-                    let n = app.mesh.messages_for(s.id);
-                    if n > 0 {
-                        marks.push(format!(" {}", msg::mesh_messages_mark(n)));
-                    }
-                    // 会话行不重复项目名——组头已经说了，宽度还给 activity，
-                    // 它是屏幕上最先被截断的信息。有行尾标记时，activity
-                    // 给它们让出位置：标记被右边挤掉就等于没有。
-                    let marks_w: usize = marks.iter().map(|m| display_width(m)).sum();
-                    let activity_room = if marks_w == 0 {
-                        70
-                    } else {
-                        (area.width as usize)
-                            .saturating_sub(SESSION_PREFIX_COLS + marks_w + 1)
-                            .min(70)
-                    };
-                    spans.push(Span::raw(truncate(&s.activity, activity_room)));
-                    for m in marks {
-                        spans.push(Span::styled(m, accent()));
-                    }
-                }
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-
     // **看板是唯一不用 `widgets::header` 的一屏**，标题仍然嵌在那条横线里。
     //
     // 理由是它是所有浮层的**背景**：选项目的浮层居中盖在它身上，看板往下
@@ -339,13 +200,423 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             list_area,
         );
     } else {
+        // 行内容的宽度：整块列表减掉 `▶ ` 那两列。`HighlightSpacing::Always`
+        // 让每一行都先空出这两列——右对齐的行尾标记要拿这个数算位置，不能
+        // 让它随「有没有选中行」变来变去。
+        let width = (list_area.width as usize).saturating_sub(SYMBOL_COLS);
+        let items = rows_for(app, width, current, now_ms());
+        // 实色档下选中行整行铺上底栏同一档颜色（见 `paint_selected`），
+        // 那时候不再需要 List 自己的高亮；横线档 / `NO_COLOR` 没有实色可铺，
+        // 退回加粗，`▶` 两种情况下都在。
+        let highlight = if super::bar_style(app.bar).is_some() {
+            Style::default()
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
         f.render_stateful_widget(
-            List::new(items).highlight_symbol("▶ "),
+            List::new(items)
+                .highlight_symbol("▶ ")
+                .highlight_spacing(HighlightSpacing::Always)
+                .highlight_style(highlight),
             list_area,
             &mut app.list_state,
         );
     }
     f.render_widget(Paragraph::new(section), section_area);
+}
+
+/// 此刻的 Unix 毫秒，量「空闲多久」用。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 行首那几列固定宽度：项目色条 1、组序号 ` 1 ` 3、折叠记号 `▾` 1。
+/// 记号后面那一格空隙算在项目列里（见 `Cols::proj`）。
+const LEAD_COLS: usize = 1 + 3 + 1;
+/// 会话号 `{id:>3}` 加两格空隙。
+const ID_COLS: usize = 5;
+/// 状态前那个圆点加一格空隙。
+const DOT_COLS: usize = 2;
+/// 列与列之间的空隙。
+const GAP: usize = 2;
+/// 项目名那一列内容的上限（宽屏 / 100 列以下）。超过的裁短——名字裁短了
+/// 还认得出是哪个项目，红字被挤下屏幕就什么都没有了（见 `rows_for` 头上那段）。
+const PROJ_MAX: usize = 16;
+const PROJ_MAX_NARROW: usize = 12;
+/// 会话名那一列的上限，同上。
+const NAME_MAX: usize = 16;
+const NAME_MAX_NARROW: usize = 10;
+/// 窄于这个宽度就用上面那几个 `_NARROW`：80 列上每一格都是从 activity
+/// 那边抠出来的，而 activity 是这一屏上唯一说「它此刻在干什么」的那一列。
+const NARROW: usize = 100;
+/// 智能体名的上限：内置 profile 最长的 `qwen-api` 正好 8 列。
+const AGENT_MAX: usize = 8;
+/// activity 那一列最多画多宽：70 列内容，裁了的话再加那一个 `…`。宽屏上
+/// 一整行 200 列的终端输出读不完，也不是这一列要说的事。
+const ACTIVITY_MAX: usize = 70 + 1;
+
+/// 看板这一屏的列宽。**一帧只算一次**，组头、合成的单会话行、组里的会话行
+/// 都按这一份排——列对不齐，向来是因为每种行各算各的。
+///
+/// 宽度跟着屏幕上真有的内容走（最长的项目名、最长的状态词……），各有上限：
+/// 手上项目都叫 `web`/`api` 的人不该替一个想象中的长名字留 16 列空白，
+/// 而 80 列上每一格都是从 activity 那一列抠出来的。
+struct Cols {
+    /// 项目名那一列：左边一格（牌子的左垫）、名字、右边一格（牌子的右垫）、
+    /// 再一格空隙。**没戴牌子的名字也从左边第二格起写**，所以戴不戴牌子，
+    /// 名字的第一个字都落在同一列上。
+    proj: usize,
+    /// 状态词，不含前面的圆点。
+    status: usize,
+    /// 智能体名。
+    agent: usize,
+    /// 会话名。0 = 这一屏没有一个会话起了名字，这一列连空隙一起省掉。
+    name: usize,
+}
+
+impl Cols {
+    /// 一行会话在 activity 之前占掉的列数。
+    fn prefix(&self) -> usize {
+        LEAD_COLS
+            + self.proj
+            + ID_COLS
+            + DOT_COLS
+            + self.status
+            + GAP
+            + self.agent
+            + GAP
+            + if self.name == 0 { 0 } else { self.name + GAP }
+    }
+}
+
+/// 裁到**不超过** `w` 列。`truncate` 真裁了的时候会多补一个 `…`（max + 1 列），
+/// 这里把那一格先让出来，调用方不用再记着「传 15 才是 16」。
+fn clip(s: &str, w: usize) -> String {
+    if w == 0 {
+        String::new()
+    } else if display_width(s) <= w {
+        truncate(s, w)
+    } else {
+        truncate(s, w - 1)
+    }
+}
+
+/// 会话的状态记号和状态词的颜色：一档强调色给干活中，灰给空闲，红只给出错。
+///
+/// 不直接用 `status_style`：那是九宫格标题条的配色，空闲在那儿是绿的。看板
+/// 一屏二十几行，绿的空闲和青的干活中挨在一起，扫一眼分不出谁在动——这里要
+/// 的是「在动的亮、停着的暗」。等你回答照旧用它自己那档暖色，出错照旧红。
+fn state_mark(state: SessionState) -> (&'static str, Style) {
+    match state {
+        SessionState::Working => ("●", accent()),
+        SessionState::Asking => ("◆", status_style(SessionState::Asking)),
+        SessionState::Idle => ("○", dim()),
+        SessionState::Failed => ("✕", danger()),
+        SessionState::Stopped => ("·", dim()),
+        // 状态词本身就是「—」（不知道），前面再点一个记号是在装作知道点什么。
+        SessionState::Unknown => (" ", dim()),
+    }
+}
+
+/// 状态那一格的字：空闲的带上空了多久。
+fn state_text(s: &SessionInfo, lang: crate::i18n::Lang, now_ms: u64) -> String {
+    if s.state == SessionState::Idle {
+        let secs = (s.last_active_ms > 0).then(|| now_ms.saturating_sub(s.last_active_ms) / 1000);
+        msg::idle_for(lang, secs)
+    } else {
+        status_label(s.state, lang).to_string()
+    }
+}
+
+/// 会话那一格的名字。没起名字时留空——智能体那一列已经写着 profile 了，
+/// `session_label` 的回落在这里只会把同一个词印两遍。
+fn session_name(s: &SessionInfo) -> &str {
+    if s.tag.is_empty() {
+        ""
+    } else {
+        session_label(s)
+    }
+}
+
+/// 一行正在拼的字，顺手记着已经用掉多少列。
+struct Cells {
+    spans: Vec<Span<'static>>,
+    w: usize,
+}
+
+impl Cells {
+    fn push(&mut self, text: String, style: Style) {
+        self.w += display_width(&text);
+        self.spans.push(Span::styled(text, style));
+    }
+}
+
+/// 每个组在项目那一列上写什么：通常只是名字；**两个组同名时**才带上父目录，
+/// 用 `project_label` 从近到远贴几段——两个 `web` 并排，光看名字认不出哪个
+/// 是哪个，而不重名的时候那串路径什么都没说，只占地方。
+fn group_labels(groups: &[ProjectGroup], cap: usize) -> Vec<String> {
+    groups
+        .iter()
+        .map(|g| {
+            if groups.iter().filter(|o| o.name == g.name).count() > 1 {
+                project_label(&g.name, &g.parent, cap)
+            } else {
+                g.name.clone()
+            }
+        })
+        .collect()
+}
+
+/// 看板列表的每一行。
+///
+/// 三种行共用一套列（`Cols`）：
+///
+/// - `Row::Single`：一个会话的组，项目和会话合成一行——绝大多数项目就是这样。
+/// - `Row::Header`：两个以上会话的组的标题，只写项目名；有出错的会话时在
+///   状态那一列写红色的「N 个出错」。
+/// - `Row::Session`：标题下面那几行，项目那一列空着，末尾一个 `├`/`└` 紧贴
+///   会话号，把它们挂在标题下面。
+///
+/// **红字永远不能被挤下屏幕。** 会话静默失败是 dct 最贵的失败模式：组头的
+/// 「N 个出错」写在状态那一列，前面只有长度封了顶的项目名；单会话行的
+/// 「✕ 出错了」也在状态列。会被截的只有 activity，它在行尾的标记（`● 播`、
+/// `✉ N`）之前先让位。
+fn rows_for(
+    app: &App,
+    width: usize,
+    current: Option<usize>,
+    now_ms: u64,
+) -> Vec<ListItem<'static>> {
+    let lang = app.lang;
+    let narrow = width < NARROW;
+    let proj_cap = if narrow { PROJ_MAX_NARROW } else { PROJ_MAX };
+    let name_cap = if narrow { NAME_MAX_NARROW } else { NAME_MAX };
+    let labels = group_labels(&app.groups, proj_cap);
+    let shown: Vec<&SessionInfo> = app
+        .rows
+        .iter()
+        .filter_map(|r| r.session_index())
+        .filter_map(|(g, s)| app.groups.get(g)?.sessions.get(s))
+        .collect();
+    let cols = Cols {
+        // 内容 + 牌子左右各一格 + 一格空隙：当前项目的名字反白成一块牌子
+        // （见下面），牌子不许从别的列借宽度。
+        proj: app
+            .rows
+            .iter()
+            .filter(|r| !matches!(r, Row::Session(..)))
+            .map(|r| display_width(&labels[r.group()]).min(proj_cap))
+            .max()
+            .unwrap_or(0)
+            .max(4)
+            + 3,
+        status: shown
+            .iter()
+            .map(|s| display_width(&state_text(s, lang, now_ms)))
+            .max()
+            .unwrap_or(0),
+        agent: shown
+            .iter()
+            .map(|s| display_width(&s.profile).min(AGENT_MAX))
+            .max()
+            .unwrap_or(0),
+        name: shown
+            .iter()
+            .map(|s| display_width(session_name(s)).min(name_cap))
+            .max()
+            .unwrap_or(0),
+    };
+    let selected = app.list_state.selected();
+
+    app.rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let gi = row.group();
+            let g = &app.groups[gi];
+            let mut line = Cells {
+                spans: Vec::new(),
+                w: 0,
+            };
+            // 当前项目：整组左侧一条竖色条。光标只标「哪一行」，项目要的是
+            // 「哪一片」，隔着屏幕就得认得出来。
+            line.push(
+                if Some(gi) == current { "┃" } else { " " }.into(),
+                accent(),
+            );
+            // 序号只给前九个组：`1`…`9` 直达。第十个起靠 Tab，印一个按不动的
+            // 号码等于在屏幕上说谎。组里的会话行不重复写。
+            let num = match row {
+                Row::Header(_) | Row::Single(_) if gi < 9 => format!(" {} ", gi + 1),
+                _ => "   ".into(),
+            };
+            line.push(num, dim());
+            let fold = match row {
+                Row::Header(_) if g.collapsed => "▸",
+                Row::Header(_) => "▾",
+                Row::Single(_) | Row::Session(..) => " ",
+            };
+            line.push(fold.into(), dim());
+
+            // 目录被删了：名字标灰并点出来。会话本身还活着（进程的 cwd 已经
+            // 打开），组照常留在看板上——让它消失才是真的找不回来了。
+            let gone = !g.dir.exists();
+            match row {
+                // 组里的会话行：项目那一格空着，末尾挂一个 `├`/`└` 紧贴会话号，
+                // 把这几行跟上面那行标题连起来。挂在行首的话，它跟会话号之间
+                // 隔着一整列空白，看着像飘在那儿，什么都没连上。
+                Row::Session(_, si) => {
+                    let branch = if *si + 1 == g.sessions.len() { "└" } else { "├" };
+                    line.push(" ".repeat(cols.proj - 2), Style::default());
+                    line.push(format!("{branch} "), dim());
+                }
+                // 当前项目的名字**反白成一块牌子**，不是加粗了事：屏幕上每个
+                // 项目名都是加粗的，加粗认不出哪个是自己那个。用 `REVERSED`
+                // 而不是挑一个具名色，理由跟底栏那块牌子一样（`ui/mod.rs`）：
+                // 六档底栏配色里任何写死的前景色都会在某一档上糊掉。
+                //
+                // 牌子**只包住名字**，右边补的空白照旧是普通底色——反白连着
+                // 补满一列的话，短名字后面拖出一条长尾巴，像进度条不像牌子。
+                //
+                // 目录没了的组不贴牌子：整行标灰是在说「这东西现在是坏的」，
+                // 反白会把它重新变成屏幕上最显眼的东西。
+                _ if Some(gi) == current && !gone => {
+                    let chip = format!(" {} ", clip(&labels[gi], cols.proj - 3));
+                    let w = display_width(&chip);
+                    line.push(
+                        chip,
+                        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                    );
+                    line.push(" ".repeat(cols.proj.saturating_sub(w)), Style::default());
+                }
+                // **先截再补**：`pad_to` 只补不截，一个长目录名（`我的自媒体
+                // 电商代运营项目` 是 24 列）会把整行右推，先被吃掉的正是红字。
+                _ => line.push(
+                    pad_to(&format!(" {}", clip(&labels[gi], cols.proj - 3)), cols.proj),
+                    if gone {
+                        dim()
+                    } else {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    },
+                ),
+            }
+
+            // 行尾右对齐的那几个标记。
+            let mut meta: Vec<(String, Style)> = Vec::new();
+            match row.session_index() {
+                None => {
+                    // 组头：状态那一列写出错几个，跟会话行的「✕ 出错了」对齐。
+                    line.push(" ".repeat(ID_COLS), Style::default());
+                    if gone {
+                        line.push(text(Key::ProjectDirGone, lang).into(), dim());
+                    } else if g.failed() > 0 {
+                        line.push(
+                            format!("✕ {}", msg::failed_count(lang, g.failed())),
+                            danger(),
+                        );
+                    }
+                }
+                Some((_, si)) => {
+                    let s = &g.sessions[si];
+                    let (dot, style) = state_mark(s.state);
+                    line.push(format!("{:>3}  ", s.id), dim());
+                    line.push(format!("{dot} "), style);
+                    line.push(
+                        pad_to(&state_text(s, lang, now_ms), cols.status + GAP),
+                        style,
+                    );
+                    line.push(
+                        pad_to(&clip(&s.profile, cols.agent), cols.agent + GAP),
+                        dim(),
+                    );
+                    if cols.name > 0 {
+                        line.push(
+                            pad_to(&clip(session_name(s), cols.name), cols.name + GAP),
+                            Style::default(),
+                        );
+                    }
+                    debug_assert_eq!(line.w, cols.prefix());
+                    // 上架标记：老师切到别的会话时，得一眼认出「还在播的是这几路」
+                    // （只有直播面板上勾过的那几行，`App::live.staged`）。
+                    if app.live.staged.iter().any(|(id, _)| *id == s.id) {
+                        meta.push((text(Key::LiveOnAirMark, lang).into(), accent()));
+                    }
+                    // 「✉ N」：这次运行期间别的电脑送进这个会话几条留言。
+                    let n = app.mesh.messages_for(s.id);
+                    if n > 0 {
+                        meta.push((msg::mesh_messages_mark(n), accent()));
+                    }
+                    if gone && matches!(row, Row::Single(_)) {
+                        meta.push((text(Key::ProjectDirGone, lang).into(), dim()));
+                    }
+                    let meta_w: usize = meta.iter().map(|(m, _)| display_width(m) + 1).sum();
+                    // 空闲的会话那一列留空：它停着，屏幕最后一行上剩下的只是
+                    // 它自己的输入框和底栏，说明不了任何事。
+                    let activity = if s.state == SessionState::Idle {
+                        String::new()
+                    } else {
+                        clip(
+                            &s.activity,
+                            width.saturating_sub(line.w + meta_w).min(ACTIVITY_MAX),
+                        )
+                    };
+                    let style = if s.state == SessionState::Working {
+                        Style::default()
+                    } else {
+                        dim()
+                    };
+                    line.push(activity, style);
+                }
+            }
+            if !meta.is_empty() {
+                let meta_w: usize = meta.iter().map(|(m, _)| display_width(m) + 1).sum();
+                line.push(
+                    " ".repeat(width.saturating_sub(line.w + meta_w)),
+                    Style::default(),
+                );
+                for (m, style) in meta {
+                    line.push(format!(" {m}"), style);
+                }
+            }
+            let item_style = if selected == Some(i) {
+                paint_selected(&mut line.spans, app.bar)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(line.spans)).style(item_style)
+        })
+        .collect()
+}
+
+/// 选中那一行整行铺上底栏同一档的实色，返回这一行的底色样式。
+///
+/// 只有一个 `▶` 的话，二十几行里找光标要先找那个小三角；整行铺色是一眼的事。
+/// 色借底栏的：那几档是用户自己在设置页挑的，对比度有 `every_bar_theme_is_readable`
+/// 守着——这里不另挑颜色，也就不会有第二份要守的色表。
+///
+/// 铺了底色之后，每一段原来的前景色都可能压不住它，所以一律退回底栏自己的
+/// 前景色，只留加粗/反白这些修饰；**唯独红字换成 `bar_danger`**——它自带
+/// 底色，十四档上都读得清，出错的那一行被选中时也还是红的。
+///
+/// 横线档 / `NO_COLOR` 没有实色可铺，原样不动（List 那边退回加粗）。
+fn paint_selected(spans: &mut [Span<'static>], bar: super::BarTheme) -> Style {
+    let Some(row) = super::bar_style(bar) else {
+        return Style::default();
+    };
+    let red = danger();
+    for span in spans.iter_mut() {
+        span.style = if span.style == red {
+            super::bar_danger(bar)
+        } else {
+            Style::default()
+                .add_modifier(span.style.add_modifier)
+                .remove_modifier(Modifier::DIM)
+        };
+    }
+    row
 }
 
 /// 把标题下面那块分成三截：邀请码、列表、「我的电脑」。高度不够时先保
@@ -386,6 +657,15 @@ mod tests {
             is_agent: true,
             tag: String::new(),
             last_active_ms: 0,
+        }
+    }
+
+    /// 一个干活中的会话：空闲的会话在看板上不写 activity，量 activity 列的
+    /// 测试得用它。
+    fn busy(id: u32, dir: &str) -> SessionInfo {
+        SessionInfo {
+            state: SessionState::Working,
+            ..sess(id, dir)
         }
     }
 
@@ -535,20 +815,18 @@ mod tests {
     // `truncate` 单独产出宽度的描述略有简化。下面四条测的正是这个组合后的
     // 不变量，不依赖 `truncate` 单独的输出宽度是 15 还是 16。
 
-    /// **杀变异①**：`session_label(s)` 被换成 `s.profile`。
+    /// **杀变异①**：`session_name(s)` 被换成 `s.profile`。
     ///
-    /// 组头本来就会用 `s.profile` 报一句「这个项目里有几个 claude」
-    /// （`agent_counts()`，跟 tag 完全无关），所以单看「屏幕上有没有出现
-    /// `claude`」测不出这个变异——不管名字列画的是 tag 还是 profile，
-    /// `claude` 反正都会因为组头而出现一次。真正能分开两者的是**出现了
-    /// 几次**：名字列如果也被换成 profile，`claude` 就会在组头之外再多冒
-    /// 一次。
+    /// 单会话的项目合成一行，屏幕上只有智能体那一列写着 `claude`——名字列
+    /// 如果也被换成 profile，`claude` 就会多冒一次。原来组头上还有一串
+    /// `claude×1`，那串统计已经拿掉了（每一行自己写着智能体），所以现在
+    /// 正好是一次。
     #[test]
     fn the_session_row_shows_the_name_and_profile() {
         let (mut app, dir) = App::test_app();
         let proj = real_dir(&dir, "proj");
         let mut s = sess(1, &proj);
-        s.tag = "改登录页文案".into(); // 6 个汉字 = 12 列，落在 15 列预算内，不会被截
+        s.tag = "改登录页文案".into(); // 6 个汉字 = 12 列，落在 12 列预算内，不会被截
         app.set_sessions(vec![s]);
 
         let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
@@ -556,7 +834,8 @@ mod tests {
 
         let c = screen_text(&term);
         assert!(c.contains("改登录页文案"), "会话行必须画出名字：{c}");
-        assert_eq!(c.matches("claude").count(), 2, "组头和会话行都应显示智能体：{c}");
+        assert_eq!(c.matches("claude").count(), 1, "智能体那一列写一次：{c}");
+        assert!(!c.contains("claude×1"), "组头上的智能体统计已经拿掉了：{c}");
     }
 
     #[test]
@@ -575,48 +854,51 @@ mod tests {
         assert!(row_with(&term, "SECOND_TASK").contains("codex"));
     }
 
-    /// **杀变异③**：`pad_to(…, 16)` 被删掉。
+    /// **杀变异③**：名字那一格的 `pad_to` 被删掉。
     ///
-    /// 名字比 15 列窄时 `truncate` 根本不会触发省略号，输出原样就是 tag
-    /// 本身——这时候把这一列撑到 16 列全靠 `pad_to`。`screen_text` 会把
-    /// 空白过滤掉，补没补空格从它的输出里看不出来；这里改用 `row_with` 保留
-    /// 原始列位置，直接量「名字」到「activity」之间隔了几列。
+    /// 名字列的宽度是这一屏最长的那个名字（封顶 16）：两个项目，一个名字
+    /// 12 列、一个 4 列，短的那个也得补到 12 列再加两格空隙，activity 才对得
+    /// 上同一列。`screen_text` 会把空白过滤掉，这里改用 `row_with` 保留原始
+    /// 列位置，直接量「名字」到「activity」之间隔了几列。
     #[test]
     fn a_short_name_is_padded_out_to_the_full_sixteen_columns() {
         let (mut app, dir) = App::test_app();
-        let proj = real_dir(&dir, "proj");
-        let mut s = sess(1, &proj);
+        let mut s = busy(1, &real_dir(&dir, "a"));
         s.tag = "NAME".into(); // 4 列，纯 ASCII——不会触发截断，量起来没有歧义
         s.activity = "ACTV_TAIL".into();
-        app.set_sessions(vec![s]);
+        let mut long = busy(2, &real_dir(&dir, "b"));
+        long.tag = "TWELVE_WIDE_".into();
+        long.activity = "LONG_TAIL".into();
+        app.set_sessions(vec![s, long]);
 
-        // 200 列：给 activity 留足空间，不让这一行的宽度上限在这条测试里
-        // 掺和进来——这条测的是 `pad_to` 补没补，不是截断裁没裁。
         let mut term = Terminal::new(TestBackend::new(200, 12)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
         let row = row_with(&term, "ACTV_TAIL");
         assert_eq!(
             cols_between(&row, "NAME", "ACTV_TAIL"),
-            16,
-            "`NAME` 到 `ACTV_TAIL` 应该正好隔 16 列（`pad_to` 补齐的宽度）；\
+            14,
+            "`NAME` 到 `ACTV_TAIL` 应该正好隔 12 + 2 列（补到最长的那个名字）；\
              删掉 `pad_to` 的话这里会变成 4（tag 自己的宽度，一点没补）：{row:?}"
+        );
+        let other = row_with(&term, "LONG_TAIL");
+        assert_eq!(
+            row.find("ACTV_TAIL").map(|i| unicode_width::UnicodeWidthStr::width(&row[..i])),
+            other.find("LONG_TAIL").map(|i| unicode_width::UnicodeWidthStr::width(&other[..i])),
+            "两行的 activity 必须落在同一列：\n{row}\n{other}"
         );
     }
 
-    /// **杀变异②**：`truncate(…, 15)` 被删掉。
+    /// **杀变异②**：名字那一格的 `clip` 被删掉。
     ///
-    /// tag 给到 20 列（全 ASCII，量起来没有 CJK 的歧义）。真按 15 列截的话，
-    /// 触发点正好撞在预算撑满的那一刻（15 个单列字符），输出是「15 个字符 +
-    /// 一个省略号」= 16 列，`pad_to` 这时候是空操作。删掉 `truncate` 之后
-    /// 整条 tag（20 列）原样画出来，`pad_to` 的目标 16 又补不了负数，名字列
-    /// 直接涨到 20 列——`LONGNAME` 记号到 `ACTV_TAIL` 记号之间的列数就是能不能
-    /// 抓住这个变异的地方。
+    /// tag 给到 20 列（全 ASCII，量起来没有 CJK 的歧义），宽屏上名字列封顶
+    /// 16：裁成「15 个字符 + 一个省略号」= 16 列，再加两格空隙。删掉裁剪的话
+    /// 整条 tag 原样画出来，`LONGNAME` 到 `ACTV_TAIL` 之间就成了 22。
     #[test]
     fn an_oversized_name_is_truncated_before_it_can_eat_the_activity_budget() {
         let (mut app, dir) = App::test_app();
         let proj = real_dir(&dir, "proj");
-        let mut s = sess(1, &proj);
+        let mut s = busy(1, &proj);
         s.tag = format!("LONGNAME{}", "X".repeat(12)); // 20 列
         s.activity = "ACTV_TAIL".into();
         app.set_sessions(vec![s]);
@@ -627,9 +909,9 @@ mod tests {
         let row = row_with(&term, "ACTV_TAIL");
         assert_eq!(
             cols_between(&row, "LONGNAME", "ACTV_TAIL"),
-            16,
-            "`LONGNAME…` 到 `ACTV_TAIL` 应该正好隔 16 列；删掉 `truncate` 的话\
-             整条 20 列的 tag 会原样画出来，这里会变成 20：{row:?}"
+            18,
+            "`LONGNAME…` 到 `ACTV_TAIL` 应该正好隔 16 + 2 列；删掉裁剪的话\
+             整条 20 列的 tag 会原样画出来，这里会变成 22：{row:?}"
         );
     }
 
@@ -643,7 +925,7 @@ mod tests {
     fn the_activity_column_still_truncates_at_seventy_not_seventy_six() {
         let (mut app, dir) = App::test_app();
         let proj = real_dir(&dir, "proj");
-        let mut s = sess(1, &proj);
+        let mut s = busy(1, &proj);
         s.activity = format!("{}MARK", "A".repeat(70));
         app.set_sessions(vec![s]);
 
@@ -721,7 +1003,7 @@ mod tests {
         );
     }
 
-    /// **牌子只包住名字，不许把补白一起反白。** 反白连着补到 18 列的话，
+    /// **牌子只包住名字，不许把补白一起反白。** 反白连着补满一列的话，
     /// 短名字后面会拖出一条长尾巴，看着像进度条。牌子两端各一个空格，
     /// 所以反白的宽度恰好是「名字 + 2」。
     #[test]
@@ -733,13 +1015,14 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
-        // 组头那一行里反白的格子：只有 ` dct `（标题那块牌子在另一行）
+        // 当前项目那一行（行首竖色条 `┃`）里反白的格子：只有 ` dct `
+        // （标题那块牌子在第 0 行）
         let buf = term.backend().buffer();
-        let row = (0..buf.area.height)
+        let row = (1..buf.area.height)
             .find(|&y| {
-                (0..buf.area.width).any(|x| buf.cell((x, y)).map(|c| c.symbol()) == Some("▾"))
+                (0..buf.area.width).any(|x| buf.cell((x, y)).map(|c| c.symbol()) == Some("┃"))
             })
-            .expect("没有组头行");
+            .expect("没有当前项目那一行");
         let on_row: String = (0..buf.area.width)
             .filter_map(|x| buf.cell((x, row)))
             .filter(|c| c.style().add_modifier.contains(Modifier::REVERSED))
@@ -748,30 +1031,33 @@ mod tests {
         assert_eq!(on_row, " dct ", "牌子该是名字加左右各一个空格：{on_row:?}");
     }
 
-    /// **组头上的牌子不许把名字那一列撑宽。** 牌子的两个空格是从名字自己的
-    /// 18 列预算里出的（截断上限 17 → 15），不是从右边邻居那里借的——右边
-    /// 是 agent 统计和行尾那句红字，后者被挤掉是 dct 最贵的失败模式。
+    /// **牌子不许把项目那一列撑宽。** 牌子的两个空格是从项目列自己的预算里
+    /// 出的，不是从右边邻居那里借的——右边是状态列，组头的红字「N 个出错」
+    /// 就写在那儿，它被挤掉是 dct 最贵的失败模式。
     #[test]
     fn the_chip_does_not_widen_the_name_column() {
         let (mut app, dir) = App::test_app();
-        // 两个组：一个戴牌子（光标所在），一个没戴。两行的父目录列必须
-        // 落在同一列上，否则就是牌子把列撑宽了。
+        // 两个组：一个戴牌子（光标所在），一个没戴。两行的会话号必须落在
+        // 同一列上，否则就是牌子把列撑宽了。
         let mine = real_dir(&dir, "mine-project-here");
         let other = real_dir(&dir, "other-project-x");
-        app.set_sessions(vec![sess(1, &mine), sess(2, &other)]);
+        app.set_sessions(vec![sess(41, &mine), sess(42, &other)]);
 
         let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
-        // 用组序号当记号，不用项目名：完整路径也写在**标题**那一行（标题上
-        // 那块牌子），拿名字找行会先撞上标题。
-        let chipped = row_with(&term, "1 ▾");
-        let plain = row_with(&term, "2 ▾");
-        // `▾` 到 agent 统计之间的列数：名字列 + 父目录列，两行必须完全一样
+        // 用会话号当记号（前后带空隙）：完整路径也写在**标题**那一行，拿
+        // 项目名找行会先撞上标题。
+        let chipped = row_with(&term, "  41  ");
+        let plain = row_with(&term, "  42  ");
+        assert!(chipped.contains('┃'), "前提：41 那一行是当前项目：{chipped}");
+        let col = |row: &str, m: &str| {
+            unicode_width::UnicodeWidthStr::width(&row[..row.find(m).unwrap()])
+        };
         assert_eq!(
-            cols_between(&chipped, "▾", "claude×1"),
-            cols_between(&plain, "▾", "claude×1"),
-            "戴牌子的那一行把名字列撑宽了：\n{chipped}\n{plain}"
+            col(&chipped, "41"),
+            col(&plain, "42"),
+            "戴牌子的那一行把项目列撑宽了：\n{chipped}\n{plain}"
         );
     }
 
@@ -922,12 +1208,11 @@ mod tests {
 
     /// 用户报的症状一：底栏写着「当前项目：dc-terminal」，看板却列着
     /// dc_desktop 的会话。答案不再是「把别的项目藏起来」，而是**分组**：
-    /// 两个项目都在屏幕上，各自的会话待在自己的组头底下，谁属于谁一眼可见。
+    /// 两个项目都在屏幕上，各自的会话待在自己那一行（或组头底下），谁属于谁
+    /// 一眼可见。
     #[test]
     fn the_board_groups_every_session_under_its_own_project() {
         let (mut app, dir) = App::test_app();
-        // 组头上的 agent 统计只在目录真的还在时才画（不在就换成
-        // 「目录不在了」），所以这两个项目必须是磁盘上真实存在的目录。
         let one = real_dir(&dir, "dc-terminal");
         let two = real_dir(&dir, "dc_desktop");
         app.set_sessions(vec![sess(1, &one), sess(2, &two)]);
@@ -936,10 +1221,11 @@ mod tests {
         term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
 
         let c = screen_text(&term);
-        assert!(c.contains("dc-terminal"), "两个项目都要有组头：{c}");
+        assert!(c.contains("dc-terminal"), "两个项目都要在：{c}");
         assert!(c.contains("dc_desktop"), "别的项目不再被藏起来：{c}");
-        // 组头上写着这个项目里有几个什么 agent
-        assert!(c.contains("claude×1"), "组头要数出这个项目里的 agent：{c}");
+        // 一个会话的项目合成一行：项目名和会话号在同一行上
+        assert!(row_with(&term, "dc_desktop").contains("  2  "));
+        assert!(!c.contains("claude×1"), "组头上不再数智能体：{c}");
     }
 
     /// 目录被删了要在组头上说出来，而不是让整个组从看板上消失——
@@ -1029,15 +1315,14 @@ mod tests {
         }
     }
 
-    /// 「当前项目 = 光标所在的组」，所以进一个别的组的会话既不需要改写
-    /// 什么，也没有什么可以报告的——静默改变当前项目正是上一版被判为
-    /// 「混乱」的原因，而这一版结构上就不会发生。
+    /// 进会话不会报告「已切到」——光标没离开过它所在的组，项目根本没变，
+    /// 也没有什么可以报告的。
     #[test]
     fn entering_a_session_never_announces_a_project_change() {
         let (mut app, _dir) = App::test_app();
         app.set_sessions(vec![sess(1, "/w/a"), sess(2, "/w/b")]);
-        // 行：[组头 a, 会话 1, 组头 b, 会话 2]
-        app.list_state.select(Some(3));
+        // 行：[a（会话 1）, b（会话 2）]，各合成一行
+        app.list_state.select(Some(1));
         assert_eq!(
             app.current_dir(),
             PathBuf::from("/w/b"),
@@ -1046,7 +1331,7 @@ mod tests {
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
 
-        assert!(matches!(app.view, View::Attached(2)), "进的是会话 2");
+        assert!(matches!(app.view, View::Attached(2)), "合成行上的 Enter 进的是会话 2");
         assert!(
             !app.message.text.contains("已切到"),
             "没有任何项目被改写，不该报告：{}",
@@ -1055,10 +1340,11 @@ mod tests {
     }
 
     /// 光标停在组头上时按 Enter 没有会话可进，不能 panic、也不能进错一个。
+    /// 组头只有两个以上会话的组才有（一个会话的组合成一行，Enter 进的就是它）。
     #[test]
     fn enter_on_a_group_header_does_nothing() {
         let (mut app, _dir) = App::test_app();
-        app.set_sessions(vec![sess(1, "/w/a")]);
+        app.set_sessions(vec![sess(1, "/w/a"), sess(2, "/w/a")]);
         app.list_state.select(Some(0));
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
@@ -1066,19 +1352,21 @@ mod tests {
         assert!(matches!(app.view, View::Board), "组头上没有会话可进");
     }
 
-    /// Tab 是日常换项目的主路径：一步跳到下一个组头，到头回绕。
+    /// Tab 是日常换项目的主路径：一步跳到下一个组的头（组头或合成的那一行），
+    /// 到头回绕。
     #[test]
     fn tab_jumps_to_the_next_project_and_wraps() {
         let (mut app, _dir) = App::test_app();
-        app.set_sessions(vec![sess(1, "/w/a"), sess(2, "/w/b")]);
+        app.set_sessions(vec![sess(1, "/w/a"), sess(3, "/w/a"), sess(2, "/w/b")]);
         app.list_state.select(Some(0));
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
         assert_eq!(app.current_dir(), PathBuf::from("/w/b"));
-        assert_eq!(app.list_state.selected(), Some(2), "落在组头上");
+        assert_eq!(app.list_state.selected(), Some(3), "落在 b 合成的那一行上");
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
         assert_eq!(app.current_dir(), PathBuf::from("/w/a"), "到头回绕");
+        assert_eq!(app.list_state.selected(), Some(0), "落在 a 的组头上");
     }
 
     /// 数字键直达前九个项目；越界什么都不做——按了 `7` 而只有两个项目时，
@@ -1320,7 +1608,8 @@ mod tests {
     fn a_session_that_got_messages_shows_the_count_at_the_end_of_its_row() {
         let (mut app, dir) = App::test_app();
         let proj = real_dir(&dir, "proj");
-        let mut a = sess(1, &proj);
+        // 干活中：空闲的会话不写 activity，那样这条长 activity 就挤不到谁了
+        let mut a = busy(1, &proj);
         a.activity = "x".repeat(200);
         app.set_sessions(vec![a, sess(2, &proj)]);
         let mut v = mesh_view(true, &[("家里Mac", true, true)]);
@@ -1332,5 +1621,280 @@ mod tests {
         assert!(row.trim_end().ends_with("✉ 3"), "{row:?}");
         assert!(row.contains("  1  "), "是会话 #1 那一行：{row:?}");
         assert_eq!(rows(&term).iter().filter(|l| l.contains('✉')).count(), 1);
+    }
+
+    // —— 一组一行、列对齐、选中行 ——
+
+    /// 原样的每一行（不洗空白），右边的空白去掉。贴进报告、量列都用它。
+    fn raw_rows(term: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                let mut line = String::new();
+                let mut x = 0;
+                while x < buf.area.width {
+                    let sym = buf.cell((x, y)).map(|c| c.symbol().to_string()).unwrap_or_default();
+                    // 双宽字符在 buffer 里占两格，第二格是空串：跳过它，不然
+                    // 每个汉字后面都会多出一个空格。
+                    x += unicode_width::UnicodeWidthStr::width(sym.as_str()).max(1) as u16;
+                    line.push_str(&sym);
+                }
+                line.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    /// **一个会话的项目只占一行，两个以上的才有标题行。** 22 个会话的看板
+    /// 原来每个项目两行，一屏装不下；组头那一行除了项目名什么都没说。
+    #[test]
+    fn a_single_session_project_is_one_line_and_a_busier_one_keeps_its_title() {
+        let (mut app, dir) = App::test_app();
+        let one = real_dir(&dir, "aaa-one");
+        let two = real_dir(&dir, "bbb-two");
+        app.set_sessions(vec![sess(1, &one), sess(2, &two), sess(3, &two)]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let r = raw_rows(&term);
+
+        // 第 0 行是标题；列表从第 1 行开始
+        assert!(r[1].contains("aaa-one") && r[1].contains("  1  "), "aaa 合成一行：{r:#?}");
+        assert!(r[2].contains("bbb-two") && !r[2].contains("  2  "), "bbb 的标题行：{r:#?}");
+        // 树枝紧贴会话号，不是飘在行首
+        assert!(r[3].contains("├   2  "), "{r:#?}");
+        assert!(r[4].contains("└   3  "), "{r:#?}");
+        assert!(r[5].is_empty(), "三个会话、两个项目，一共四行：{r:#?}");
+        assert!(!r.iter().any(|l| l.contains('×')), "不再数智能体：{r:#?}");
+    }
+
+    /// **会话号、状态、智能体在三种行上落在同一列。**
+    #[test]
+    fn single_rows_and_grouped_rows_share_one_grid() {
+        let (mut app, dir) = App::test_app();
+        let one = real_dir(&dir, "a");
+        let two = real_dir(&dir, "a-much-longer-name");
+        let mut x = busy(7, &one);
+        x.profile = "codex".into();
+        app.set_sessions(vec![x, sess(12, &two), sess(301, &two)]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let r = raw_rows(&term);
+        let col = |row: &str, m: &str| {
+            let at = row.find(m).unwrap_or_else(|| panic!("{m:?} 不在 {row:?}"));
+            unicode_width::UnicodeWidthStr::width(&row[..at])
+        };
+        // 会话号右对齐：个位、两位、三位数的最后一位在同一列
+        assert_eq!(col(&r[1], "7 "), col(&r[3], "12 ") + 1, "{r:#?}");
+        assert_eq!(col(&r[3], "12 "), col(&r[4], "301 ") + 1, "{r:#?}");
+        // 状态圆点和智能体名
+        assert_eq!(col(&r[1], "●"), col(&r[3], "○"), "{r:#?}");
+        assert_eq!(col(&r[1], "codex"), col(&r[4], "claude"), "{r:#?}");
+    }
+
+    /// 父目录只在两个项目**同名**时才写：不重名的时候那串路径什么都没说。
+    #[test]
+    fn the_parent_dir_shows_only_when_two_projects_share_a_name() {
+        let (mut app, dir) = App::test_app();
+        let a = real_dir(&dir, "one/web");
+        let b = real_dir(&dir, "two/web");
+        let c = real_dir(&dir, "api");
+        app.set_sessions(vec![sess(1, &a), sess(2, &b), sess(3, &c)]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let r = raw_rows(&term);
+        assert!(r.iter().any(|l| l.contains("one/web")), "{r:#?}");
+        assert!(r.iter().any(|l| l.contains("two/web")), "{r:#?}");
+        let api = r.iter().find(|l| l.contains("  3  ")).unwrap();
+        assert!(!api.contains("/api"), "不重名就只写名字：{api}");
+    }
+
+    /// 空闲的会话：状态写「空闲 N分钟」，activity 留空——它停着，屏幕最后一行
+    /// 上剩下的只是它自己的底栏（这里故意给一句没洗过的，旧守护进程就会这么报）。
+    #[test]
+    fn an_idle_session_says_how_long_and_leaves_its_activity_blank() {
+        let (mut app, dir) = App::test_app();
+        let proj = real_dir(&dir, "proj");
+        let mut idle = sess(1, &proj);
+        idle.activity = "⏵⏵ bypass permissions on".into();
+        idle.last_active_ms = now_ms() - (3 * 60 + 5) * 1000;
+        let mut working = busy(2, &real_dir(&dir, "qqq"));
+        working.activity = "Running gradle assembleDebug build".into();
+        app.set_sessions(vec![idle, working]);
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let r = raw_rows(&term);
+        let idle_row = r.iter().find(|l| l.contains("  1  ")).unwrap();
+        assert!(idle_row.contains("○ 空闲 3分钟"), "{idle_row}");
+        assert!(!idle_row.contains("bypass"), "空闲的不写 activity：{idle_row}");
+        let busy_row = r.iter().find(|l| l.contains("  2  ")).unwrap();
+        assert!(busy_row.contains("● 干活中"), "{busy_row}");
+        assert!(busy_row.contains("Running gradle assembleDebug build"), "{busy_row}");
+    }
+
+    /// 80 列、activity 很长：截的是 activity，「N 个出错」和行尾的 `✉ N`
+    /// 都还在，单会话行上的「✕ 出错了」也在。
+    #[test]
+    fn eighty_columns_cut_the_activity_never_the_red_or_the_marks() {
+        let (mut app, dir) = App::test_app();
+        let multi = real_dir(&dir, "我的自媒体电商代运营项目");
+        let mut bad = busy(2, &multi);
+        bad.state = SessionState::Failed;
+        let mut long = busy(5, &real_dir(&dir, "dc-android"));
+        long.tag = "平板视频部署与测试".into();
+        long.activity = "general-purpose Running gradle assembleDebug build and more".repeat(3);
+        let mut lone_bad = sess(9, &real_dir(&dir, "zzz"));
+        lone_bad.state = SessionState::Failed;
+        app.set_sessions(vec![sess(1, &multi), bad, long, lone_bad]);
+        let mut v = super::super::computers::tests::mesh_view(true, &[("家里Mac", true, true)]);
+        v.messages = [(5, 1)].into_iter().collect();
+        app.mesh.view = Some(v);
+
+        let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let r = raw_rows(&term);
+        assert!(r.iter().any(|l| l.contains("✕ 1 个出错")), "{r:#?}");
+        let mail = r.iter().find(|l| l.contains("  5  ")).unwrap();
+        assert!(mail.ends_with("✉ 1"), "{mail:?}");
+        assert!(mail.contains("general-pur"), "activity 还剩一截：{mail:?}");
+        let lone = r.iter().find(|l| l.contains("  9  ")).unwrap();
+        assert!(lone.contains("✕ 出错了"), "{lone:?}");
+    }
+
+    /// 选中那一行整行铺上底栏的颜色，一直铺到最右边；出错的红字在那一行上
+    /// 换成自带底色的那块红，不会被底色吃掉。别的行不铺。
+    #[test]
+    fn the_selected_row_is_painted_across_the_full_width() {
+        let (mut app, dir) = App::test_app();
+        let mut bad = sess(1, &real_dir(&dir, "a"));
+        bad.state = SessionState::Failed;
+        app.set_sessions(vec![bad, sess(2, &real_dir(&dir, "b"))]);
+        app.list_state.select(Some(0));
+        let bar = super::super::bar_style(app.bar).expect("测试里实色档开着");
+
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        assert_eq!(buf.cell((99, 1)).unwrap().style().bg, bar.bg, "选中行铺到最右边");
+        assert_eq!(buf.cell((0, 1)).unwrap().style().bg, bar.bg, "▶ 那一格也在色条里");
+        assert_ne!(buf.cell((99, 2)).unwrap().style().bg, bar.bg, "别的行不铺");
+        let cross = (0..100u16)
+            .find(|&x| buf.cell((x, 1)).unwrap().symbol() == "✕")
+            .expect("出错的记号");
+        assert_eq!(
+            buf.cell((cross, 1)).unwrap().style().bg,
+            super::super::bar_danger(app.bar).bg,
+            "选中行上的红字换成自带底色的那块红"
+        );
+    }
+
+    /// 合成行上的键：数字键落在它上面、Enter 进它的会话、折叠把它折成一行
+    /// `▸` 组头、再展开回到合成行。
+    #[test]
+    fn digits_enter_and_collapse_all_work_on_a_single_row() {
+        let (mut app, _dir) = App::test_app();
+        app.set_sessions(vec![sess(1, "/w/a"), sess(2, "/w/b")]);
+        app.list_state.select(Some(0));
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.selected_session().map(|s| s.id), Some(2), "落在 b 那一行上");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.rows[1], Row::Header(1), "折起来是一行组头");
+        assert_eq!(app.list_state.selected(), Some(1));
+        assert!(app.selected_session().is_none());
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.rows[1], Row::Single(1), "展开回到合成行");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert!(matches!(app.view, View::Attached(2)), "Enter 进的是它的会话");
+    }
+
+    /// 一屏真实的看板（2026-11-26 用户那一屏的形状：22 个会话、几乎每个项目
+    /// 一个），120 和 80 列各画一遍：22 个会话一屏装得下，红字都在。
+    /// `cargo test realistic_board -- --nocapture` 把两屏打出来看。
+    #[test]
+    fn a_realistic_board_fits_and_reads_at_120_and_80_columns() {
+        let (mut app, dir) = App::test_app();
+        let now = now_ms();
+        let mut all = Vec::new();
+        // (会话号, 项目, 智能体, 状态, 名字, activity, 空闲了几分钟)
+        type Spec<'a> = (u32, &'a str, &'a str, SessionState, &'a str, &'a str, u64);
+        let mut add = |(id, proj, profile, state, tag, act, idle_min): Spec| {
+            let mut s = sess(id, &real_dir(&dir, proj));
+            s.profile = profile.into();
+            s.state = state;
+            s.tag = tag.into();
+            s.activity = act.into();
+            s.last_active_ms = now - idle_min * 60_000;
+            all.push(s);
+        };
+        use SessionState::{Failed, Idle, Working};
+        add((
+            47,
+            "dc-android",
+            "claude",
+            Working,
+            "平板视频部署与测试",
+            "general-purpose Running gradle assembleDebug build",
+            0,
+        ));
+        add((63, "dc-android", "codex", Idle, "阅读OpenAI手机文档", "", 12));
+        add((7, "dc-device", "claude", Idle, "现在项目什么样了", "", 140));
+        add((12, "dc-thesis", "claude", Working, "论文第三章改写", "1 shell", 0));
+        add((3, "dc-terminal", "claude", Working, "看板列表美化", "Editing src/ui/board.rs", 0));
+        add((21, "dc-terminal", "claude", Idle, "手机连接复查", "", 47));
+        add((
+            22,
+            "dc-terminal",
+            "codex",
+            Failed,
+            "发版检查",
+            "API Error: Connection closed mid-response",
+            0,
+        ));
+        add((5, "dc_desktop", "claude", Idle, "浏览器自动化", "", 3 * 24 * 60));
+        add((8, "dc-vault", "kimi", Idle, "知识库导入器", "", 25));
+        add((9, "dc-octo", "claude", Working, "设备触手", "Reading 14 files", 0));
+        add((11, "dc_classroom", "glm", Idle, "课堂终端修复", "", 5));
+        add((14, "dc_classeditor", "claude", Idle, "审批审计", "", 300));
+        add((15, "dc_llm", "deepseek", Idle, "", "", 61));
+        add((16, "dc-common", "claude", Idle, "共享契约", "", 2));
+        add((17, "dc_exam", "qwen-api", Working, "监考实时页", "Running ./gradlew test", 0));
+        add((18, "dc-local", "claude", Idle, "托盘菜单", "", 90));
+        add((19, "dc-link-contract", "codex", Idle, "消息总线", "", 33));
+        add((23, "dc_workspace", "shell", SessionState::Unknown, "", "$ docker ps", 0));
+        add((24, "dc-video-mcp", "claude", Idle, "视频摘要", "", 18));
+        add((25, "我的自媒体电商代运营项目", "claude", Working, "写小红书文案", "Writing 3 drafts", 0));
+        add((26, "dc_gpu_worker", "claude", Idle, "头像生成", "", 400));
+        add((27, "dc-device-sim", "claude", Idle, "故障注入", "", 9));
+        app.set_sessions(all);
+        app.live.staged = vec![(9, "claude".into())];
+        let mut v = super::super::computers::tests::mesh_view(true, &[("家里Mac", true, true)]);
+        v.messages = [(47, 1)].into_iter().collect();
+        app.mesh.view = Some(v);
+        app.list_state.select(Some(4));
+
+        for w in [120u16, 80] {
+            let mut term = Terminal::new(TestBackend::new(w, 32)).unwrap();
+            term.draw(|f| draw(f, f.area(), &mut app)).unwrap();
+            let r = raw_rows(&term);
+            println!("—— {w} 列 ——");
+            for l in &r {
+                println!("{l}");
+            }
+            for id in [47, 63, 7, 12, 3, 21, 22, 5, 27] {
+                assert!(
+                    r.iter().any(|l| l.contains(&format!(" {id}  "))),
+                    "{w} 列：会话 {id} 不在屏幕上：{r:#?}"
+                );
+            }
+            assert!(r.iter().any(|l| l.contains("✕ 1 个出错")), "{w} 列：{r:#?}");
+            assert!(r.iter().any(|l| l.ends_with("✉ 1")), "{w} 列：{r:#?}");
+            assert!(!r.iter().any(|l| l.contains("bypass") || l.contains('×')), "{r:#?}");
+        }
     }
 }

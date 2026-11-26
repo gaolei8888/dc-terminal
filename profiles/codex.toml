@@ -24,6 +24,15 @@ busy_pattern = "esc to interrupt|tab to queue|· [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏
 # codex-cli 0.172.0（2026-11-26）：`developer_instructions=` 后面直接跟多行
 # 中文，codex 当成一段字面字符串收下，模型看得到。
 note_args = ["-c", "developer_instructions={note}"]
+# 看板 activity 那一列要丢掉的底栏噪音（见 `profile.rs::Profile::activity_noise`）。
+# 本机真实看板上抄下来的（codex-cli 0.172，2026-11-26）：空闲时最后一行是
+# `← for agents · ? for shortcuts`，说明不了它在干什么。
+activity_noise = [
+  "← for agents",
+  "\\? for shortcuts",
+  "\\(?esc to interrupt\\)?",
+  "tab to queue message",
+]
 
 [label]
 zh = "Codex"
