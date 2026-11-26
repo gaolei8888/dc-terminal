@@ -32,6 +32,10 @@ activity_noise = [
   "\\? for shortcuts",
   "\\(?esc to interrupt\\)?",
   "tab to queue message",
+  # 底栏右边的「⚠ 1 warning · f2 to view」：启动时的一条提示，不是在干活。
+  # 2026-11-26 重启后三个 codex 会话都带着它。
+  "⚠?\\s*\\d+ warnings?",
+  "f2 to view",
 ]
 
 [label]
