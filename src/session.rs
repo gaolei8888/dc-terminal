@@ -128,6 +128,93 @@ fn classify(
     }
 }
 
+/// 看板上那一列「它在干什么」：把屏幕最后一行里 agent 自己的底栏噪音去掉。
+///
+/// 最后一行十有八九是 agent 的底栏（`⏵⏵ bypass permissions on · ← 4 agents`），
+/// 每个会话都一样，于是看板上那一列满屏同一句话。这里按 ` · `（codex 的 ` • `、
+/// 以及三个以上的连续空格——agent 用它们把底栏排成左右两块）切成几段，**整段**
+/// 匹上 `noise` 的丢掉，剩下的重新用 ` · ` 接起来。
+///
+/// 每段比两次：原样一次，去掉开头的箭头/方块/盲文点这类符号再一次——
+/// `⏵⏵ bypass permissions on` 和 `bypass permissions on` 是同一句话，
+/// 正则不必各写一遍。只剩符号的段（截断留下的 `…`、一个孤零零的 `○`）也丢。
+/// 整句开头的符号去掉，中间连续的空白收成一个。
+///
+/// 切的时候可能把一对括号劈开（`Working (12s • esc to interrupt)` 丢掉后半段
+/// 剩 `Working (12s`），缺的右括号补回去。
+///
+/// 纯函数，拿真实截屏的那一行直接测。`noise` 为空时只做空白整理，内容不动。
+pub(crate) fn clean_activity(line: &str, noise: &[regex::Regex]) -> String {
+    let is_noise = |seg: &str| noise.iter().any(|re| re.is_match(seg));
+    let mut kept: Vec<String> = Vec::new();
+    for seg in split_segments(line) {
+        let raw = seg.trim();
+        let bare = raw.trim_start_matches(is_glyph).trim();
+        if bare.is_empty() || bare.chars().all(is_glyph) {
+            continue;
+        }
+        if !noise.is_empty() && (is_noise(raw) || is_noise(bare)) {
+            continue;
+        }
+        // 段尾截断留下的 ` …`（前面是空格，不是 `Thinking…` 这种字里的省略号）
+        let seg = raw.strip_suffix(" …").unwrap_or(raw).trim_end();
+        kept.push(seg.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    let mut out = kept.join(" · ");
+    out = out.trim_start_matches(is_glyph).to_string();
+    let open = out.matches('(').count();
+    let close = out.matches(')').count();
+    for _ in close..open {
+        out.push(')');
+    }
+    out
+}
+
+/// 按 ` · `、` • ` 和三个以上的连续空格切段。
+fn split_segments(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < line.len() {
+        let rest = &line[i..];
+        let sep = if rest.starts_with(" · ") {
+            " · ".len()
+        } else if rest.starts_with(" • ") {
+            " • ".len()
+        } else if rest.starts_with("   ") {
+            rest.len() - rest.trim_start_matches(' ').len()
+        } else {
+            0
+        };
+        if sep > 0 {
+            out.push(&line[start..i]);
+            i += sep;
+            start = i;
+            continue;
+        }
+        // 前进一个完整的字符，不能切在 UTF-8 中间
+        i += 1;
+        while i < line.len() && (b[i] & 0xC0) == 0x80 {
+            i += 1;
+        }
+    }
+    out.push(&line[start..]);
+    out
+}
+
+/// 底栏上那些「不是字」的符号：箭头、方块圆点、技术符号（`⏵`）、
+/// 装饰符号（`✻` `⚠`）、盲文点（转圈的那个）、省略号和中点。
+fn is_glyph(c: char) -> bool {
+    matches!(c,
+        ' ' | '…' | '·' | '•' | '‣' | '*'
+        | '\u{2190}'..='\u{21FF}'
+        | '\u{2300}'..='\u{23FF}'
+        | '\u{2500}'..='\u{27BF}'
+        | '\u{2800}'..='\u{28FF}'
+        | '\u{2B00}'..='\u{2BFF}')
+}
+
 /// 该不该为这个会话叫醒用户的手机？三道门，全 AND。
 ///
 /// - `is_agent`：命令行会话（shell）从来不该推送——用户自己在敲的东西，
@@ -541,6 +628,9 @@ struct Session {
     /// 出错时屏幕上一定有的串。跟上面两个一起在 `create()` 里编译一次，
     /// 不在 tick 里每轮重编——tick 每秒跑 5 次。
     error_re: Option<regex::Regex>,
+    /// profile 的 `activity_noise`，同上在 `create()` 里编译一次。`list()`
+    /// 拿它洗掉看板 activity 那一列里的底栏噪音（`clean_activity`）。
+    noise_re: Vec<regex::Regex>,
     pty: PtySession,
     /// 出错原因的人话解释，由后台线程写回（见 `SessionManager::request_explanation`）。
     /// **必须是 `Arc<Mutex<_>>`**：那个线程拿不到 `Session` 的锁——`tick()`
@@ -1479,6 +1569,7 @@ impl SessionManager {
         let idle_re = profile.idle_regex()?;
         let busy_re = profile.busy_regex()?;
         let error_re = profile.error_regex()?;
+        let noise_re = profile.activity_noise_regexes()?;
         let is_agent = profile.is_agent;
 
         // 有 pattern 才敢说「干活中」：agent 刚起来确实在初始化。
@@ -1599,6 +1690,7 @@ impl SessionManager {
             idle_re,
             busy_re,
             error_re,
+            noise_re,
             pty,
             explanation_slot: Arc::new(Mutex::new(None)),
             name_slot: Arc::new(Mutex::new(restored_name)),
@@ -1697,7 +1789,7 @@ impl SessionManager {
                     profile: s.profile.name.clone(),
                     dir: s.dir.display().to_string(),
                     state: s.state,
-                    activity: s.pty.last_line(),
+                    activity: clean_activity(&s.pty.last_line(), &s.noise_re),
                     is_agent: s.is_agent,
                     tag,
                     last_active_ms: s
@@ -2347,6 +2439,70 @@ mod tests {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
+    /// 内置 profile 的 `activity_noise` 编好的正则。
+    fn noise_of(name: &str) -> Vec<regex::Regex> {
+        crate::profile::Profile::builtin(name)
+            .unwrap()
+            .activity_noise_regexes()
+            .unwrap()
+    }
+
+    /// 2026-11-26 本机看板上抄下来的几行（22 个会话那一屏），逐条对答案。
+    /// 空闲的 claude / codex 洗完一个字都不剩——它们整行都是底栏。
+    #[test]
+    fn idle_footers_clean_down_to_nothing() {
+        let claude = noise_of("claude");
+        for line in [
+            "⏵⏵ bypass permissions on (shift+tab to cycle) · ← 4 agents",
+            "⏵⏵ bypass permissions on",
+            "? for shortcuts",
+            "⏵⏵ don't ask on (shift+tab to cycle) · ⚠ 2 warnings · f2 to view",
+        ] {
+            assert_eq!(clean_activity(line, &claude), "", "{line:?}");
+        }
+        assert_eq!(
+            clean_activity("← for agents · ? for shortcuts", &noise_of("codex")),
+            ""
+        );
+    }
+
+    /// 干活中的那几行：底栏洗掉，夹在中间的那段留下。dc-thesis 那行
+    /// 只剩 `1 shell`；#47 留下它正在跑的那条命令，末尾截断的 `…` 不留。
+    #[test]
+    fn busy_footers_keep_what_the_session_is_doing() {
+        let claude = noise_of("claude");
+        assert_eq!(
+            clean_activity(
+                "⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ← 4 agents · ↓ to manage",
+                &claude
+            ),
+            "1 shell"
+        );
+        let got = clean_activity(
+            "○ general-purpose  Running gradle assembleDebug build   …",
+            &claude,
+        );
+        assert!(got.contains("Running gradle assembleDebug build"), "{got:?}");
+        assert!(!got.contains('…') && !got.starts_with('○'), "{got:?}");
+        // 被劈开的括号补回去，只剩半句的 `esc to interrupt)` 不留
+        assert_eq!(
+            clean_activity("Working (12s • esc to interrupt)", &noise_of("codex")),
+            "Working (12s)"
+        );
+    }
+
+    /// 没声明噪音的 profile（shell、qwen……）内容原样保留，只整理空白。
+    /// 整段匹配：一句碰巧**提到** `esc to interrupt` 的正经输出不能被吃掉。
+    #[test]
+    fn cleaning_never_eats_real_output() {
+        assert_eq!(clean_activity("  $ cargo test  ", &[]), "$ cargo test");
+        assert_eq!(
+            clean_activity("press esc to interrupt the build", &noise_of("claude")),
+            "press esc to interrupt the build"
+        );
+        assert_eq!(clean_activity("✻ Thinking…", &noise_of("claude")), "Thinking…");
+    }
+
     /// 一台真机上 Claude Code **停在提示符等人** 时的屏幕底部，照抄。
     ///
     /// 关键在最后一行：用 `--dangerously-skip-permissions` 起的 Claude Code
@@ -2635,6 +2791,7 @@ mod tests {
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
             error_pattern: None,
+            activity_noise: Vec::new(),
             env: Default::default(),
             secret: None,
             install: None,
@@ -2708,6 +2865,7 @@ mod tests {
             idle_pattern: None,
             busy_pattern: None,
             error_pattern: Some("BOOM".into()),
+            activity_noise: Vec::new(),
             env: Default::default(),
             secret: None,
             install: None,
@@ -2742,6 +2900,7 @@ mod tests {
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
             error_pattern: None,
+            activity_noise: Vec::new(),
             env: Default::default(),
             secret: None,
             install: None,
@@ -2777,6 +2936,7 @@ mod tests {
             idle_pattern: None,
             busy_pattern: Some("esc to interrupt".into()),
             error_pattern: None,
+            activity_noise: Vec::new(),
             env: Default::default(),
             secret: None,
             install: None,
@@ -3545,6 +3705,7 @@ mod tests {
             idle_pattern: Some("READY".into()),
             busy_pattern: None,
             error_pattern: Some("BOOM".into()),
+            activity_noise: Vec::new(),
             env: Default::default(),
             secret: None,
             install: None,

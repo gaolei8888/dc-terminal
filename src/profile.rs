@@ -132,6 +132,21 @@ pub struct Profile {
     /// 没出事的东西，然后就不再相信这个标记了。没写 = 这个功能对它关着。
     #[serde(default)]
     pub error_pattern: Option<String>,
+    /// agent 自己底栏上的「噪音」：每一行都一样、说明不了它此刻在干什么的那几段
+    /// （claude 的 `bypass permissions on`、`? for shortcuts`、`← 4 agents`……）。
+    ///
+    /// 看板那一列 activity 原样取屏幕最后一行，而那一行十有八九就是这条底栏——
+    /// 22 个会话的看板上于是满屏同一句话，真在干活的那几行反倒淹没了。守护进程
+    /// 把最后一行按 ` · `（和三个以上的连续空格）切成几段，**整段**匹上这里任何
+    /// 一条的就丢掉（见 `session::clean_activity`），剩下的才是「它在干什么」。
+    ///
+    /// 整段匹配而不是查找：`esc to interrupt` 写成查找的话，一句恰好提到它的
+    /// 正经输出也会被吃掉。每条正则自动套 `^(?:…)$`，不用自己写锚点。
+    ///
+    /// **跟 `error_pattern` 一样只写实测见过的文案**：编出来的正则吃掉的是
+    /// 用户本来该看到的东西。没写 = 原样显示（旧行为）。
+    #[serde(default)]
+    pub activity_noise: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -332,6 +347,18 @@ impl Profile {
                 })?))
             }
         }
+    }
+
+    /// `activity_noise` 编好的正则，每条套上整段匹配的锚点。一条编不过就整个
+    /// 报错——跟另外三个 pattern 一样在起会话那一刻暴露，不拖到每次列会话。
+    pub fn activity_noise_regexes(&self) -> Result<Vec<regex::Regex>> {
+        self.activity_noise
+            .iter()
+            .map(|p| {
+                regex::Regex::new(&format!("^(?:{p})$"))
+                    .with_context(|| format!("activity_noise 不是合法正则: {p}"))
+            })
+            .collect()
     }
 
     /// 菜单上显示的名字。没写 label 就回落到 profile 名——那至少是个能认的词。
@@ -906,6 +933,27 @@ mod tests {
         }
     }
 
+    /// claude 系那几个跑的是同一个界面，底栏噪音也一样；codex 有它自己的那份。
+    /// 漏掉任何一个，那个 agent 在看板上就会满屏底栏。不写这个字段的 TOML
+    /// 照常解析，噪音为空——旧行为原样保留。
+    #[test]
+    fn agents_with_a_known_footer_declare_their_activity_noise() {
+        for name in ["claude", "kimi", "glm", "deepseek", "qwen-api", "codex"] {
+            let p = Profile::builtin(name).unwrap();
+            assert!(!p.activity_noise.is_empty(), "{name} 应当声明 activity_noise");
+            assert_eq!(
+                p.activity_noise_regexes().unwrap().len(),
+                p.activity_noise.len()
+            );
+        }
+        let p = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\n").unwrap();
+        assert!(p.activity_noise.is_empty());
+        assert!(p.activity_noise_regexes().unwrap().is_empty());
+        let bad = Profile::from_toml("name = \"x\"\ncommand = [\"x\"]\nactivity_noise = [\"(\"]\n")
+            .unwrap();
+        assert!(bad.activity_noise_regexes().is_err(), "非法正则要报错");
+    }
+
     /// claude 系那几个的 `command` 就是 `claude`，界面完全一样，所以
     /// 错误文案也一样。漏掉任何一个，那个 agent 就会静默地坏着。
     #[test]
@@ -1114,6 +1162,7 @@ mod tests {
             // 正则必须能编译，否则一到 tick 就报错
             p.idle_regex().unwrap();
             p.busy_regex().unwrap();
+            p.activity_noise_regexes().unwrap();
         }
     }
 

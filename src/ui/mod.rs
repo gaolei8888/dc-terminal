@@ -3805,6 +3805,7 @@ is_agent = true
             idle_pattern: None,
             busy_pattern: None,
             error_pattern: None,
+            activity_noise: Vec::new(),
             env,
             secret: None,
             install: None,
