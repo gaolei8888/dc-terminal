@@ -20,6 +20,7 @@ fn fake_agent() -> Profile {
         busy_pattern: None,
         error_pattern: None,
         ask_pattern: None,
+        activity_noise: Vec::new(),
         env: Default::default(),
         secret: None,
         install: None,
@@ -33,6 +34,7 @@ fn fake_agent() -> Profile {
         resume_id_args: Default::default(),
         conversation_file: Default::default(),
         conversation_file_key: Default::default(),
+        note_args: Default::default(),
         pairable: false,
         backend_only: false,
     }

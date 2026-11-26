@@ -1158,9 +1158,10 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
 
         assert!(app.current_dir().ends_with("b"), "项目切过去了");
+        // b 只有一个会话，它的组头就是合成的那一行
         assert_eq!(
-            app.selected_session().map(|s| s.id),
-            None,
+            app.list_state.selected(),
+            crate::ui::view::head_row(&app.rows, 1),
             "光标停在 b 的组头上，不是随便某个会话上"
         );
     }
@@ -2680,8 +2681,8 @@ mod tests {
         let (mut app, _d) = App::test_app();
         app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(2, "/w/b")]);
         assert!(app.pinned.is_empty(), "前提：两个组都不是 pin 上来的");
-        // 行：[组头 a, 1, 组头 b, 2]——用户挪到 b 的会话上
-        app.list_state.select(Some(3));
+        // 行：[a（1）, b（2）] 各合成一行——用户挪到 b 的会话上
+        app.list_state.select(Some(1));
         super::super::pin_cursor_group(&mut app);
 
         // 后台那一轮 List：b 的唯一一个会话自己跑完停了。没有任何按键。
@@ -2705,7 +2706,7 @@ mod tests {
         let (mut app, _d) = App::test_app();
         app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(2, "/w/b")]);
         // 光标留在 a 上，从没去过 b
-        app.list_state.select(Some(1));
+        app.list_state.select(Some(0));
         super::super::pin_cursor_group(&mut app);
 
         let mut done = sess_in(2, "/w/b");
@@ -2738,7 +2739,7 @@ mod tests {
     fn a_projects_sync_never_unpins_the_group_under_the_cursor() {
         let (mut app, _d) = App::test_app();
         app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(2, "/w/b")]);
-        app.list_state.select(Some(3));
+        app.list_state.select(Some(1));
         super::super::pin_cursor_group(&mut app);
         // b 的会话停了：现在它留在看板上**只**靠那条 pin
         let mut done = sess_in(2, "/w/b");
@@ -2768,7 +2769,7 @@ mod tests {
         let (mut app, _d) = App::test_app();
         app.pinned = vec!["/w/gone".to_string()];
         app.set_sessions(vec![sess_in(1, "/w/a")]);
-        app.list_state.select(Some(1));
+        app.list_state.select(Some(0));
         super::super::pin_cursor_group(&mut app);
 
         // 另一个窗口：x 掉了 /w/gone，p 上来了 /w/new
@@ -2823,8 +2824,8 @@ mod tests {
         done.state = crate::session::SessionState::Stopped;
         app.pinned = vec!["/w/z".to_string()];
         app.set_sessions(vec![sess_in(1, "/w/a"), done]);
-        // 行：[组头 a, 1, 组头 z, 9]——光标停到 z 上
-        app.list_state.select(Some(2));
+        // 行：[a（1）, z（9）] 各合成一行——光标停到 z 上
+        app.list_state.select(Some(1));
         assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/z"));
 
         assert!(super::super::unpin_current(&mut app), "拿得掉");
@@ -2843,7 +2844,7 @@ mod tests {
         let (mut app, _d) = App::test_app();
         app.pinned = vec!["/w/z".to_string()];
         app.set_sessions(vec![sess_in(1, "/w/a"), sess_in(9, "/w/z")]);
-        app.list_state.select(Some(2));
+        app.list_state.select(Some(1));
         assert_eq!(app.current_dir(), std::path::PathBuf::from("/w/z"));
 
         assert!(!super::super::unpin_current(&mut app), "拿不掉");
@@ -2865,7 +2866,7 @@ mod tests {
         done.state = crate::session::SessionState::Stopped;
         app.pinned = vec!["/w/z".to_string()];
         app.set_sessions(vec![sess_in(1, "/w/a"), done]);
-        app.list_state.select(Some(2));
+        app.list_state.select(Some(1));
 
         assert!(
             super::super::help_ctx_for(&app, &View::Board).can_remove,

@@ -1106,8 +1106,8 @@ mod tests {
             machine: None,
         };
         app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
-        // 行：[组头 a, 会话 1, 组头 b, 会话 2]——先站在 a 的会话上
-        app.list_state.select(Some(1));
+        // 行：[a 合成一行（会话 1）, b 合成一行（会话 2）]——先站在 a 的会话上
+        app.list_state.select(Some(0));
         assert_eq!(
             app.current_group().map(|g| g.name.clone()),
             Some("a".to_string()),
@@ -1145,11 +1145,11 @@ mod tests {
             machine: None,
         };
         app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
-        // 把 b 折起来，再回到 a 的会话上
-        app.list_state.select(Some(2));
+        // 把 b 折起来（合成行折成一行 `▸` 组头），再回到 a 的会话上
+        app.list_state.select(Some(1));
         super::super::toggle_collapse(&mut app);
         assert!(app.groups[1].collapsed, "前提：b 是折叠的");
-        app.list_state.select(Some(1));
+        app.list_state.select(Some(0));
         app.view = View::Attached(1);
 
         handle_key(&mut app, key(KeyCode::F(3))).unwrap();
@@ -1217,7 +1217,7 @@ mod tests {
             ..session(id, SessionState::Working)
         };
         app.set_sessions(vec![in_dir(1, "/w/a"), in_dir(2, "/w/b")]);
-        app.list_state.select(Some(3)); // [组头 a, 1, 组头 b, 2]
+        app.list_state.select(Some(1)); // [a（1）, b（2）] 各合成一行
         app.view = View::Attached(2);
 
         handle_key(&mut app, mod_key(KeyCode::F(3), KeyModifiers::SHIFT)).unwrap();

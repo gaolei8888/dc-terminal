@@ -3830,6 +3830,7 @@ mod tests {
             busy_pattern: None,
             error_pattern: None,
             ask_pattern: None,
+            activity_noise: Vec::new(),
             env: Default::default(),
             secret: None,
             install: None,
@@ -3843,6 +3844,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
             backend_only: false,
         });
@@ -3907,6 +3909,7 @@ mod tests {
             busy_pattern: None,
             error_pattern: None,
             ask_pattern: None,
+            activity_noise: Vec::new(),
             env: Default::default(),
             secret: None,
             install: None,
@@ -3920,6 +3923,7 @@ mod tests {
             resume_id_args: Default::default(),
             conversation_file: Default::default(),
             conversation_file_key: Default::default(),
+            note_args: Default::default(),
             pairable: false,
             backend_only: false,
         });

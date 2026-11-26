@@ -28,6 +28,20 @@ error_pattern = "API Error|Connection closed mid-response"
 # 非空行**（`\z`）——agent 回答里引用这句、哪怕独占一行，下面也还压着输入框
 # 和底栏，不能把会话判成「等你回答」。
 ask_pattern = '(?m)^\s*Enter to confirm · Esc to cancel\s*\z'
+# 看板 activity 那一列要丢掉的底栏噪音（见 `profile.rs::Profile::activity_noise`）。
+# 每条整段匹配一段 ` · ` 切开的文字（开头的 `⏵⏵`、`←` 这类符号去掉后再比一次）。都是本机真实看板上抄下来的（claude 2.1.33x，
+# 2026-11-26）：空闲时整行就是这些，干活时夹在中间的 `1 shell` 才是有用的那段。
+activity_noise = [
+  "(?:bypass permissions|accept edits|plan mode|don't ask) on(?: \\(shift\\+tab to cycle\\))?",
+  "\\(?shift\\+tab to cycle\\)?",
+  "\\? for shortcuts",
+  "← \\d+ agents?",
+  "← for agents",
+  "\\(?esc to interrupt\\)?",
+  "↓ to manage",
+  "⚠ \\d+ warnings?",
+  "f2 to view",
+]
 # 恢复守护进程重启前的会话时用：跑的是 claude 二进制，`--continue`
 # 接回这个目录下最近一次对话。
 resume_args = ["--continue"]
@@ -40,6 +54,9 @@ resume_id_args = ["--resume", "{id}"]
 # 读不到就照旧。实测：claude 2.1.302（2026-10-18）。
 conversation_file = "~/.claude/sessions/{pid}.json"
 conversation_file_key = "sessionId"
+# 开会话时告诉 agent 怎么给别的会话留言（`session::peer_note`），追加在系统
+# 提示词后面。实测：claude 2.1.332（2026-11-26），多行中文原样读到。
+note_args = ["--append-system-prompt", "{note}"]
 
 [label]
 zh = "DeepSeek"

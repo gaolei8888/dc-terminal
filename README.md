@@ -1094,6 +1094,13 @@ dct send Mac/#3 "run the Windows tests"
 - **Messages**: `dct send <computer>/<session> "<text>"`, the session can be `#id`.
   The other side sees a marker line (`[来自 home-mac/docs 的留言 #a1b2]`) and then
   the text. Idle session: typed now. Busy: queued, one at a time.
+- **Agents message each other on their own**: once this computer is logged in
+  (`dct login`), Claude sessions (including Kimi / GLM / DeepSeek / Qwen API) and
+  Codex sessions started by dct are told which computer and session number they
+  are, how to use `dct send` to message another session, and that a `[来自 …` block
+  is a message, not you. So you can just say "tell #3 …". Not logged in: they are
+  told nothing. On Windows, npm-installed agents don't get this yet (arguments go
+  through cmd.exe, which can't carry multi-line text).
 - **The relay can't read them**: sealed on your computer for the one recipient;
   the relay forwards, never writes to disk, and sees ciphertext only.
 - The relay defaults to `https://dataclue.cn/dct-relay`; override with

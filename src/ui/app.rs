@@ -532,13 +532,11 @@ impl App {
             .unwrap_or_else(|| self.start_dir.clone())
     }
 
-    /// 光标停在会话行上时是哪个会话；停在组头上就是 `None`。
+    /// 光标停在会话行（或合成的单会话行）上时是哪个会话；停在组头上就是 `None`。
     pub fn selected_session(&self) -> Option<&SessionInfo> {
         let i = self.list_state.selected()?;
-        match self.rows.get(i)? {
-            super::view::Row::Header(_) => None,
-            super::view::Row::Session(g, s) => self.groups.get(*g)?.sessions.get(*s),
-        }
+        let (g, s) = self.rows.get(i)?.session_index()?;
+        self.groups.get(g)?.sessions.get(s)
     }
 
     /// 拿到活的守护进程连接；构造时没能连上（目前只有测试会这样构造）就
@@ -698,7 +696,10 @@ mod tests {
         app.set_sessions(vec![sess(1, "/w/a"), sess(2, "/w/b")]);
 
         assert_eq!(app.groups.len(), 2);
-        assert_eq!(app.rows.len(), 4, "两个组头 + 两个会话行");
+        assert_eq!(app.rows.len(), 2, "两个项目各一个会话，各合成一行");
+
+        app.set_sessions(vec![sess(1, "/w/a"), sess(3, "/w/a"), sess(2, "/w/b")]);
+        assert_eq!(app.rows.len(), 4, "a 的组头 + 两个会话行，b 合成一行");
     }
 
     /// 规则 5：项目只在用户移动光标时变。后台多出来的会话不能把光标推走。
@@ -706,8 +707,8 @@ mod tests {
     fn a_new_session_in_another_project_does_not_move_the_cursor() {
         let (mut app, _d) = App::test_app();
         app.set_sessions(vec![sess(1, "/w/a"), sess(7, "/w/b")]);
-        // 光标放到 /w/b 的会话 7 上
-        app.list_state.select(Some(3));
+        // 光标放到 /w/b 的会话 7 上（a、b 各合成一行，它是第 1 行）
+        app.list_state.select(Some(1));
         let before = app.current_dir();
 
         app.set_sessions(vec![sess(1, "/w/a"), sess(4, "/w/a"), sess(7, "/w/b")]);
@@ -722,7 +723,7 @@ mod tests {
         let (mut app, _d) = App::test_app();
         app.pinned = vec!["/w/b".to_string()];
         app.set_sessions(vec![sess(1, "/w/a"), sess(7, "/w/b")]);
-        app.list_state.select(Some(3));
+        app.list_state.select(Some(1));
 
         app.set_sessions(vec![sess(1, "/w/a")]);
 
@@ -737,7 +738,7 @@ mod tests {
 
         app.list_state.select(Some(0));
         assert!(app.current_dir().ends_with("a"));
-        app.list_state.select(Some(2));
+        app.list_state.select(Some(1));
         assert!(app.current_dir().ends_with("b"));
     }
 

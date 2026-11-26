@@ -281,6 +281,16 @@ impl Mesh {
         &self.me.endpoint
     }
 
+    /// 别人（和这台电脑自己的会话）`dct send "<名字>/#3"` 时写的那个名字：
+    /// 名单上这台电脑那一条的名字，而且 `by_name` 拿它找回来的确实是这台
+    /// （跟 `deliver::send` 一样的查法）。没有名单、名单上没有自己、或者
+    /// 名字撞了别的电脑——都是 `None`，开会话时就不交留言说明。
+    pub fn address_name(&self) -> Option<String> {
+        let roster = &self.roster.as_ref()?.roster;
+        let name = &roster.member(&self.me.endpoint)?.name;
+        (roster.by_name(name)?.endpoint == self.me.endpoint).then(|| name.clone())
+    }
+
     /// 电脑信封的唯一入口。返回值是要回给发件方的 payload；`None` = 不回。
     ///
     /// **任何验证失败都是沉默**：丢掉、记一行 journal、不回任何东西。回一句
@@ -816,6 +826,20 @@ mod tests {
             .with_started_at(NOW - 2 * SENT_AT_WINDOW_SECS)
             .with_inbox(inbox);
         (a, b, v2)
+    }
+
+    #[test]
+    fn address_name_is_the_roster_name_that_send_resolves() {
+        let (a, b, _) = pair_ab();
+        assert_eq!(a.address_name().as_deref(), Some("A"));
+        assert_eq!(b.address_name().as_deref(), Some("B"));
+        // 没有名单 = 没进组，`dct send` 认不出任何名字。
+        let lone = Mesh::new(keys(3), "C".into(), None);
+        assert_eq!(lone.address_name(), None);
+        // 名单上没有自己。
+        let (_, _, v2) = pair_ab();
+        let outsider = Mesh::new(keys(3), "C".into(), Some(v2));
+        assert_eq!(outsider.address_name(), None);
     }
 
     fn env(from: &str, to: &str, payload: Vec<u8>) -> Envelope {

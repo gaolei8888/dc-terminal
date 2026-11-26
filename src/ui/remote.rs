@@ -911,6 +911,11 @@ impl Router {
         self.remotes.get(peer)?.age(epoch, real)
     }
 
+    /// 合成号在那台电脑上的真号（看板上给人看的是这个）；本机会话是 `None`。
+    pub fn real_id(&self, id: u32) -> Option<u32> {
+        self.ids.real(id).map(|(_, _, real)| real)
+    }
+
     /// 这个号的会话在哪台电脑上；本机是 `None`。
     pub fn machine_of(&self, id: u32) -> Option<&str> {
         self.ids.real(id).map(|(peer, _, _)| peer)

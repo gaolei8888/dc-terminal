@@ -20,6 +20,23 @@ is_agent = true
 # 剩下那 1 秒左右的空当没有任何标记，靠平稳重启那边「连续空闲 3 秒才算
 # 停下」兜住（`drain::IDLE_SETTLE`）。
 busy_pattern = "esc to interrupt|tab to queue|· [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"
+# 开会话时告诉 agent 怎么给别的会话留言（`session::peer_note`）。实测
+# codex-cli 0.172.0（2026-11-26）：`developer_instructions=` 后面直接跟多行
+# 中文，codex 当成一段字面字符串收下，模型看得到。
+note_args = ["-c", "developer_instructions={note}"]
+# 看板 activity 那一列要丢掉的底栏噪音（见 `profile.rs::Profile::activity_noise`）。
+# 本机真实看板上抄下来的（codex-cli 0.172，2026-11-26）：空闲时最后一行是
+# `← for agents · ? for shortcuts`，说明不了它在干什么。
+activity_noise = [
+  "← for agents",
+  "\\? for shortcuts",
+  "\\(?esc to interrupt\\)?",
+  "tab to queue message",
+  # 底栏右边的「⚠ 1 warning · f2 to view」：启动时的一条提示，不是在干活。
+  # 2026-11-26 重启后三个 codex 会话都带着它。
+  "⚠?\\s*\\d+ warnings?",
+  "f2 to view",
+]
 
 [label]
 zh = "Codex"

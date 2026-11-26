@@ -1074,17 +1074,6 @@ pub(crate) fn remote_group_key(machine: &str) -> PathBuf {
 }
 
 impl ProjectGroup {
-    /// 组头上的 `claude×2 codex×1`。**现算不存**：存下来就有两份真相，
-    /// 而它们只有一份是新的。按 agent 名排序，跟组的排序同一个理由——
-    /// 顺序不能随会话生灭而跳动。
-    pub fn agent_counts(&self) -> Vec<(String, usize)> {
-        let mut m: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-        for s in &self.sessions {
-            *m.entry(s.profile.clone()).or_insert(0) += 1;
-        }
-        m.into_iter().collect()
-    }
-
     /// 这个项目在九宫格里的第一个格子（按 id 序），没有格子就是 `None`。
     ///
     /// **「有会话」不等于「有格子」**：九宫格不画已停止的会话（见
@@ -1288,12 +1277,47 @@ pub(crate) enum Row {
     Header(usize),
     /// (组下标, 组内会话下标)
     Session(usize, usize),
+    /// 只有一个会话的组：组头和那个会话**合成一行**。
+    ///
+    /// 用户手上的项目绝大多数只开一个会话，组头 + 会话两行一组的话，22 个
+    /// 会话的看板一屏装不下，而组头那一行除了项目名什么都没说。合成一行之后
+    /// 它同时是这个组的「头」（`1`…`9`、Tab 落在它上面，折叠也从它这儿折）和
+    /// 那个会话（Enter、`s`/`u`/`d` 作用在 `sessions[0]` 上）。
+    Single(usize),
 }
 
-/// 把分组展平成屏幕上的行。折叠的组只贡献组头那一行。
+impl Row {
+    /// 这一行属于哪个组。
+    pub(crate) fn group(self) -> usize {
+        match self {
+            Row::Header(g) | Row::Single(g) | Row::Session(g, _) => g,
+        }
+    }
+
+    /// 这一行是不是某个组的「头」——换项目时光标落的那一行。
+    pub(crate) fn is_head_of(self, gi: usize) -> bool {
+        matches!(self, Row::Header(g) | Row::Single(g) if g == gi)
+    }
+
+    /// 这一行上的会话（组内下标）。纯组头没有会话。
+    pub(crate) fn session_index(self) -> Option<(usize, usize)> {
+        match self {
+            Row::Header(_) => None,
+            Row::Single(g) => Some((g, 0)),
+            Row::Session(g, s) => Some((g, s)),
+        }
+    }
+}
+
+/// 把分组展平成屏幕上的行。折叠的组只贡献组头那一行；正好一个会话的组
+/// 不折叠时合成一行 `Single`（理由见它自己的文档）。
 pub(crate) fn flatten(groups: &[ProjectGroup]) -> Vec<Row> {
     let mut rows = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
+        if !g.collapsed && g.sessions.len() == 1 {
+            rows.push(Row::Single(gi));
+            continue;
+        }
         rows.push(Row::Header(gi));
         if !g.collapsed {
             for si in 0..g.sessions.len() {
@@ -1304,13 +1328,15 @@ pub(crate) fn flatten(groups: &[ProjectGroup]) -> Vec<Row> {
     rows
 }
 
+/// 第 `gi` 个组的「头」在第几行（组头或合成的那一行）。
+pub(crate) fn head_row(rows: &[Row], gi: usize) -> Option<usize> {
+    rows.iter().position(|r| r.is_head_of(gi))
+}
+
 /// 某一行属于哪个组。**「当前项目」就是这个函数的答案**——不再有一个
 /// 可以跟屏幕不一致的 `current_dir` 字段。
 pub(crate) fn group_of(rows: &[Row], i: usize) -> Option<usize> {
-    match rows.get(i)? {
-        Row::Header(g) => Some(*g),
-        Row::Session(g, _) => Some(*g),
-    }
+    rows.get(i).map(|r| r.group())
 }
 
 /// 光标指着的那个东西的**语义身份**。重新分组之后靠它找回原位。
@@ -1336,6 +1362,10 @@ pub(crate) fn anchor_of(groups: &[ProjectGroup], rows: &[Row], i: usize) -> Opti
             let grp = groups.get(*g)?;
             Some(Anchor::Session(grp.sessions.get(*s)?.id, grp.dir.clone()))
         }
+        Row::Single(g) => {
+            let grp = groups.get(*g)?;
+            Some(Anchor::Session(grp.sessions.first()?.id, grp.dir.clone()))
+        }
     }
 }
 
@@ -1345,9 +1375,9 @@ pub(crate) fn find_anchor(groups: &[ProjectGroup], rows: &[Row], a: &Anchor) -> 
     match a {
         Anchor::Session(id, dir) => {
             // 会话还在：站回它身上
-            if let Some(i) = rows.iter().position(|r| match r {
-                Row::Session(g, s) => groups[*g].sessions[*s].id == *id,
-                Row::Header(_) => false,
+            if let Some(i) = rows.iter().position(|r| match r.session_index() {
+                Some((g, s)) => groups[g].sessions[s].id == *id,
+                None => false,
             }) {
                 return Some(i);
             }
@@ -1358,13 +1388,13 @@ pub(crate) fn find_anchor(groups: &[ProjectGroup], rows: &[Row], a: &Anchor) -> 
             // 带着这个 id，搜也搜不到。
             let gi = groups.iter().position(|g| &g.dir == dir);
             match gi {
-                Some(gi) => rows.iter().position(|r| *r == Row::Header(gi)),
+                Some(gi) => head_row(rows, gi),
                 None => None,
             }
         }
         Anchor::Header(dir) => {
             let gi = groups.iter().position(|g| &g.dir == dir)?;
-            rows.iter().position(|r| *r == Row::Header(gi))
+            head_row(rows, gi)
         }
     }
 }
@@ -3540,7 +3570,9 @@ mod tests {
     }
 
     #[test]
-    fn the_group_header_summarises_agents_and_failures() {
+    fn the_group_header_counts_its_failures() {
+        // 组头上原来还有一串 `claude×2 codex×1`，看板改成一组一行之后拿掉了：
+        // 每一行自己写着智能体，那串统计什么都没多说。出错数还在，它是红字。
         let mut all = vec![
             si(1, "/w/a", "claude"),
             si(2, "/w/a", "claude"),
@@ -3549,11 +3581,6 @@ mod tests {
         all[2].state = SessionState::Failed;
         let g = group_sessions(&all, &[], &BTreeMap::new(), &[]);
 
-        assert_eq!(
-            g[0].agent_counts(),
-            vec![("claude".to_string(), 2), ("codex".to_string(), 1)],
-            "按 agent 名字排序，数量是这个项目里的会话数"
-        );
         assert_eq!(g[0].failed(), 1);
     }
 
@@ -3656,6 +3683,7 @@ mod tests {
         g.remove(0)
     }
 
+    /// 两个以上会话的组：组头 + 每个会话一行；正好一个会话的组合成一行。
     #[test]
     fn flatten_puts_a_header_before_each_group() {
         let groups = vec![grp("/w/a", &[1, 2]), grp("/w/b", &[3])];
@@ -3665,20 +3693,19 @@ mod tests {
                 Row::Header(0),
                 Row::Session(0, 0),
                 Row::Session(0, 1),
-                Row::Header(1),
-                Row::Session(1, 0),
+                Row::Single(1),
             ]
         );
     }
 
+    /// 折起来的组只剩组头——单会话的组也一样，折起来就是一行 `▸` 组头。
     #[test]
     fn a_collapsed_group_contributes_only_its_header() {
         let mut groups = vec![grp("/w/a", &[1, 2]), grp("/w/b", &[3])];
         groups[0].collapsed = true;
-        assert_eq!(
-            flatten(&groups),
-            vec![Row::Header(0), Row::Header(1), Row::Session(1, 0)]
-        );
+        assert_eq!(flatten(&groups), vec![Row::Header(0), Row::Single(1)]);
+        groups[1].collapsed = true;
+        assert_eq!(flatten(&groups), vec![Row::Header(0), Row::Header(1)]);
     }
 
     #[test]
@@ -3688,30 +3715,46 @@ mod tests {
     }
 
     #[test]
-    fn group_of_answers_for_both_row_kinds() {
-        let groups = vec![grp("/w/a", &[1]), grp("/w/b", &[2])];
+    fn group_of_answers_for_every_row_kind() {
+        let groups = vec![grp("/w/a", &[1, 3]), grp("/w/b", &[2])];
         let rows = flatten(&groups);
-        assert_eq!(group_of(&rows, 0), Some(0));
-        assert_eq!(group_of(&rows, 1), Some(0));
-        assert_eq!(group_of(&rows, 3), Some(1));
+        assert_eq!(group_of(&rows, 0), Some(0), "组头");
+        assert_eq!(group_of(&rows, 1), Some(0), "会话行");
+        assert_eq!(group_of(&rows, 3), Some(1), "合成的单会话行");
         assert_eq!(group_of(&rows, 99), None);
+        assert_eq!(head_row(&rows, 1), Some(3), "单会话行就是它那个组的头");
     }
 
     /// 本设计最关键的不变式：后台事件让行数变了，光标必须还站在同一个东西上。
     #[test]
     fn the_cursor_stays_on_the_same_session_when_another_group_grows() {
-        let before = vec![grp("/w/a", &[1]), grp("/w/b", &[7])];
+        let before = vec![grp("/w/a", &[1]), grp("/w/b", &[7, 8])];
         let rows_before = flatten(&before);
-        // 光标在 /w/b 的会话 7 上（第 3 行）
-        let a = anchor_of(&before, &rows_before, 3).unwrap();
+        // 光标在 /w/b 的会话 7 上（第 2 行：a 合成一行，b 的组头，会话 7）
+        let a = anchor_of(&before, &rows_before, 2).unwrap();
         assert_eq!(a, Anchor::Session(7, canon(Path::new("/w/b"))));
 
         // /w/a 里多开了两个会话，行数变了
-        let after = vec![grp("/w/a", &[1, 4, 5]), grp("/w/b", &[7])];
+        let after = vec![grp("/w/a", &[1, 4, 5]), grp("/w/b", &[7, 8])];
         let rows_after = flatten(&after);
         let i = find_anchor(&after, &rows_after, &a).unwrap();
 
         assert_eq!(rows_after[i], Row::Session(1, 0), "还站在会话 7 上");
+    }
+
+    /// 合成行上的光标也是「站在那个会话上」：它所在的组多开一个会话、
+    /// 合成行拆成组头 + 两行，光标跟着会话走，不留在组头上。
+    #[test]
+    fn the_cursor_on_a_single_row_follows_its_session_when_the_group_splits() {
+        let before = vec![grp("/w/a", &[1]), grp("/w/b", &[7])];
+        let rows_before = flatten(&before);
+        let a = anchor_of(&before, &rows_before, 1).unwrap();
+        assert_eq!(a, Anchor::Session(7, canon(Path::new("/w/b"))));
+
+        let after = vec![grp("/w/a", &[1]), grp("/w/b", &[7, 9])];
+        let rows_after = flatten(&after);
+        let i = find_anchor(&after, &rows_after, &a).unwrap();
+        assert_eq!(rows_after[i], Row::Session(1, 0));
     }
 
     /// 会话没了（结束并被 prune）——退回它原来那个组的组头，不要滑到别的项目上。
@@ -3719,7 +3762,7 @@ mod tests {
     fn a_vanished_session_falls_back_to_its_own_group_header() {
         let before = vec![grp("/w/a", &[1]), grp("/w/b", &[7])];
         let rows_before = flatten(&before);
-        let a = anchor_of(&before, &rows_before, 3).unwrap();
+        let a = anchor_of(&before, &rows_before, 1).unwrap();
 
         let after = vec![grp("/w/a", &[1]), grp("/w/b", &[])];
         let rows_after = flatten(&after);
@@ -3734,16 +3777,22 @@ mod tests {
 
     #[test]
     fn a_header_anchor_finds_its_group_again_after_reordering() {
-        let before = vec![grp("/w/b", &[7])];
+        let before = vec![grp("/w/b", &[7, 8])];
         let rows_before = flatten(&before);
         let a = anchor_of(&before, &rows_before, 0).unwrap();
         assert_eq!(a, Anchor::Header(canon(Path::new("/w/b"))));
 
-        // /w/a 是新出现的，排在前面，把 /w/b 挤到了第 2 行
-        let after = vec![grp("/w/a", &[1]), grp("/w/b", &[7])];
+        // /w/a 是新出现的，排在前面，把 /w/b 挤到了第 1 行
+        let after = vec![grp("/w/a", &[1]), grp("/w/b", &[7, 8])];
         let rows_after = flatten(&after);
         let i = find_anchor(&after, &rows_after, &a).unwrap();
 
         assert_eq!(rows_after[i], Row::Header(1));
+
+        // 那个组只剩一个会话、合成了一行：组头锚点落在合成行上
+        let after = vec![grp("/w/a", &[1]), grp("/w/b", &[7])];
+        let rows_after = flatten(&after);
+        let i = find_anchor(&after, &rows_after, &a).unwrap();
+        assert_eq!(rows_after[i], Row::Single(1));
     }
 }

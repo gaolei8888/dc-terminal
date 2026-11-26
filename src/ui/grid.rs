@@ -1509,11 +1509,11 @@ mod tests {
     fn arrowing_into_a_collapsed_project_still_moves_the_cursor() {
         let (mut app, _dir) = App::test_app();
         app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b")]);
-        // 把 b 折起来（光标先停到它的组头上），再回到 a
-        app.list_state.select(Some(2));
+        // 把 b 折起来（光标先停到它那一行上），再回到 a
+        app.list_state.select(Some(1));
         super::super::toggle_collapse(&mut app);
         assert!(app.groups[1].collapsed, "前提：b 是折叠的");
-        app.list_state.select(Some(1));
+        app.list_state.select(Some(0));
         app.view = View::grid(0);
         assert!(app.current_dir().ends_with("a"), "前提：当前项目是 a");
 
@@ -1541,14 +1541,14 @@ mod tests {
         let mut stopped = session_in(99, "/w/z");
         stopped.state = SessionState::Stopped;
         app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b"), stopped]);
-        // 行：[组头 a, 1, 组头 b, 2, 组头 z]——把 b 折起来
-        app.list_state.select(Some(2));
+        // 行：[a（1）, b（2）, z（99）] 各合成一行——把 b 折起来
+        app.list_state.select(Some(1));
         super::super::toggle_collapse(&mut app);
         assert!(app.groups[1].collapsed, "前提：b 是折叠的");
 
-        // 焦点指着 b 的那一格，光标停在空组 z 的组头上
+        // 焦点指着 b 的那一格，光标停在空组 z 那一行上
         app.view = View::grid(1);
-        app.list_state.select(Some(3));
+        app.list_state.select(Some(2));
         assert!(app.current_dir().ends_with("z"), "前提：当前项目是 z");
 
         handle_key(&mut app, key(KeyCode::Char('x'))).unwrap();
@@ -1631,8 +1631,8 @@ mod tests {
         // 不等于焦点陈旧」，不是「它凭什么在看板上」。
         app.pinned = vec!["/w/zz".into()];
         app.set_sessions(vec![session_in(2, "/w/b"), session_in(3, "/w/b"), stopped]);
-        // 行是 [组头 b, 2, 3, 组头 zz, 9]：光标停在 zz 的那个已停止会话上
-        app.list_state.select(Some(4));
+        // 行是 [组头 b, 2, 3, zz 合成一行（9）]：光标停在 zz 的那个已停止会话上
+        app.list_state.select(Some(3));
         assert_eq!(
             app.selected_session().map(|s| s.id),
             Some(9),
@@ -1735,9 +1735,9 @@ mod tests {
         let mut stopped = session_in(99, "/w/m");
         stopped.state = SessionState::Stopped;
         app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/z"), stopped]);
-        // 组序是 a / m / z，焦点落在 z 的格子上
+        // 组序是 a / m / z（各合成一行），焦点落在 z 的格子上
         app.view = View::grid(1);
-        app.list_state.select(Some(4));
+        app.list_state.select(Some(2));
         assert_eq!(
             app.current_group().map(|g| g.name.clone()),
             Some("z".to_string()),
@@ -1772,7 +1772,7 @@ mod tests {
         app.set_sessions(vec![session_in(1, "/w/a"), session_in(2, "/w/b")]);
         app.view = View::grid(0);
         // 光标停在 a 的会话行上（进九宫格时两边本来就是对齐的）
-        app.list_state.select(Some(1));
+        app.list_state.select(Some(0));
 
         handle_key(&mut app, key(KeyCode::Right)).unwrap();
         assert_eq!(

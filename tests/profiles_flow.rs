@@ -139,6 +139,7 @@ fn two_projects_each_keep_their_own_agent_over_the_wire() {
         busy_pattern: None,
         error_pattern: None,
         ask_pattern: None,
+        activity_noise: Vec::new(),
         env: Default::default(),
         secret: None,
         install: None,
@@ -152,6 +153,7 @@ fn two_projects_each_keep_their_own_agent_over_the_wire() {
         resume_id_args: Default::default(),
         conversation_file: Default::default(),
         conversation_file_key: Default::default(),
+        note_args: Default::default(),
         pairable: false,
         backend_only: false,
     };
