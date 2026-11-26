@@ -11,3 +11,6 @@ __pycache__/
 
 # cloud-authoring 的运行时依赖（镜像里装），不入库
 container/vendor/node_modules/
+
+# Qwen Code scratch
+.qwen/
